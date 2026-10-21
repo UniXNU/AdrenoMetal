@@ -11,11 +11,13 @@
 #include <pthread.h>
 #include <dlfcn.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
 @end
@@ -150,10 +152,19 @@ static bool listedClient() {
 }
 // A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
+// The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
+// "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+static void clientFailure(unsigned port, const char *step, const char *detail) {
+    if (Gpu *gpu = makeGpu(port)) {
+        char text[64];
+        snprintf(text, sizeof text, "%.14s %.46s", step, detail ? detail : "");
+        streamText(*gpu, text);
+    }
+}
 static id clientDevice(unsigned port) {
     if (!listedClient()) return nil;
     char turnip[1024];
-    if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) return nil;
+    if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
     uint64_t registryID = 0;
     if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
         if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -165,17 +176,23 @@ static id clientDevice(unsigned port) {
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
     id device = nil;
+    const char *lastError = "";
+    unsigned usable = 0;
     for (unsigned i = 0; i < 2 && !device; ++i) {
         if (!candidates[i][0]) continue;
         strlcat(candidates[i], "m2v", sizeof candidates[i]);
         mkdir(candidates[i], 0700);
         if (access(candidates[i], W_OK) != 0) continue;
+        ++usable;
         @try {
             device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
         } @catch (NSException *exception) {
             device = nil;
+            lastError = "exception";
         }
+        if (!device && !lastError[0]) lastError = nmb_last_error();
     }
+    if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     return device;
 }
 static id deviceForPort(unsigned port) {
@@ -184,6 +201,7 @@ static id deviceForPort(unsigned port) {
     @synchronized([NativeAdrenoMetalDeviceBase class]) {
         if (tried) return device;
         tried = true;
+        exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -229,12 +247,22 @@ static id deviceForPort(unsigned port) {
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-        char candidates[4][512] = {};
+        char candidates[5][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
         strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
         strlcpy(candidates[3], "/private/var/tmp/", sizeof candidates[3]);
-        for (unsigned i = 0; i < 4 && !device; ++i) {
+        // The user temp directory of the mobile user is under /var/mobile/tmp, which launchd's boot task dirs_cleaner empties at every boot,
+        // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
+        // (marker 0x6814); the earlier candidates keep their markers.
+        if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
+            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
+            mkdir(candidates[4], 0700);
+            strlcat(candidates[4], "/", sizeof candidates[4]);
+        }
+        static const unsigned order[] = {4, 0, 1, 2, 3};
+        for (unsigned i : order) {
+            if (device) break;
             if (!candidates[i][0]) continue;
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
