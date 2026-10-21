@@ -319,16 +319,6 @@ static id deviceForPort(unsigned port) {
             }
             return nullptr;
         }, gpu);
-        // The fixed CPU/memory/pipeline workload of native_bridge_metal_benchmark, once while the render server starts, against the host's run
-        // of the same (pipeline_timing_host draw=2): how much slower the tablet is, and where. Its second run on the desktop (150 s later) fell
-        // inside the user's testing and competed with the UI for the GPU (int-154), so it is gone.
-        pthread_t benchmark;
-        pthread_create(&benchmark, &attributes, [](void *arg) -> void * {
-            id dev = (__bridge id)arg;
-            sleep(3);
-            native_bridge_metal_benchmark(dev, "/System/Library/Frameworks/QuartzCore.framework/default.metallib", 8, nullptr, 0);
-            return nullptr;
-        }, (__bridge void *)device);
         pthread_t telemetry;
         pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
