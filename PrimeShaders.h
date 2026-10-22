@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <set>
@@ -46,16 +47,24 @@ static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 100000
 // The libraries: first the paths of the list file beside the bundle (NativeAdrenoMetal.primelist, every .metallib of the OS image, one
 // absolute path per line), because the render server's sandbox refuses to list most directories (a scan alone found 8 of 166), then
 // whatever the scan still reaches. A path is taken once, by its file identity.
-static std::vector<std::string> libraries(const std::string &listPath) {
+// `note` gets the list's outcome: its path, the lines read, the libraries kept and the stat failures with the last errno.
+static std::vector<std::string> libraries(const std::string &listPath, std::string &note) {
     std::vector<std::string> found;
     std::set<std::pair<dev_t, ino_t>> seen;
+    unsigned lines = 0, failed = 0;
+    int lastErrno = 0;
     if (!listPath.empty())
         for (const std::string &path : readLines(listPath)) {
+            ++lines;
             struct stat st = {};
-            if (!path.empty() && path[0] == '/' && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
-                seen.insert({st.st_dev, st.st_ino}).second)
-                found.push_back(path);
+            if (path.empty() || path[0] != '/') continue;
+            if (stat(path.c_str(), &st) != 0) {++failed; lastErrno = errno; continue;}
+            if (S_ISREG(st.st_mode) && seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
         }
+    char line[200];
+    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d", listPath.empty() ? "(none)" : listPath.c_str(), lines,
+             found.size(), failed, lastErrno);
+    note = line;
     for (const char *root : kRoots) {
         char *paths[] = {const_cast<char *>(root), nullptr};
         FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
@@ -132,7 +141,10 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     std::set<std::string> done = readLines(donePath);
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0;
-    for (const std::string &path : libraries(listPath)) {
+    std::string note;
+    const std::vector<std::string> paths = libraries(listPath, note);
+    appendLine(logPath, note);
+    for (const std::string &path : paths) {
         ++libs;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
