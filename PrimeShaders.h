@@ -10,7 +10,9 @@
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <dlfcn.h>
 #include <fts.h>
+#include <mach-o/getsect.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
@@ -36,6 +38,24 @@ static std::set<std::string> readLines(const std::string &path) {
     }
     return lines;
 }
+// The same list carried in this executable's __DATA,__primelist section (build-adreno-metal-plugin.py), for a render server whose sandbox
+// refuses to read the file beside the bundle.
+static std::set<std::string> embeddedLines() {
+    std::set<std::string> lines;
+    Dl_info info = {};
+    if (!dladdr(reinterpret_cast<const void *>(&embeddedLines), &info) || !info.dli_fbase) return lines;
+    unsigned long size = 0;
+    const uint8_t *data = getsectiondata(static_cast<const struct mach_header_64 *>(info.dli_fbase), "__DATA", "__primelist", &size);
+    if (!data) return lines;
+    const std::string text(reinterpret_cast<const char *>(data), size);
+    for (size_t at = 0; at < text.size();) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        if (end > at) lines.insert(text.substr(at, end - at));
+        at = end + 1;
+    }
+    return lines;
+}
 static void appendLine(const std::string &path, const std::string &line) {
     if (FILE *f = fopen(path.c_str(), "a")) {fprintf(f, "%s\n", line.c_str()); fclose(f);}
 }
@@ -53,16 +73,18 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     std::set<std::pair<dev_t, ino_t>> seen;
     unsigned lines = 0, failed = 0;
     int lastErrno = 0;
-    if (!listPath.empty())
-        for (const std::string &path : readLines(listPath)) {
-            ++lines;
-            struct stat st = {};
-            if (path.empty() || path[0] != '/') continue;
-            if (stat(path.c_str(), &st) != 0) {++failed; lastErrno = errno; continue;}
-            if (S_ISREG(st.st_mode) && seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
-        }
+    std::set<std::string> list = listPath.empty() ? std::set<std::string>() : readLines(listPath);
+    const char *source = listPath.empty() ? "(none)" : listPath.c_str();
+    if (list.empty()) {list = embeddedLines(); source = "embedded";}
+    for (const std::string &path : list) {
+        ++lines;
+        struct stat st = {};
+        if (path.empty() || path[0] != '/') continue;
+        if (stat(path.c_str(), &st) != 0) {++failed; lastErrno = errno; continue;}
+        if (S_ISREG(st.st_mode) && seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
+    }
     char line[200];
-    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d", listPath.empty() ? "(none)" : listPath.c_str(), lines,
+    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d", source, lines,
              found.size(), failed, lastErrno);
     note = line;
     for (const char *root : kRoots) {
