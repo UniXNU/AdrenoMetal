@@ -129,11 +129,10 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 @end
-// A no-copy import keeps its pages wired until the runtime frees it, which can be after the buffer object goes (a command buffer still
-// using it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that: run earlier, the owner unmaps pages the
-// kernel still holds wired, and vm_deallocate blocks until the GPU lets them go (int-233: Core Animation's render thread stuck in a Shmem
-// unmap under the context lock, SpringBoard's commits blocked on a full port).
-static std::atomic<uint64_t> gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
+// A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
+// it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
+// unmap or reuse pages the GPU still reads or writes.
+static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
 static void releaseBlock(void *context,void *pointer,uint64_t length) {
  gNoCopyReleased++;
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
@@ -1330,7 +1329,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   if(context)(void)(__bridge_transfer id)context;
   NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
  }
- if(context)gNoCopyMade++;
+ gNoCopyAll++;if(context)gNoCopyMade++;
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
  return (id<MTLBuffer>)buffer;
 }
@@ -1671,7 +1670,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
- row("N no-copy dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyReleased.load(),(unsigned long long)gNoCopyMade.load(),
+ row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
+  (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
