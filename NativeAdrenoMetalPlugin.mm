@@ -362,13 +362,14 @@ static id deviceForPort(unsigned port) {
             cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
             return nullptr;
         }, gpu);
-        // Every Metal library of the OS through the runtime, three minutes after the desktop came up (PrimeShaders.h).
+        // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
+        // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         pthread_create(&primer, &attributes, [](void *) -> void * {
             char list[1024];
-            prime::run((id<MTLDevice>)device, gCacheDirectory, 180,
+            prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
                        requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
             return nullptr;
         }, nullptr);
