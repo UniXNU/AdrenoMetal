@@ -1244,6 +1244,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
+// Core Image's CIMetalDeviceGetLimits reads both (Apple's GPU devices answer them; _MTLDevice does not): without them every CIContext
+// creation threw and iconservicesagent aborted while rasterizing symbol glyphs. The GPU has no memory of its own; it shares the system's.
+- (uint64_t)dedicatedMemorySize {return 0;}
+- (uint64_t)sharedMemorySize {return [NSProcessInfo processInfo].physicalMemory;}
 - (BOOL)isLowPower {return NO;}
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
