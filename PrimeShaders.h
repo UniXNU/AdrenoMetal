@@ -43,9 +43,19 @@ static void writeCurrent(const std::string &path, const std::string &line) {
 }
 static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;}
 
-static std::vector<std::string> libraries() {
+// The libraries: first the paths of the list file beside the bundle (NativeAdrenoMetal.primelist, every .metallib of the OS image, one
+// absolute path per line), because the render server's sandbox refuses to list most directories (a scan alone found 8 of 166), then
+// whatever the scan still reaches. A path is taken once, by its file identity.
+static std::vector<std::string> libraries(const std::string &listPath) {
     std::vector<std::string> found;
     std::set<std::pair<dev_t, ino_t>> seen;
+    if (!listPath.empty())
+        for (const std::string &path : readLines(listPath)) {
+            struct stat st = {};
+            if (!path.empty() && path[0] == '/' && stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode) &&
+                seen.insert({st.st_dev, st.st_ino}).second)
+                found.push_back(path);
+        }
     for (const char *root : kRoots) {
         char *paths[] = {const_cast<char *>(root), nullptr};
         FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
@@ -109,7 +119,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
 }
 
 // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
-static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds) {
+static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath) {
     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     const std::string donePath = root + "/prime-done", badPath = root + "/prime-bad", current = root + "/prime-current",
@@ -122,7 +132,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds) {
     std::set<std::string> done = readLines(donePath);
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0;
-    for (const std::string &path : libraries()) {
+    for (const std::string &path : libraries(listPath)) {
         ++libs;
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;

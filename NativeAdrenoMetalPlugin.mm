@@ -367,7 +367,9 @@ static id deviceForPort(unsigned port) {
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         pthread_create(&primer, &attributes, [](void *) -> void * {
-            prime::run((id<MTLDevice>)device, gCacheDirectory, 180);
+            char list[1024];
+            prime::run((id<MTLDevice>)device, gCacheDirectory, 180,
+                       requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
             return nullptr;
         }, nullptr);
         pthread_attr_destroy(&attributes);
