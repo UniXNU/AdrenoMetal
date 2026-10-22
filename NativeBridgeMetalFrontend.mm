@@ -115,9 +115,7 @@ static void waitForResource(id resource);
 @interface NBBuffer : NBObject
 @property(nonatomic) NmbBuffer *handle;
 @property(nonatomic) MTLResourceOptions options;
-@property(nonatomic,copy) void (^deallocator)(void *,NSUInteger);
 @property(nonatomic) void *wrapped;
-@property(nonatomic) IOSurfaceRef surfaceOwner; // keeps a shared import's CPU mapping alive
 @property(nonatomic,strong) id<MTLHeap> parentHeap;   // the heap that made the buffer, nil otherwise
 @property(nonatomic) NSUInteger heapOffset;
 @end
@@ -131,11 +129,19 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
 @end
+// A no-copy import keeps its pages wired until the runtime frees it, which can be after the buffer object goes (a command buffer still
+// using it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that: run earlier, the owner unmaps pages the
+// kernel still holds wired, and vm_deallocate blocks until the GPU lets them go (int-233: Core Animation's render thread stuck in a Shmem
+// unmap under the context lock, SpringBoard's commits blocked on a full port).
+static std::atomic<uint64_t> gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
+static void releaseBlock(void *context,void *pointer,uint64_t length) {
+ gNoCopyReleased++;
+ void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
+}
+static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
 @implementation NBBuffer
 - (void)dealloc {
- const NSUInteger length=nmb_buffer_length(_handle);nmb_buffer_release(_handle);
- if(_deallocator)_deallocator(_wrapped,length);
- if(_surfaceOwner)CFRelease(_surfaceOwner);
+ nmb_buffer_release(_handle);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
 - (void *)contents {return nmb_buffer_contents(_handle);}
@@ -169,10 +175,10 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
  if(buffer)return buffer;
- NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,base,bytes,MTLResourceStorageModeShared);
- if(!handle){NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
- buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
- buffer.surfaceOwner=(IOSurfaceRef)CFRetain(surface);
+ // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+ if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
+ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
  if(key) {
   // Bound metadata without retaining old frames. Evicting an association is
   // harmless: its owners still retain the actual import until their own end.
@@ -1318,10 +1324,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
- NmbBuffer *handle=nmb_buffer_new_no_copy(gDevice,pointer,length,options);
- if(!handle){NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;}
- NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;
- buffer.wrapped=pointer;buffer.deallocator=deallocator;
+ void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
+ NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
+ if(!handle) {
+  if(context)(void)(__bridge_transfer id)context;
+  NBLOG(@"native-metal: no-copy buffer refused: %@",lastError());return nil;
+ }
+ if(context)gNoCopyMade++;
+ NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;buffer.wrapped=pointer;
  return (id<MTLBuffer>)buffer;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
@@ -1661,6 +1671,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
   (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
   (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
+ row("N no-copy dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyReleased.load(),(unsigned long long)gNoCopyMade.load(),
+  (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};

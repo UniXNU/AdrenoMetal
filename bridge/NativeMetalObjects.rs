@@ -18,7 +18,7 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
+    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, Library, LoadAction,
     MetalLevel, Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
@@ -535,6 +535,40 @@ pub unsafe extern "C" fn nmb_buffer_new(device: *mut NmbDevice, length: u64, opt
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_buffer_new_no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64)
                                                 -> *mut NmbBuffer {
+    // SAFETY: the caller's contract.
+    unsafe { no_copy(device, pointer, length, options_word, None) }
+}
+
+/// The C side of a no-copy deallocator: `release(context, pointer, length)`.
+pub type NmbRelease = unsafe extern "C" fn(*mut c_void, *mut c_void, u64);
+
+struct ReleaseContext(*mut c_void);
+// SAFETY: the caller hands the context over for a call on any thread (Metal's deallocator contract).
+unsafe impl Send for ReleaseContext {}
+
+/// `nmb_buffer_new_no_copy` with Metal's deallocator: `release` runs once, on any thread, when the runtime frees its import of the pages
+/// (the last buffer over them and every command buffer using them are gone), so the pages stay pinned until then and are never unmapped
+/// under the GPU. A refused call never runs it: the caller still owns `context`.
+///
+/// # Safety
+/// `pointer` is page aligned, holds `length` bytes and stays mapped until `release` runs.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_buffer_new_no_copy_releasing(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64,
+                                                          release: Option<NmbRelease>, context: *mut c_void) -> *mut NmbBuffer {
+    let deallocator = release.map(|release| {
+        let context = ReleaseContext(context);
+        Box::new(move |pointer: NonNull<u8>, length: u64| {
+            let context = context;
+            // SAFETY: the caller's contract.
+            unsafe { release(context.0, pointer.as_ptr() as *mut c_void, length) }
+        }) as Deallocator
+    });
+    // SAFETY: the caller's contract.
+    unsafe { no_copy(device, pointer, length, options_word, deallocator) }
+}
+
+unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
+                  -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let device = get(device)?;
         // SAFETY: the caller's contract.
@@ -544,14 +578,14 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy(device: *mut NmbDevice, pointer:
         // simultaneous first constructors can allocate distinct imports of the
         // same pages. Cover every native ABI no-copy call, including mixtures
         // of raw buffers and IOSurface textures. Each call still gets its own
-        // buffer object. This ABI passes neither a dma-buf source nor a runtime
-        // deallocator; no caller callback runs under this gate. Drop it before
+        // buffer object. This ABI passes no dma-buf source; a deallocator runs
+        // only when an import is freed, never under this gate. Drop it before
         // returning/formatting a failure; GPU work and resource release never
         // take it. A device's unrelated APIs and other devices remain separate.
         let buffer = {
             let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // SAFETY: as above.
-            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, None) }
+            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
     })

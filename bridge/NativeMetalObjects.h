@@ -64,6 +64,10 @@ bool nmb_binary_archive_serialize(NmbBinaryArchive *, const char *path);
 NmbBuffer *nmb_buffer_new(NmbDevice *, uint64_t length, uint64_t options, const void *bytes /* NULL: zeroed */);
 /* Wraps page-aligned memory the caller keeps mapped until the buffer is released (an IOSurface's base, host pages). */
 NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, uint64_t options);
+/* The same with Metal's deallocator: release(context, pointer, length) runs once, on any thread, when the pages' import is freed (the last
+ * buffer and every command buffer using them are gone). A refused call (NULL) never runs it. */
+NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
+                                            void (*release)(void *context, void *pointer, uint64_t length), void *context);
 void nmb_buffer_release(NmbBuffer *);
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
