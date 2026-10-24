@@ -45,6 +45,8 @@ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
 bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+// No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
+bool nmb_no_copy_remaps(uint64_t out[2]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */
 struct NmbShaderCacheStats {
     uint64_t hits, misses, rejected, read_failures, writes, write_failures, evictions;

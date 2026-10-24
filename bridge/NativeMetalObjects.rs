@@ -155,7 +155,7 @@ pub unsafe extern "C" fn nmb_function_constant_air(length: *mut usize) -> *const
 
 // ---- device ----
 
-pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<()>);
+pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<NoCopyPages>);
 
 impl NmbDevice {
     /// The runtime judges the private properties by the family rows once.
@@ -185,7 +185,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
-        Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::new(()))))
+        Ok(boxed(NmbDevice(Device::system_default_with(&options).map_err(e("device"))?, std::sync::OnceLock::new(), std::sync::Mutex::default())))
     })
 }
 
@@ -638,12 +638,99 @@ pub unsafe extern "C" fn nmb_buffer_new_no_copy_releasing(device: *mut NmbDevice
     unsafe { no_copy(device, pointer, length, options_word, deallocator) }
 }
 
+/// The pages each no-copy range had when a buffer was last made over exactly it (`pages_identity`), under the device's no-copy gate.
+/// The runtime puts a no-copy buffer over exactly the bytes a live one was made over in that one's import, so over the pages that
+/// were there then (`host_aliases.rs`); Metal wires the pages at the address when it makes each buffer. CoreAnimation's render
+/// server maps a client's new shared memory (and IOSurfaces) where an earlier one was while its no-copy buffers still live in its
+/// caches: the GPU drew the earlier pages, another text mask in a label's place (GFXBench's test list; Metal Check case 40).
+#[derive(Default)]
+pub struct NoCopyPages {
+    seen: std::collections::HashMap<(u64, u64), u64>,
+    /// Whether `seen` was ever emptied to bound it: a range without a note may then have a live buffer over it.
+    forgot: bool,
+}
+
+const NO_COPY_RANGES_NOTED: usize = 8192;
+/// Ranges checked, and ranges whose pages had changed (reported to the runtime as remapped).
+static NO_COPY_REMAPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// What the pages under `length` bytes at `start` are, as the kernel names them: for each map entry over the range, the leaf VM
+/// object's (hashed) id and the object offset at the range's first byte in it. A remap puts other objects there, and the object of
+/// pages a live import pinned outlives the remap (the import holds it), so no new object takes its id while it lives. `None` where
+/// a page has no object yet (memory never touched, so not what a live import pinned) or the range is not all mapped.
+#[cfg(target_vendor = "apple")]
+fn pages_identity(start: u64, length: u64) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    // vm_region_submap_short_info_64 (mach/vm_region.h, packed to 4).
+    #[repr(C, packed(4))]
+    #[derive(Default)]
+    struct Region {
+        protection: i32,
+        max_protection: i32,
+        inheritance: u32,
+        offset: u64,
+        user_tag: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        is_submap: i32,
+        behavior: i32,
+        object_id: u32,
+        user_wired_count: u16,
+    }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn mach_vm_region_recurse(task: u32, address: *mut u64, size: *mut u64, depth: *mut u32, info: *mut i32, count: *mut u32) -> i32;
+    }
+    let end = start.checked_add(length)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let mut at = start;
+    while at < end {
+        let (mut address, mut size, mut depth) = (at, 0u64, 64u32);
+        let mut region = Region::default();
+        let mut count = (std::mem::size_of::<Region>() / 4) as u32;
+        // SAFETY: the out-parameters are this frame's, `count` words of `region`; the call reads no memory of the range.
+        let status = unsafe {
+            mach_vm_region_recurse(mach_task_self_, &mut address, &mut size, &mut depth, (&raw mut region).cast(), &mut count)
+        };
+        let (object, offset) = (region.object_id, region.offset);
+        if status != 0 || address > at || object == 0 {
+            return None;
+        }
+        (at, object, offset + (at - address)).hash(&mut hash);
+        at = address.checked_add(size)?;
+    }
+    Some(hash.finish())
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn pages_identity(_: u64, _: u64) -> Option<u64> {
+    None
+}
+
+/// Ranges checked and ranges found remapped since the device opened (`NoCopyPages`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_no_copy_remaps(out: *mut u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if out.is_null() {
+        return false;
+    }
+    // SAFETY: the header's two words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+    out[0] = NO_COPY_REMAPS[0].load(Relaxed);
+    out[1] = NO_COPY_REMAPS[1].load(Relaxed);
+    true
+}
+
 unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, options_word: u64, deallocator: Option<Deallocator>)
                   -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
         let device = get(device)?;
         // SAFETY: the caller's contract.
-        let memory = unsafe { HostMemory::new(NonNull::new(pointer as *mut u8).ok_or("null memory")?) };
+        let base = NonNull::new(pointer as *mut u8).ok_or("null memory")?;
+        // SAFETY: the caller's contract.
+        let memory = unsafe { HostMemory::new(base) };
         let modes = options(options_word)?;
         // The runtime's live-import lookup and subsequent join are separate:
         // simultaneous first constructors can allocate distinct imports of the
@@ -653,10 +740,39 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
         // only when an import is freed, never under this gate. Drop it before
         // returning/formatting a failure; GPU work and resource release never
         // take it. A device's unrelated APIs and other devices remain separate.
+        // The gate also holds each range's pages when a buffer was last made over it: pages other than those now (a remap) are
+        // reported to the runtime first, so the buffer imports the pages at the address instead of joining a live import of the
+        // earlier ones (`NoCopyPages`).
         let buffer = {
-            let _gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut gate = device.2.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let range = (pointer as u64, length);
+            let now = pages_identity(range.0, range.1);
+            let changed = match gate.seen.get(&range) {
+                Some(&noted) => now != Some(noted),
+                None => gate.forgot || now.is_none(),
+            };
+            NO_COPY_REMAPS[0].fetch_add(1, Relaxed);
+            if changed {
+                NO_COPY_REMAPS[1].fetch_add(1, Relaxed);
+                device.0.host_range_remapped(base, length);
+            }
             // SAFETY: as above.
-            unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) }
+            let buffer = unsafe { device.0.new_buffer_with_bytes_no_copy(memory, length, modes, deallocator) };
+            // Noted as they are once the buffer pinned them (pinning for writing may give the range objects of its own).
+            match (&buffer, pages_identity(range.0, range.1)) {
+                (Ok(_), Some(pages)) => {
+                    if gate.seen.len() >= NO_COPY_RANGES_NOTED && !gate.seen.contains_key(&range) {
+                        gate.seen.clear();
+                        gate.forgot = true;
+                    }
+                    gate.seen.insert(range, pages);
+                }
+                _ => {
+                    gate.seen.remove(&range);
+                }
+            }
+            buffer
         };
         Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
     })

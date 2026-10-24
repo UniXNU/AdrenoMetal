@@ -2279,6 +2279,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
   (unsigned long long)gNoCopyMade.load(),
   (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
+ {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);}
  // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
  // its shader cache: where the driver's compile time goes.
  uint64_t work[10]={};
