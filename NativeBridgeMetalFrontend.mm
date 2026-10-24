@@ -345,6 +345,74 @@ static void noteFormat(uint32_t format,bool made) {
  for(unsigned i=0;i<gFormatCount;i++)if(gFormats[i]==format)return;
  if(gFormatCount<8)gFormats[gFormatCount++]=format;
 }
+// Metal source: the system's own front end (MTLCompiler.framework, which MTLCompilerService runs for Apple's newLibraryWithSource:)
+// compiles it here, in the client, into a metallib of AIR, which is then loaded as any library from data. Request 13: two
+// little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments NUL-terminated. The reply, to a block
+// called before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the warnings after it, then the
+// metallib. One service per process, one request at a time.
+typedef void (^NBCodeGenReply)(int32_t status,const void *reply,size_t length,const char *message);
+static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString **warnings,NSString **failure) {
+ static void *service;
+ static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
+ static dispatch_once_t once;
+ static std::mutex lock;
+ dispatch_once(&once,^{
+  void *library=dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler",RTLD_NOW);
+  void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
+  build=library?(void (*)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply))dlsym(library,"MTLCodeGenServiceBuildRequest"):nullptr;
+  service=create && build?create("native-metal"):nullptr;
+ });
+ if(!service){*failure=@"the system's Metal compiler (MTLCompiler.framework) is not available";return nil;}
+ NSData *text=[source dataUsingEncoding:NSUTF8StringEncoding];
+ const char *options=arguments.UTF8String;
+ const uint64_t sourceBytes=(text.length+1+3)&~uint64_t(3),optionBytes=strlen(options)+1;
+ std::vector<uint8_t> request(16+sourceBytes+optionBytes,0);
+ memcpy(request.data(),&sourceBytes,8);memcpy(request.data()+8,&optionBytes,8);
+ memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
+ __block NSData *metallib=nil;
+ __block NSString *warned=nil,*message=nil;
+ __block bool called=false;
+ {
+  std::lock_guard<std::mutex> guard(lock);
+  build(service,nullptr,13,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
+   called=true;
+   uint32_t header=0,warning=0;
+   if(reply && length>=16){memcpy(&header,(const uint8_t *)reply+8,4);memcpy(&warning,(const uint8_t *)reply+12,4);}
+   if(status || !reply || length<16 || (uint64_t)header+warning>length) {
+    message=why && *why?@(why):[NSString stringWithFormat:@"the Metal compiler failed (status %d)",status];
+    return;
+   }
+   if(warning)warned=[[NSString alloc] initWithBytes:(const uint8_t *)reply+header length:warning encoding:NSUTF8StringEncoding];
+   metallib=[NSData dataWithBytes:(const uint8_t *)reply+header+warning length:length-header-warning];
+  });
+ }
+ if(!called)message=@"the Metal compiler did not answer";
+ *warnings=warned;*failure=message;
+ return message?nil:metallib;
+}
+// The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
+// invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
+// client may write.
+static NSString *compileArgument(NSString *text) {
+ if([text rangeOfCharacterFromSet:[NSCharacterSet characterSetWithCharactersInString:@" \t\"\\'"]].location==NSNotFound)return text;
+ NSString *escaped=[[text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"] stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+ return [NSString stringWithFormat:@"\"%@\"",escaped];
+}
+static NSString *compileArguments(MTLCompileOptions *options) {
+ NSMutableArray<NSString *> *arguments=[NSMutableArray arrayWithObjects:@"--driver-mode=metal",@"-x",@"metal",nil];
+ const NSUInteger version=options && options.languageVersion?(NSUInteger)options.languageVersion:(NSUInteger)MTLLanguageVersion3_1;
+ const unsigned major=(unsigned)(version>>16),minor=(unsigned)(version&0xffff);
+ [arguments addObject:[NSString stringWithFormat:major>=3?@"-std=metal%u.%u":@"-std=ios-metal%u.%u",major,minor]];
+ const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
+ [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ if(options.preserveInvariance)[arguments addObject:@"-fpreserve-invariance"];
+ if(options.optimizationLevel==MTLLibraryOptimizationLevelSize)[arguments addObject:@"-Os"];
+ [options.preprocessorMacros enumerateKeysAndObjectsUsingBlock:^(NSString *name,NSObject *value,BOOL *) {
+  [arguments addObject:compileArgument([NSString stringWithFormat:@"-D%@=%@",name,value])];
+ }];
+ [arguments addObject:compileArgument([@"-fmodules-cache-path=" stringByAppendingString:[NSTemporaryDirectory() stringByAppendingPathComponent:@"m2v-msl"]])];
+ return [arguments componentsJoinedByString:@" "];
+}
 static NSError *nbError(NSString *why) {
  return [NSError errorWithDomain:@"org.blu-sharky.native-metal" code:-1 userInfo:@{NSLocalizedDescriptionKey:why?:@"refused"}];
 }
@@ -1949,6 +2017,34 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  return [(id<MTLDevice>)self newLibraryWithURL:url error:error];
 }
 - (id<MTLLibrary>)newDefaultLibrary {return [(id<MTLDevice>)self newDefaultLibraryWithBundle:[NSBundle mainBundle] error:nil];}
+- (id<MTLLibrary>)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options error:(NSError **)error {
+ if(!source){if(error)*error=nbError(@"no source");return nil;}
+ if(options && options.libraryType==MTLLibraryTypeDynamic) {
+  if(error)*error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported
+                                  userInfo:@{NSLocalizedDescriptionKey:@"dynamic libraries are not supported"}];
+  return nil;
+ }
+ NSString *warnings=nil,*failure=nil;
+ NSData *metallib=compileMetalSource(source,compileArguments(options),&warnings,&failure);
+ if(!metallib) {
+  NBLOG(@"native-metal: newLibraryWithSource: %@",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)]);
+  if(error)*error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey:failure}];
+  return nil;
+ }
+ dispatch_data_t data=dispatch_data_create(metallib.bytes,metallib.length,nullptr,^{(void)metallib;});
+ id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithData:data error:error];
+ // As Metal does: a library compiled with warnings comes with them as a CompileWarning error.
+ if(library && warnings.length && error)
+  *error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileWarning userInfo:@{NSLocalizedDescriptionKey:warnings}];
+ return library;
+}
+- (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options completionHandler:(MTLNewLibraryCompletionHandler)handler {
+ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  NSError *error=nil;
+  id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
+  if(handler)handler(library,error);
+ });
+}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error {
  return [(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:MTLPipelineOptionNone reflection:nil error:error];
 }
