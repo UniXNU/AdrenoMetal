@@ -81,6 +81,7 @@ uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
+    uint64_t rotation, framebuffer_only, is_drawable;
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
@@ -203,6 +204,8 @@ int nmb_command_buffer_wait(NmbCommandBuffer *, uint64_t timeout_ms);
 /* Metal's MTLCommandBufferStatus (0 not enqueued .. 4 completed, 5 error). */
 uint64_t nmb_command_buffer_status(const NmbCommandBuffer *);
 size_t nmb_command_buffer_error(const NmbCommandBuffer *, char *out, size_t size);
+// Metal's MTLCommandBufferError code, or 0 for no error / a translation-runtime refusal.
+uint64_t nmb_command_buffer_metal_error_code(const NmbCommandBuffer *);
 double nmb_command_buffer_gpu_time(const NmbCommandBuffer *, bool end);
 
 /* Events: an MTLEvent (shared false) or an MTLSharedEvent within this process. */
@@ -228,6 +231,8 @@ struct NmbPassAttachment {
     NmbTexture *texture;
     uint64_t level, slice, depth_plane, load, store;
     double clear[4]; /* color, or clear[0] depth / stencil */
+    NmbTexture *resolve_texture;
+    uint64_t resolve_level, resolve_slice, resolve_depth_plane, resolve_filter;
 };
 struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;
@@ -248,6 +253,7 @@ bool nmb_encoder_set_sampler(NmbEncoder *, uint32_t stage, NmbSampler *, uint32_
 bool nmb_compute_set_pipeline(NmbEncoder *, NmbComputePipeline *);
 bool nmb_compute_set_threadgroup_memory(NmbEncoder *, uint32_t length, uint32_t index);
 bool nmb_compute_dispatch(NmbEncoder *, const uint64_t size[3], const uint64_t per_group[3], bool threads);
+bool nmb_compute_dispatch_indirect(NmbEncoder *, NmbBuffer *, uint64_t offset, const uint64_t per_group[3]);
 
 bool nmb_render_set_pipeline(NmbEncoder *, NmbRenderPipeline *);
 bool nmb_render_set_depth_stencil(NmbEncoder *, NmbDepthStencil *);

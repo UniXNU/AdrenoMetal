@@ -10,6 +10,7 @@
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <algorithm>
 #include <atomic>
 #include <mutex>
@@ -276,16 +277,26 @@ static void noteProblem(NSString *what) {
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
 static std::atomic<uint64_t> gSurfaceTextures,gSurfaceRefusals,gSurfacePlanar;
+static std::atomic<uint64_t> gSurfaceRotations[5];
+static uint64_t textureRotation(id descriptor) {
+ SEL sel=sel_registerName("rotation");
+ return [descriptor respondsToSelector:sel]?((NSUInteger (*)(id,SEL))objc_msgSend)(descriptor,sel):0;
+}
+static bool textureFlag(id descriptor,const char *name) {
+ SEL sel=sel_registerName(name);
+ return [descriptor respondsToSelector:sel] && ((BOOL (*)(id,SEL))objc_msgSend)(descriptor,sel);
+}
 // The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
-struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height;};
+struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,surfaceWidth,surfaceHeight,rotation;bool framebufferOnly;};
 static SurfaceRefusal gSurfaceLastRefusal;
 // Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row.
 extern "C" volatile uint32_t native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate;
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
-                   d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0};
+                   d?(uint32_t)d.pixelFormat:0,offset,row,surface?IOSurfaceGetAllocSize(surface):0,d?d.width:0,d?d.height:0,
+                   surface?IOSurfaceGetWidth(surface):0,surface?IOSurfaceGetHeight(surface):0,textureRotation(d),textureFlag(d,"framebufferOnly")};
  std::lock_guard<std::mutex> lock(gProblemLock);gSurfaceLastRefusal=r;
 }
 static void noteFormat(uint32_t format,bool made) {
@@ -428,7 +439,8 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
 }
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
- *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions};
+ *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
+       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable")};
  return true;
 }
 @implementation NBTexture
@@ -445,14 +457,15 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLResourceOptions)resourceOptions {return (MTLResourceOptions)_descriptor.options;}
 - (MTLStorageMode)storageMode {return (MTLStorageMode)((_descriptor.options&MTLResourceStorageModeMask)>>MTLResourceStorageModeShift);}
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
-- (BOOL)isFramebufferOnly {return NO;}
+- (BOOL)isFramebufferOnly {return _descriptor.framebuffer_only!=0;}
+- (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
 - (IOSurfaceRef)iosurface {return _surface;}
 - (NSUInteger)iosurfacePlane {return 0;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
 - (id<MTLTexture>)parentTexture {return _parent;}
-- (NSUInteger)rotation {return 0;}
+- (NSUInteger)rotation {return _descriptor.rotation;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
@@ -880,6 +893,13 @@ static void waitForResource(id resource) {
 }
 - (void)dispatchThreads:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:true];}
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
+- (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:(MTLSize)group {
+ if(![(id)buffer isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
+ [self.commandBuffer.resourceOwners addObject:buffer];
+ gDispatches++;self.commandBuffer->encodedWork.dispatches++;
+ const uint64_t g[3]={group.width,group.height,group.depth};
+ [self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g) what:"indirect dispatch"];
+}
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
@@ -1085,6 +1105,15 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  if(self.failedLocally)return nbError(self.encodeFailure);
  if(self.status!=MTLCommandBufferStatusError)return nil;
  char text[512]={};nmb_command_buffer_error(_handle,text,sizeof text);
+ uint64_t code=nmb_command_buffer_metal_error_code(_handle);
+#if TARGET_OS_IPHONE
+ // The runtime uses Metal's macOS code 11 for Vulkan DeviceLost. iOS has no
+ // removable GPU: this is revoked access after the process's context fault,
+ // represented by AccessRevoked (4), not the unavailable DeviceRemoved code.
+ if(code==11)code=MTLCommandBufferErrorAccessRevoked;
+#endif
+ if(code)return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:(NSInteger)code
+                              userInfo:@{NSLocalizedDescriptionKey:[NSString stringWithUTF8String:text]}];
  return nbError([NSString stringWithUTF8String:text]);
 }
 // Debug groups and cache hints name work for tools and the driver's caches; they change nothing the GPU computes here.
@@ -1134,6 +1163,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
   [_resourceOwners addObject:texture];
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
+  if(a.resolveTexture) {
+   if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
+   NBTexture *resolve=(NBTexture *)a.resolveTexture;
+   [_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;
+   out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -1143,6 +1179,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  }
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
+ pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
@@ -1712,6 +1749,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  // the plane's own address and rows. Only a plain surface has no planes, and then only plane 0 exists.
  const size_t planes=surface?IOSurfaceGetPlaneCount(surface):0;
  if(!surface || !d || (planes?plane>=planes:plane!=0)){refuseSurface(1,surface,d,plane,0,0);return nil;}
+ const uint64_t rotation=textureRotation(d);if(rotation<5)gSurfaceRotations[rotation]++;
  if(planes)gSurfacePlanar++;
  void *base=IOSurfaceGetBaseAddress(surface);const size_t page=(size_t)getpagesize(),allocation=IOSurfaceGetAllocSize(surface);
  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
@@ -2103,6 +2141,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
    (unsigned long long)r.height,r.pixelFormat);
+  if(r.step)row("SR layout surface=%llux%llu rotation=%llu framebuffer=%u",(unsigned long long)r.surfaceWidth,
+   (unsigned long long)r.surfaceHeight,(unsigned long long)r.rotation,r.framebufferOnly);
+  row("ROT imports 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu",(unsigned long long)gSurfaceRotations[0].load(),
+   (unsigned long long)gSurfaceRotations[1].load(),(unsigned long long)gSurfaceRotations[2].load(),
+   (unsigned long long)gSurfaceRotations[3].load(),(unsigned long long)gSurfaceRotations[4].load());
   row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
   row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
  }

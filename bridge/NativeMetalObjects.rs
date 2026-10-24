@@ -27,6 +27,7 @@ use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Duration;
+use metal2vulkan_runtime::{CommandBufferError, FailureOrigin, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter};
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -768,6 +769,9 @@ pub struct NmbTextureDescriptor {
     pub array_length: u64,
     pub usage: u64,
     pub options: u64,
+    pub rotation: u64,
+    pub framebuffer_only: u64,
+    pub is_drawable: u64,
 }
 
 pub struct NmbTexture(Texture);
@@ -785,6 +789,9 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.array_length = d.array_length;
     out.usage = raw::<TextureUsage>(d.usage, "texture usage")?;
     out.resource_options = options(d.options)?;
+    out.rotation = d.rotation;
+    out.framebuffer_only = d.framebuffer_only != 0;
+    out.is_drawable = d.is_drawable != 0;
     Ok(out)
 }
 
@@ -902,6 +909,9 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             array_length: t.array_length(),
             usage: t.usage().as_raw() as u64,
             options: t.resource_options().raw(),
+            rotation: t.rotation(),
+            framebuffer_only: u64::from(t.framebuffer_only()),
+            is_drawable: u64::from(t.is_drawable()),
         };
         Ok(())
     })
@@ -1657,7 +1667,36 @@ pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuf
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
-    guard(0, || Ok(get(command_buffer)?.0.error_description().map_or(0, |text| copy_out(&text, out, size))))
+    guard(0, || {
+        let cb = &get(command_buffer)?.0;
+        let description = cb.error_description().or_else(|| cb.error().map(|error| format!("{error:?}")));
+        Ok(description.map_or(0, |text| copy_out(&text, out, size)))
+    })
+}
+
+// Preserve the runtime's distinction between Metal failures and translation refusals.
+// In particular, DeviceLost must reach clients as MTLCommandBufferErrorDeviceRemoved.
+fn metal_command_buffer_error_code(error: Option<CommandBufferError>) -> u64 {
+    error.filter(|error| error.origin() == FailureOrigin::Metal).map_or(0, |error| error.metal_code())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_metal_error_code(command_buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || Ok(metal_command_buffer_error_code(get(command_buffer)?.0.error())))
+}
+
+#[cfg(test)]
+mod command_buffer_error_tests {
+    use super::*;
+
+    #[test]
+    fn metal_errors_keep_their_codes_and_runtime_refusals_keep_their_domain() {
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::DeviceLost)), 11);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::PageFault)), 3);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::OutOfMemory)), 8);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::Refused)), 0);
+        assert_eq!(metal_command_buffer_error_code(None), 0);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1832,6 +1871,11 @@ pub struct NmbPassAttachment {
     pub load: u64,
     pub store: u64,
     pub clear: [f64; 4],
+    pub resolve_texture: *mut NmbTexture,
+    pub resolve_level: u64,
+    pub resolve_slice: u64,
+    pub resolve_depth_plane: u64,
+    pub resolve_filter: u64,
 }
 
 #[repr(C)]
@@ -1858,6 +1902,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         let mut pass = RenderPassDescriptor::new();
         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
             slot.texture = texture_of(a)?;
+            slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
+            slot.resolve_level = a.resolve_level;
+            slot.resolve_slice = a.resolve_slice;
+            slot.resolve_depth_plane = a.resolve_depth_plane;
             slot.level = a.level;
             slot.slice = a.slice;
             slot.depth_plane = a.depth_plane;
@@ -1867,6 +1915,11 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         }
         let depth = &mut pass.depth_attachment;
         depth.texture = texture_of(&d.depth)?;
+        depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.clone());
+        depth.resolve_level = d.depth.resolve_level;
+        depth.resolve_slice = d.depth.resolve_slice;
+        depth.resolve_depth_plane = d.depth.resolve_depth_plane;
+        depth.depth_resolve_filter = MultisampleDepthResolveFilter::from_raw(d.depth.resolve_filter).map_err(e("depth resolve filter"))?;
         depth.level = d.depth.level;
         depth.slice = d.depth.slice;
         depth.depth_plane = d.depth.depth_plane;
@@ -1875,6 +1928,11 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.clear_depth = d.depth.clear[0];
         let stencil = &mut pass.stencil_attachment;
         stencil.texture = texture_of(&d.stencil)?;
+        stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.clone());
+        stencil.resolve_level = d.stencil.resolve_level;
+        stencil.resolve_slice = d.stencil.resolve_slice;
+        stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
+        stencil.stencil_resolve_filter = MultisampleStencilResolveFilter::from_raw(d.stencil.resolve_filter).map_err(e("stencil resolve filter"))?;
         stencil.level = d.stencil.level;
         stencil.slice = d.stencil.slice;
         stencil.depth_plane = d.stencil.depth_plane;
@@ -2053,6 +2111,16 @@ pub extern "C" fn nmb_compute_dispatch(encoder: *mut NmbEncoder, size: *const u6
         let (s, g) = (Size::new(s[0], s[1], s[2]), Size::new(g[0], g[1], g[2]));
         let c = compute(encoder)?;
         if threads { c.dispatch_threads(s, g) } else { c.dispatch_threadgroups(s, g) }.map_err(e("dispatch"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_dispatch_indirect(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, per_group: *const u64) -> bool {
+    guard(false, || {
+        let g = triple(per_group)?;
+        compute(encoder)?.dispatch_threadgroups_indirect(&get(buffer)?.0, offset, Size::new(g[0], g[1], g[2]))
+            .map_err(e("indirect dispatch"))?;
         Ok(true)
     })
 }
