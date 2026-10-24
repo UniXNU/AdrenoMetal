@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -303,6 +304,28 @@ static bool textureFlag(id descriptor,const char *name) {
  SEL sel=sel_registerName(name);
  return [descriptor respondsToSelector:sel] && ((BOOL (*)(id,SEL))objc_msgSend)(descriptor,sel);
 }
+// Diagnostic, render server only, while /private/var/ngpu/debug/texture-log exists when it starts: every texture made over an
+// IOSurface or a no-copy buffer is logged "native-metal: texture-log ..." with the surface's own size, rows, format and planes
+// next to the texture's, to tell which memory and which shape a garbled layer was drawn from.
+static const bool gLogTextures=isRenderServer() && access("/private/var/ngpu/debug/texture-log",F_OK)==0;
+static std::atomic<uint64_t> gTexturesLogged;
+// The first 2000 texture-log lines, then every 100th: the uploads run every frame.
+static bool textureLogTurn() {const uint64_t n=++gTexturesLogged;return n<=2000 || n%100==0;}
+static void logTexture(const char *kind,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,const void *bytes,
+                       NSUInteger offset,NSUInteger row,bool made) {
+ if(!textureLogTurn())return;
+ const uint64_t n=gTexturesLogged.load();
+ if(surface)
+  NSLog(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu rot %lu | surface id %u %zux%zu rows %zu fmt %08x planes %zu "
+        @"plane %lu alloc %zu | offset %lu rows %lu",(unsigned long long)n,kind,made?"made":"REFUSED",(unsigned long)d.width,
+        (unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)textureRotation(d),IOSurfaceGetID(surface),
+        IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),IOSurfaceGetPixelFormat(surface),
+        IOSurfaceGetPlaneCount(surface),(unsigned long)plane,IOSurfaceGetAllocSize(surface),(unsigned long)offset,(unsigned long)row);
+ else
+  NSLog(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu | memory %p offset %lu rows %lu",(unsigned long long)n,kind,
+        made?"made":"REFUSED",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,bytes,(unsigned long)offset,
+        (unsigned long)row);
+}
 // The last refused surface texture: the check that refused it (1 plane, 2 base, 3 plane range, 4 import, 5 texture), the surface's format,
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
 struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,surfaceWidth,surfaceHeight,rotation;bool framebufferOnly;};
@@ -506,6 +529,12 @@ NB_RESOURCE_SPI
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
+ if(gLogTextures && textureLogTurn())
+  NSLog(@"native-metal: texture-log %llu replaceRegion origin %lu,%lu size %lux%lu level %lu slice %lu rows %lu | texture %llux%llu fmt %llu "
+        @"options %llx surface %u",(unsigned long long)gTexturesLogged.load(),(unsigned long)r.origin.x,(unsigned long)r.origin.y,
+        (unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)level,(unsigned long)slice,(unsigned long)row,
+        (unsigned long long)_descriptor.width,(unsigned long long)_descriptor.height,(unsigned long long)_descriptor.format,
+        (unsigned long long)_descriptor.options,_surface?IOSurfaceGetID(_surface):0u);
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
@@ -567,7 +596,9 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 }
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
- return (id<MTLTexture>)textureOnBuffer(self,d,offset,row,false);
+ NBTexture *texture=textureOnBuffer(self,d,offset,row,false);
+ if(gLogTextures && self.wrapped)logTexture("no-copy",d,nullptr,0,self.wrapped,offset,row,texture!=nil);
+ return (id<MTLTexture>)texture;
 }
 - (id<MTLTexture>)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
@@ -807,6 +838,62 @@ static uint64_t hashSource(const uint8_t *bytes,size_t length) {
  for(;at+8<=length;at+=8){memcpy(&word,bytes+at,8);hash=(hash^word)*1099511628211ull;}
  for(;at<length;at++)hash=(hash^bytes[at])*1099511628211ull;
  return hash;
+}
+// With the texture log on, the 30 commits after /private/var/ngpu/debug/dump-now is touched (its modification time changes;
+// the render server may read it but not remove it) list every texture they use in surf/manifest.txt of this process's temporary
+// directory, and write the bytes of each IOSurface of at most 1 MiB once, named by the surface's id, the texture's size and
+// pixel format and the surface's own size, rows and format: what the client drew, next to how this process reads it.
+static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
+ static std::atomic<int64_t> seen{0};
+ static std::atomic<int> left{0};
+ static std::mutex lock;
+ static NSMutableSet *written;
+ struct stat trigger;
+ if(stat("/private/var/ngpu/debug/dump-now",&trigger)!=0)return;
+ const int64_t stamp=(int64_t)trigger.st_mtimespec.tv_sec*1000000000+trigger.st_mtimespec.tv_nsec;
+ if(seen.exchange(stamp)!=stamp)left=30;
+ if(left<=0)return;
+ left--;
+ std::lock_guard<std::mutex> guard(lock);
+ if(!written)written=[NSMutableSet new];
+ NSString *directory=[NSTemporaryDirectory() stringByAppendingPathComponent:@"surf"];
+ [[NSFileManager defaultManager] createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:nil];
+ FILE *manifest=fopen([directory stringByAppendingPathComponent:@"manifest.txt"].fileSystemRepresentation,"a");
+ if(manifest)fprintf(manifest,"commit %d: %lu textures\n",30-left.load(),(unsigned long)owners.count);
+ for(id object in owners) {
+  if(![object isKindOfClass:[NBTexture class]])continue;
+  NBTexture *texture=(NBTexture *)object;const NmbTextureDescriptor d=texture.descriptor;IOSurfaceRef surface=texture.surface;
+  const uint32_t f=surface?IOSurfaceGetPixelFormat(surface):0;
+  char name[200];
+  if(surface)snprintf(name,sizeof name,"%u-%llux%llu-f%llu-%zux%zu-r%zu-%c%c%c%c-o%lu",IOSurfaceGetID(surface),(unsigned long long)d.width,
+                      (unsigned long long)d.height,(unsigned long long)d.format,IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),
+                      IOSurfaceGetBytesPerRow(surface),(char)(f>>24),(char)(f>>16),(char)(f>>8),(char)f,(unsigned long)texture.offset);
+  else snprintf(name,sizeof name,"texture %llux%llu-f%llu-levels%llu%s",(unsigned long long)d.width,(unsigned long long)d.height,
+                (unsigned long long)d.format,(unsigned long long)d.levels,texture.buffer.wrapped?"-nocopy":texture.buffer?"-buffer":"");
+  if(manifest)fprintf(manifest,"  %s%s rows %lu offset %lu\n",name,[textures containsObject:texture]?" sampled-or-target":"",
+                      (unsigned long)texture.rowBytes,(unsigned long)texture.offset);
+  if(!surface && texture.buffer.wrapped && texture.rowBytes) {
+   // A texture over a client's memory (a no-copy buffer): its rows as this process reads them, once per place and shape.
+   const size_t span=(size_t)texture.rowBytes*(size_t)d.height;
+   const uint8_t *start=(const uint8_t *)texture.buffer.wrapped+texture.offset;
+   NSString *tag=[NSString stringWithFormat:@"nc-%p-%llux%llu-f%llu-r%lu",start,(unsigned long long)d.width,(unsigned long long)d.height,
+                  (unsigned long long)d.format,(unsigned long)texture.rowBytes];
+   if(span && span<=(1u<<20) && ![written containsObject:tag]) {
+    [written addObject:tag];
+    FILE *out=fopen([directory stringByAppendingPathComponent:[tag stringByAppendingString:@".raw"]].fileSystemRepresentation,"wb");
+    if(out){fwrite(start,1,span,out);fclose(out);}
+   }
+   continue;
+  }
+  const size_t alloc=surface?IOSurfaceGetAllocSize(surface):0;
+  NSNumber *key=@(surface?IOSurfaceGetID(surface):0);
+  if(!alloc || alloc>(1u<<20) || [written containsObject:key])continue;
+  [written addObject:key];
+  FILE *out=fopen([directory stringByAppendingPathComponent:[NSString stringWithFormat:@"%s.raw",name]].fileSystemRepresentation,"wb");
+  if(!out)continue;
+  fwrite(IOSurfaceGetBaseAddress(surface),1,alloc,out);fclose(out);
+ }
+ if(manifest)fclose(manifest);
 }
 @interface NBCommandBuffer : NBObject {
 @public
@@ -1086,6 +1173,14 @@ static void waitForResource(id resource) {
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ if(gLogTextures && textureLogTurn()) {
+  const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
+  NSLog(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
+        @"buffer %lu%s | texture %llux%llu fmt %llu options %llx",(unsigned long long)gTexturesLogged.load(),(unsigned long)z.width,
+        (unsigned long)z.height,(unsigned long)dO.x,(unsigned long)dO.y,(unsigned long)level,(unsigned long)slice,(unsigned long)row,
+        (unsigned long)image,(unsigned long)o,(unsigned long)[s length],[(NBBuffer *)s wrapped]?" no-copy":"",
+        (unsigned long long)t.width,(unsigned long long)t.height,(unsigned long long)t.format,(unsigned long long)t.options);
+ }
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
@@ -1320,6 +1415,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
+  if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
@@ -1800,6 +1896,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
+ if(gLogTextures && textureLogTurn())
+  NSLog(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+        (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
+        (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
+        (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
 }
@@ -1821,6 +1922,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+ if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
