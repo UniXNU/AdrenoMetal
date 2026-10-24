@@ -27,6 +27,9 @@
 #include <thread>
 #include <fcntl.h>
 #include <unistd.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -273,6 +276,19 @@ static void noteProblem(NSString *what) {
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);}while(0)
+// The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
+// the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
+// and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
+// again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
+static void endRenderServerAfterGpuLoss() {
+ static const bool renderServer=!strcmp(getprogname(),"backboardd");
+ static std::atomic<bool> ending{false};
+ if(!renderServer || ending.exchange(true))return;
+ NBLOG(@"native-metal: the render server's GPU context is lost; ending backboardd so launchd starts it again");
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(500*NSEC_PER_MSEC)),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
+  kill(getpid(),SIGTERM);
+ });
+}
 // The pixel formats textures were asked for (first eight distinct), with how many were refused: native_bridge_metal_formats.
 static uint32_t gFormats[8];static unsigned gFormatCount;static std::atomic<uint64_t> gTextureRefusals;
 // Textures over IOSurfaces: made, refused, and how many of the requests named a planar surface.
@@ -1236,9 +1252,12 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
  }
+ // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
+ const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
  void (^run)(void)=^{
   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
   dispatch_group_leave(self->_handlers);
+  if(lost)endRenderServerAfterGpuLoss();
  };
  dispatch_queue_t queue=_queue.completionQueue;
  if(queue)dispatch_async(queue,run);else run();
