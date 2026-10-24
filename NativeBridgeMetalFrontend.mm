@@ -30,6 +30,7 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "bridge/NativeMetalObjects.h"
 #include "NativeBridgeMetalFrontend.h"
 
@@ -280,10 +281,10 @@ static void noteProblem(NSString *what) {
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
 // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
 // again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
+static bool isRenderServer() {static const bool renderServer=!strcmp(getprogname(),"backboardd");return renderServer;}
 static void endRenderServerAfterGpuLoss() {
- static const bool renderServer=!strcmp(getprogname(),"backboardd");
  static std::atomic<bool> ending{false};
- if(!renderServer || ending.exchange(true))return;
+ if(!isRenderServer() || ending.exchange(true))return;
  NBLOG(@"native-metal: the render server's GPU context is lost; ending backboardd so launchd starts it again");
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(500*NSEC_PER_MSEC)),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
   kill(getpid(),SIGTERM);
@@ -794,12 +795,26 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
+// Diagnostic, render server only, while /private/var/ngpu/debug/source-race exists when it starts: each small source a command buffer
+// samples (a texture over an IOSurface or over a no-copy buffer, at most 1 MiB of rows) is hashed at commit and again at completion.
+// One that changed in between was rewritten by its client while the GPU could read it, which puts two frames' rows into one frame
+// (garbled labels, the status bar clock). Logged "native-metal: source-race ...", the first 50 of each kind and every 500th.
+static const bool gWatchSources=isRenderServer() && access("/private/var/ngpu/debug/source-race",F_OK)==0;
+struct WatchedSource {const uint8_t *bytes;size_t length;uint64_t hash;bool surface;uint32_t width,height,row;};
+static std::atomic<uint64_t> gSourcesWatched[2],gSourcesRaced[2];
+static uint64_t hashSource(const uint8_t *bytes,size_t length) {
+ uint64_t hash=1469598103934665603ull,word;size_t at=0;
+ for(;at+8<=length;at+=8){memcpy(&word,bytes+at,8);hash=(hash^word)*1099511628211ull;}
+ for(;at<length;at++)hash=(hash^bytes[at])*1099511628211ull;
+ return hash;
+}
 @interface NBCommandBuffer : NBObject {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
  uint64_t createdUs;
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
+ std::vector<WatchedSource> watched;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -812,6 +827,9 @@ static void notified(void *context,uint64_t value) {
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
+// The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
+@property(nonatomic,strong) NSMutableSet *sampled;
+- (void)watchTexture:(NBTexture *)texture;
 @property(nonatomic,strong) dispatch_group_t handlers;
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
@@ -859,6 +877,7 @@ static void waitForResource(id resource) {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
@@ -1104,6 +1123,16 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
+- (void)watchTexture:(NBTexture *)texture {
+ const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
+ const size_t length=(size_t)texture.rowBytes*(size_t)texture.descriptor.height;
+ if(!bytes || !length || length>(1u<<20) || self.committed)return;
+ if(!_sampled)_sampled=[NSMutableSet set];
+ if([_sampled containsObject:texture])return;
+ [_sampled addObject:texture];
+ watched.push_back({bytes+texture.offset,length,0,texture.surface!=nullptr,(uint32_t)texture.descriptor.width,
+                    (uint32_t)texture.descriptor.height,(uint32_t)texture.rowBytes});
+}
 - (id<MTLCommandQueue>)commandQueue {return (id<MTLCommandQueue>)_queue;}
 - (BOOL)retainedReferences {return YES;}
 // Protected content is not supported (the runtime's AppleOnlyCall::SetProtectionOptions takes Metal's default only): any other option fails
@@ -1252,6 +1281,18 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   if(!_schedulingDelivered){_schedulingDelivered=YES;[_scheduledHandlers removeAllObjects];dispatch_group_leave(_schedulingHandlers);}
   completedHandlers=[_completedHandlers copy];[_completedHandlers removeAllObjects];
  }
+ if(!watched.empty()) {
+  // A command buffer refused before its commit never hashed its sources.
+  for(const WatchedSource &source:watched)
+   if(!self.failedLocally && hashSource(source.bytes,source.length)!=source.hash) {
+    const uint64_t raced=++gSourcesRaced[source.surface];
+    if(raced<=50 || raced%500==0)
+     NSLog(@"native-metal: source-race %s %ux%u, rows %u bytes: rewritten while the GPU could read it (%llu of %llu such sources)",
+           source.surface?"IOSurface":"no-copy buffer",source.width,source.height,source.row,(unsigned long long)raced,
+           (unsigned long long)gSourcesWatched[source.surface].load());
+   }
+  watched.clear();[_sampled removeAllObjects];
+ }
  // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
  const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
  void (^run)(void)=^{
@@ -1279,6 +1320,7 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
+  for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
