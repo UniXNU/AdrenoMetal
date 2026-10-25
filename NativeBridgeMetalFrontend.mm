@@ -350,6 +350,17 @@ static void noteFormat(uint32_t format,bool made) {
 // to a block called before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the warnings after it,
 // then the metallib. One service per process, one request at a time.
 typedef void (^NBCodeGenReply)(int32_t status,const void *reply,size_t length,const char *message);
+// The compiler was written for MTLCompilerService's threads and recurses deeply; here it runs on whatever thread asked, and a dispatch
+// worker's 512 KiB stack was too small for it (Aztec Ruins' shaders: a stack-protector abort inside libGPUCompilerImplLazy). A request
+// runs on a thread of its own with a 16 MiB stack, the caller waiting.
+static void *runBlock(void *block) {@autoreleasepool {((__bridge void (^)(void))block)();}return nullptr;}
+static void onLargeStack(void (^body)(void)) {
+ pthread_attr_t attr;pthread_t thread;
+ if(pthread_attr_init(&attr)){body();return;}
+ const bool made=!pthread_attr_setstacksize(&attr,16u<<20) && !pthread_create(&thread,&attr,runBlock,(__bridge void *)body);
+ pthread_attr_destroy(&attr);
+ if(made)pthread_join(thread,nullptr);else body();
+}
 static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
  static void *service;
  static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
@@ -367,7 +378,7 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  __block bool called=false;
  {
   std::lock_guard<std::mutex> guard(lock);
-  build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
+  onLargeStack(^{build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
    called=true;
    uint32_t header=0,warning=0;
    if(reply && length>=16){memcpy(&header,(const uint8_t *)reply+8,4);memcpy(&warning,(const uint8_t *)reply+12,4);}
@@ -377,7 +388,7 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
    }
    if(warning)warned=[[NSString alloc] initWithBytes:(const uint8_t *)reply+header length:warning encoding:NSUTF8StringEncoding];
    metallib=[NSData dataWithBytes:(const uint8_t *)reply+header+warning length:length-header-warning];
-  });
+  });});
  }
  if(!called)message=@"the Metal compiler did not answer";
  *warnings=warned;*failure=message;
