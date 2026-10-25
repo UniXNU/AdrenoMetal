@@ -1920,9 +1920,15 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (BOOL)isRemovable {return NO;}
 - (BOOL)isHeadless {return NO;}
 // supportsFamily: and the other queries the runtime answers are installed from it (installAnswers); supportsFamily: also answers the target
-// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). No legacy feature set is claimed: the
-// base implementation reads Apple tables this device does not have.
-- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {(void)set;return NO;}
+// hardware's families (the bridge's TARGET_FAMILIES, journaled with their waived rows as F lines). A legacy feature set is a family at an OS
+// release: iOS_GPUFamilyN_vM is MTLGPUFamilyAppleN on an iOS that has vM (this one has them all), so it is answered as supportsFamily:
+// answers that family. The base implementation would read Apple tables this device does not have; answering NO had GFXBench refuse
+// Car Chase (UNSUPPORTED_TC_TYPE: ASTC is iOS_GPUFamily2_v1) and turn off tessellation. macOS and tvOS sets are not this platform.
+- (BOOL)supportsFeatureSet:(MTLFeatureSet)set {
+ static const uint8_t families[]={1,2,1,2,3,1,2,3,1,2,3,4,1,2,3,4,5};   // MTLFeatureSet_iOS_GPUFamily1_v1 (0) to iOS_GPUFamily5_v1 (16)
+ if((NSUInteger)set>=sizeof families)return NO;
+ return [(id<MTLDevice>)self supportsFamily:(MTLGPUFamily)(MTLGPUFamilyApple1+families[set]-1)];
+}
 // The original discovery (_MTLAddDevice) runs these four on every device it registers. The target's own versions fill the base class's limits
 // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
 // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
