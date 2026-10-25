@@ -345,13 +345,12 @@ static void noteFormat(uint32_t format,bool made) {
  for(unsigned i=0;i<gFormatCount;i++)if(gFormats[i]==format)return;
  if(gFormatCount<8)gFormats[gFormatCount++]=format;
 }
-// Metal source: the system's own front end (MTLCompiler.framework, which MTLCompilerService runs for Apple's newLibraryWithSource:)
-// compiles it here, in the client, into a metallib of AIR, which is then loaded as any library from data. Request 13: two
-// little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments NUL-terminated. The reply, to a block
-// called before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the warnings after it, then the
-// metallib. One service per process, one request at a time.
+// The system's own front end (MTLCompiler.framework, which MTLCompilerService runs for Apple's newLibraryWithSource: and stitched
+// libraries) answers a request here, in the client, with a metallib of AIR, which is then loaded as any library from data. The reply,
+// to a block called before the request returns, is a header whose u32s at 8 and 12 are its own size and that of the warnings after it,
+// then the metallib. One service per process, one request at a time.
 typedef void (^NBCodeGenReply)(int32_t status,const void *reply,size_t length,const char *message);
-static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString **warnings,NSString **failure) {
+static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
  static void *service;
  static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
  static dispatch_once_t once;
@@ -363,18 +362,12 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
   service=create && build?create("native-metal"):nullptr;
  });
  if(!service){*failure=@"the system's Metal compiler (MTLCompiler.framework) is not available";return nil;}
- NSData *text=[source dataUsingEncoding:NSUTF8StringEncoding];
- const char *options=arguments.UTF8String;
- const uint64_t sourceBytes=(text.length+1+3)&~uint64_t(3),optionBytes=strlen(options)+1;
- std::vector<uint8_t> request(16+sourceBytes+optionBytes,0);
- memcpy(request.data(),&sourceBytes,8);memcpy(request.data()+8,&optionBytes,8);
- memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
  __block NSData *metallib=nil;
  __block NSString *warned=nil,*message=nil;
  __block bool called=false;
  {
   std::lock_guard<std::mutex> guard(lock);
-  build(service,nullptr,13,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
+  build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
    called=true;
    uint32_t header=0,warning=0;
    if(reply && length>=16){memcpy(&header,(const uint8_t *)reply+8,4);memcpy(&warning,(const uint8_t *)reply+12,4);}
@@ -389,6 +382,17 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
  if(!called)message=@"the Metal compiler did not answer";
  *warnings=warned;*failure=message;
  return message?nil:metallib;
+}
+// Metal source, request 13: two little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments
+// NUL-terminated.
+static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString **warnings,NSString **failure) {
+ NSData *text=[source dataUsingEncoding:NSUTF8StringEncoding];
+ const char *options=arguments.UTF8String;
+ const uint64_t sourceBytes=(text.length+1+3)&~uint64_t(3),optionBytes=strlen(options)+1;
+ std::vector<uint8_t> request(16+sourceBytes+optionBytes,0);
+ memcpy(request.data(),&sourceBytes,8);memcpy(request.data()+8,&optionBytes,8);
+ memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
+ return codeGenRequest(13,request,warnings,failure);
 }
 // The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
 // invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
@@ -680,6 +684,9 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 // ---- libraries, functions, states ----
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
+@property(nonatomic,strong) id storage;          // what keeps the metallib's bytes mapped: its functions' bitcode, for stitching
+@property(nonatomic) const uint8_t *bytes;
+@property(nonatomic) size_t length;
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error;
 @end
@@ -688,8 +695,8 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
-@property(nonatomic,strong) NBLibrary *library;      // where it came from, and the values it was specialized with (nil: none), for
-@property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // the zero-rest rebuild of a refused pipeline
+@property(nonatomic,strong) NBLibrary *library;      // where it came from (stitching reads its bitcode), and the values it was
+@property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
@@ -814,6 +821,39 @@ static std::string quartzCoreCallers();
  return (id<MTLFunction>)function;
 }
 @end
+// A function's wrapped bitcode in its library's metallib: the function list's entry NAMEd as the function, MDSZ bytes at OFFT's bitcode
+// offset into the bitcode section (header: function list at 24, bitcode section offset and size at 72 and 80; tags a fourcc, a u16
+// length and the bytes, up to ENDT).
+static NSData *functionBitcode(NBFunction *function) {
+ NBLibrary *library=function.library;const uint8_t *file=library.bytes;const size_t length=library.length;
+ const char *wanted=function.name.UTF8String;
+ if(!file || !wanted || length<88 || memcmp(file,"MTLB",4))return nil;
+ uint64_t listAt,bitcodeAt,bitcodeSize;memcpy(&listAt,file+24,8);memcpy(&bitcodeAt,file+72,8);memcpy(&bitcodeSize,file+80,8);
+ if(listAt>length-4 || bitcodeAt>length || bitcodeSize>length-bitcodeAt)return nil;
+ uint32_t count;memcpy(&count,file+listAt,4);
+ size_t at=listAt+4;
+ for(uint32_t i=0;i<count;i++) {
+  uint32_t size;if(at>length-4)return nil;memcpy(&size,file+at,4);
+  if(size<8 || size>length-at)return nil;
+  const size_t end=at+size;
+  std::string name;uint64_t bytes=0,offset=0;bool sized=false,placed=false;
+  for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
+   if(t+6>end)return nil;
+   uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
+   if(n>end-(t+6))return nil;
+   if(!memcmp(file+t,"NAME",4))name.assign((const char *)v,strnlen((const char *)v,n));
+   else if(!memcmp(file+t,"MDSZ",4) && n>=8){memcpy(&bytes,v,8);sized=true;}
+   else if(!memcmp(file+t,"OFFT",4) && n>=24){memcpy(&offset,v+16,8);placed=true;}
+   t+=6+n;
+  }
+  if(name==wanted) {
+   if(!sized || !placed || offset>bitcodeSize || bytes>bitcodeSize-offset)return nil;
+   return [NSData dataWithBytes:file+bitcodeAt+offset length:(NSUInteger)bytes];
+  }
+  at=end;
+ }
+ return nil;
+}
 @interface NBComputePipeline : NBObject
 @property(nonatomic) NmbComputePipeline *handle;
 @end
@@ -1861,6 +1901,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  return true;
 }
 
+// The target's own _MTLDevice method that writes stitching graphs as the DAG text Metal's compiler reads (the base class of the device).
+@protocol NBOriginalStitching
+- (NSString *)newDagStringWithGraphs:(NSArray<MTLFunctionStitchingGraph *> *)graphs;
+@end
 @interface NBDeviceMethods : NSObject
 @end
 @implementation NBDeviceMethods
@@ -1996,16 +2040,18 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
  const uint64_t libraryBegan=nowUs();
- NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);(void)mapped;gTimeLibrary.add(libraryBegan);
+ NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
+ if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
  NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;if(error)*error=nil;return (id<MTLLibrary>)library;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
+ if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {
  if(!url.isFileURL){if(error)*error=nbError(@"a file URL is required");return nil;}
@@ -2042,6 +2088,47 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
   NSError *error=nil;
   id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithSource:source options:options error:&error];
+  if(handler)handler(library,error);
+ });
+}
+// Function stitching (Core Image makes its kernels so: a DAG of ci_stdlib_stitchable's functions with builtin and buffer nodes) is the
+// front end's request 14, as Metal's own MTLLibraryBuilder writes it: u32 fourcc tags, 'dag ' and the graphs' DAG text NUL-terminated,
+// 'numf' and the u32 count of functions, then for each function 'bitc', the u32 size and its wrapped bitcode. The reply is a metallib
+// with the stitched functions. Metal's own path wants its own function objects (their library data) and refuses these.
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d error:(NSError **)error {
+ NSArray<MTLFunctionStitchingGraph *> *graphs=d.functionGraphs;NSArray<id<MTLFunction>> *functions=d.functions;
+ if(!graphs.count || !functions.count){if(error)*error=nbError(@"a stitched library needs graphs and functions");return nil;}
+ NSString *dag=[(id<NBOriginalStitching>)self newDagStringWithGraphs:graphs];
+ if(!dag.length){if(error)*error=nbError(@"the stitching graphs have no DAG text");return nil;}
+ std::vector<uint8_t> request;
+ auto word=[&](uint32_t v){const uint8_t *b=(const uint8_t *)&v;request.insert(request.end(),b,b+4);};
+ const char *text=dag.UTF8String;
+ word(0x64616720 /* 'dag ' */);request.insert(request.end(),text,text+strlen(text)+1);
+ word(0x6e756d66 /* 'numf' */);word((uint32_t)functions.count);
+ for(id function in functions) {
+  NSData *bitcode=[function isKindOfClass:[NBFunction class]]?functionBitcode((NBFunction *)function):nil;
+  if(!bitcode){if(error)*error=nbError([NSString stringWithFormat:@"stitched function %@ has no bitcode here",[function name]]);return nil;}
+  word(0x62697463 /* 'bitc' */);word((uint32_t)bitcode.length);
+  const uint8_t *b=(const uint8_t *)bitcode.bytes;request.insert(request.end(),b,b+bitcode.length);
+ }
+ NSString *warnings=nil,*failure=nil;
+ NSData *metallib=codeGenRequest(14,request,&warnings,&failure);
+ if(!metallib) {
+  NBLOG(@"native-metal: stitched library: %@",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)]);
+  noteProblem([@"stitched library: " stringByAppendingString:[failure substringToIndex:MIN(failure.length,(NSUInteger)120)]]);
+  if(error)*error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey:failure}];
+  return nil;
+ }
+ dispatch_data_t data=dispatch_data_create(metallib.bytes,metallib.length,nullptr,^{(void)metallib;});
+ return [(id<MTLDevice>)self newLibraryWithData:data error:error];
+}
+- (id<MTLLibrary>)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d destinationBinaryArchive:(id<MTLBinaryArchive>)archive error:(NSError **)error {
+ (void)archive;return [(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:error];
+}
+- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)d completionHandler:(MTLNewLibraryCompletionHandler)handler {
+ dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+  NSError *error=nil;
+  id<MTLLibrary> library=[(id<MTLDevice>)self newLibraryWithStitchedDescriptor:d error:&error];
   if(handler)handler(library,error);
  });
 }
