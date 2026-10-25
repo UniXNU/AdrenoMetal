@@ -712,6 +712,8 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
+- (MTLPatchType)patchType {return (MTLPatchType)nmb_function_patch_type(_handle);}
+- (NSInteger)patchControlPointCount {return (NSInteger)nmb_function_patch_control_point_count(_handle);}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -1285,6 +1287,48 @@ static void waitForResource(id resource) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o {
  [self drawIndexedPrimitives:t indexCount:n indexType:k indexBuffer:b indexBufferOffset:o instanceCount:1 baseVertex:0 baseInstance:0];
 }
+// ---- tessellation ----
+// A buffer a patch draw reads, kept alive with the command buffer; NO (refused) for one this frontend did not make.
+- (BOOL)own:(id<MTLBuffer>)b what:(NSString *)what {
+ if(!b)return YES;
+ if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:[@"foreign " stringByAppendingString:what]];return NO;}
+ [self.commandBuffer.resourceOwners addObject:b];return YES;
+}
+- (void)setTessellationFactorBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o instanceStride:(NSUInteger)stride {
+ if(![self own:b what:@"tessellation factor buffer"])return;
+ [self check:nmb_render_set_tessellation_factor_buffer(self.handle,b?[(NBBuffer *)b handle]:nullptr,o,stride) what:"setTessellationFactorBuffer"];
+}
+- (void)setTessellationFactorScale:(float)scale {
+ [self check:nmb_render_set_tessellation_factor_scale(self.handle,scale) what:"setTessellationFactorScale"];
+}
+- (void)patches:(NSUInteger)points start:(NSUInteger)start count:(NSUInteger)count patchIndex:(id<MTLBuffer>)pi offset:(NSUInteger)po
+          points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
+ if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
+ gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
+     ci?[(NBBuffer *)ci handle]:nullptr,co,(uint32_t)instances,(uint32_t)base,ib?[(NBBuffer *)ib handle]:nullptr,io) what:"drawPatches"];
+}
+- (void)drawPatches:(NSUInteger)n patchStart:(NSUInteger)s patchCount:(NSUInteger)c patchIndexBuffer:(id<MTLBuffer>)pi patchIndexBufferOffset:(NSUInteger)po
+      instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+ [self patches:n start:s count:c patchIndex:pi offset:po points:nil offset:0 instances:i base:b indirect:nil offset:0];
+}
+- (void)drawPatches:(NSUInteger)n patchIndexBuffer:(id<MTLBuffer>)pi patchIndexBufferOffset:(NSUInteger)po indirectBuffer:(id<MTLBuffer>)ib
+ indirectBufferOffset:(NSUInteger)io {
+ if(!ib){[self.commandBuffer refuse:@"nil indirect buffer"];return;}
+ [self patches:n start:0 count:0 patchIndex:pi offset:po points:nil offset:0 instances:0 base:0 indirect:ib offset:io];
+}
+- (void)drawIndexedPatches:(NSUInteger)n patchStart:(NSUInteger)s patchCount:(NSUInteger)c patchIndexBuffer:(id<MTLBuffer>)pi
+    patchIndexBufferOffset:(NSUInteger)po controlPointIndexBuffer:(id<MTLBuffer>)ci controlPointIndexBufferOffset:(NSUInteger)co
+             instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+ if(!ci){[self.commandBuffer refuse:@"nil control point index buffer"];return;}
+ [self patches:n start:s count:c patchIndex:pi offset:po points:ci offset:co instances:i base:b indirect:nil offset:0];
+}
+- (void)drawIndexedPatches:(NSUInteger)n patchIndexBuffer:(id<MTLBuffer>)pi patchIndexBufferOffset:(NSUInteger)po
+   controlPointIndexBuffer:(id<MTLBuffer>)ci controlPointIndexBufferOffset:(NSUInteger)co indirectBuffer:(id<MTLBuffer>)ib
+      indirectBufferOffset:(NSUInteger)io {
+ if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
+ [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
+}
 - (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
@@ -1821,6 +1865,11 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
    if(a.bufferIndex<31){MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex];p->layouts[a.bufferIndex]={l.stride,(uint64_t)l.stepFunction,l.stepRate};}
   }
  }
+ // A post-tessellation vertex function's pipeline draws patches with the descriptor's tessellation state (GFXBench's Car Chase).
+ if(nmb_function_patch_type(p->vertex)!=MTLPatchTypeNone)
+  p->tessellation={1,d.maxTessellationFactor,(uint64_t)d.tessellationPartitionMode,(uint64_t)d.tessellationFactorFormat,
+      (uint64_t)d.tessellationFactorStepFunction,(uint64_t)d.tessellationOutputWindingOrder,(uint64_t)d.tessellationControlPointIndexType,
+      (uint64_t)d.tessellationFactorScaleEnabled};
  return true;
 }
 

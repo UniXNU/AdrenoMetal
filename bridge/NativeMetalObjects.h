@@ -132,6 +132,8 @@ NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *na
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
+uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
+int64_t nmb_function_patch_control_point_count(const NmbFunction *); /* -1: no patch, or no count stated */
 
 NmbComputePipeline *nmb_compute_pipeline_new(NmbDevice *, NmbFunction *);
 void nmb_compute_pipeline_release(NmbComputePipeline *);
@@ -150,6 +152,11 @@ struct NmbRenderPipelineDescriptor {
     uint64_t vertex_inputs; /* 0: no vertex descriptor */
     struct NmbVertexAttribute attributes[31];
     struct NmbVertexLayout layouts[31];
+    /* A post-tessellation vertex function's state; tessellates 0 leaves it unset (zeroed descriptors stay untessellated). */
+    struct NmbTessellation {
+        uint64_t tessellates, max_factor, partition_mode, factor_format, factor_step_function, output_winding, control_point_index_type,
+            factor_scale_enabled;
+    } tessellation;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.
@@ -270,6 +277,14 @@ bool nmb_render_set_visibility_mode(NmbEncoder *, uint64_t mode, uint64_t offset
 bool nmb_render_draw(NmbEncoder *, uint64_t primitive, uint32_t start, uint32_t count, uint32_t instances, uint32_t base_instance);
 bool nmb_render_draw_indexed(NmbEncoder *, uint64_t primitive, uint32_t count, uint64_t index_type, NmbBuffer *indices, uint64_t offset,
                              uint32_t instances, int32_t base_vertex, uint32_t base_instance);
+/* NULL buffer unsets it. */
+bool nmb_render_set_tessellation_factor_buffer(NmbEncoder *, NmbBuffer *, uint64_t offset, uint64_t instance_stride);
+bool nmb_render_set_tessellation_factor_scale(NmbEncoder *, float scale);
+/* NULL indirect: patch_start, patch_count, instances and base_instance; otherwise read from it. NULL control_point_index: the patches'
+ * own control points. NULL patch_index: patches patch_start + i. */
+bool nmb_render_draw_patches(NmbEncoder *, uint32_t control_points, uint32_t patch_start, uint32_t patch_count, NmbBuffer *patch_index,
+                             uint64_t patch_index_offset, NmbBuffer *control_point_index, uint64_t control_point_index_offset,
+                             uint32_t instances, uint32_t base_instance, NmbBuffer *indirect, uint64_t indirect_offset);
 
 bool nmb_blit_copy_buffer(NmbEncoder *, NmbBuffer *source, uint64_t source_offset, NmbBuffer *destination, uint64_t destination_offset,
                           uint64_t size);

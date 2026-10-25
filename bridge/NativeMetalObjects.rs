@@ -10,11 +10,12 @@ use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
-    TextureUsage, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+    TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureUsage,
+    TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource, VertexAttributeDescriptor, VertexBufferLayoutDescriptor,
-    VertexDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource,
+    TessellationDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
@@ -1279,6 +1280,18 @@ pub extern "C" fn nmb_function_type(function: *const NmbFunction) -> u64 {
     guard(0, || Ok(get(function)?.0.function_type().map_err(e("function type"))?.as_raw() as u64))
 }
 
+/// `patchType`: 0 (none) for a function other than a post-tessellation vertex function.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_patch_type(function: *const NmbFunction) -> u64 {
+    guard(0, || Ok(get(function)?.0.patch_type().map_err(e("patch type"))?.as_raw() as u64))
+}
+
+/// `patchControlPointCount`: -1 for no patch, or a patch that states no count.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_patch_control_point_count(function: *const NmbFunction) -> i64 {
+    guard(-1, || Ok(get(function)?.0.patch_control_point_count().map_err(e("patch control point count"))?.map_or(-1, i64::from)))
+}
+
 // ---- pipelines and states ----
 
 pub struct NmbComputePipeline(ComputePipelineState);
@@ -1419,6 +1432,20 @@ pub struct NmbRenderPipelineDescriptor {
     pub vertex_inputs: u64,
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
+    pub tessellation: NmbTessellation,
+}
+
+/// A post-tessellation vertex function's state; `tessellates` 0 leaves the descriptor's tessellation unset.
+#[repr(C)]
+pub struct NmbTessellation {
+    pub tessellates: u64,
+    pub max_factor: u64,
+    pub partition_mode: u64,
+    pub factor_format: u64,
+    pub factor_step_function: u64,
+    pub output_winding: u64,
+    pub control_point_index_type: u64,
+    pub factor_scale_enabled: u64,
 }
 
 fn optional_format(value: u64) -> Result<Option<PixelFormat>, String> {
@@ -1512,6 +1539,19 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
                 }
             }
             out.vertex_descriptor = Some(inputs);
+        }
+        let t = &d.tessellation;
+        if t.tessellates != 0 {
+            let mut tessellation = TessellationDescriptor::default();
+            tessellation.max_tessellation_factor = u32::try_from(t.max_factor).map_err(|_| "tessellation factor".to_string())?;
+            tessellation.partition_mode = raw::<TessellationPartitionMode>(t.partition_mode, "partition mode")?;
+            tessellation.factor_format = raw::<TessellationFactorFormat>(t.factor_format, "factor format")?;
+            tessellation.factor_step_function = raw::<TessellationFactorStepFunction>(t.factor_step_function, "factor step function")?;
+            tessellation.output_winding_order = raw::<Winding>(t.output_winding, "output winding")?;
+            tessellation.control_point_index_type = raw::<TessellationControlPointIndexType>(t.control_point_index_type,
+                                                                                             "control point index type")?;
+            tessellation.factor_scale_enabled = t.factor_scale_enabled != 0;
+            out.tessellation = Some(tessellation);
         }
         Ok(out)
 }
@@ -2359,6 +2399,53 @@ pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u
         render(encoder)?.draw_indexed_primitives(raw::<PrimitiveType>(primitive, "primitive")?, count,
                                                  raw::<IndexType>(index_type, "index type")?, &get(indices)?.0, offset, instances,
                                                  base_vertex, base_instance).map_err(e("indexed draw"))?;
+        Ok(true)
+    })
+}
+
+/// `setTessellationFactorBuffer:offset:instanceStride:`; a null buffer unsets it.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_tessellation_factor_buffer(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, instance_stride: u64)
+                                                            -> bool {
+    guard(false, || {
+        let buffer = if buffer.is_null() { None } else { Some(&get(buffer)?.0) };
+        render(encoder)?.set_tessellation_factor_buffer(buffer, offset, instance_stride).map_err(e("tessellation factor buffer"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_tessellation_factor_scale(encoder: *mut NmbEncoder, scale: f32) -> bool {
+    guard(false, || {
+        render(encoder)?.set_tessellation_factor_scale(scale);
+        Ok(true)
+    })
+}
+
+fn optional_buffer<'a>(buffer: *mut NmbBuffer) -> Result<Option<&'a Buffer>, String> {
+    if buffer.is_null() { Ok(None) } else { Ok(Some(&get(buffer)?.0)) }
+}
+
+/// The four patch draws: `indirect` null takes `patch_start`, `patch_count`, `instances` and `base_instance`, otherwise reads them from
+/// it at `indirect_offset`; `control_points_index` null draws the patches' own control points, otherwise indexes them through it.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn nmb_render_draw_patches(encoder: *mut NmbEncoder, control_points: u32, patch_start: u32, patch_count: u32,
+                                          patch_index: *mut NmbBuffer, patch_index_offset: u64, control_point_index: *mut NmbBuffer,
+                                          control_point_index_offset: u64, instances: u32, base_instance: u32, indirect: *mut NmbBuffer,
+                                          indirect_offset: u64) -> bool {
+    guard(false, || {
+        let r = render(encoder)?;
+        let patch_index = optional_buffer(patch_index)?;
+        let result = match (optional_buffer(control_point_index)?, optional_buffer(indirect)?) {
+            (None, None) => r.draw_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, instances, base_instance),
+            (None, Some(indirect)) => r.draw_patches_indirect(control_points, patch_index, patch_index_offset, indirect, indirect_offset),
+            (Some(points), None) => r.draw_indexed_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, points,
+                                                           control_point_index_offset, instances, base_instance),
+            (Some(points), Some(indirect)) => r.draw_indexed_patches_indirect(control_points, patch_index, patch_index_offset, points,
+                                                                              control_point_index_offset, indirect, indirect_offset),
+        };
+        result.map_err(e("patch draw"))?;
         Ok(true)
     })
 }
