@@ -886,10 +886,28 @@ static NSData *functionBitcode(NBFunction *function) {
 @end
 @interface NBSampler : NBObject
 @property(nonatomic) NmbSampler *handle;
+@property(nonatomic) NmbSamplerDescriptor descriptor;   // what made it, for a binding that replaces its LOD clamps
 @end
-@implementation NBSampler
+@implementation NBSampler {
+ NSMutableDictionary<NSString *,NBSampler *> *_clamped;
+}
 - (void)dealloc {nmb_sampler_release(_handle);}
 - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
+// This sampler with its LOD clamps replaced (a binding's lodMinClamp:lodMaxClamp:, which GFXBench's Car Chase uses): made once per pair
+// and kept, at most 64 pairs (a caller that varies them every draw starts over rather than growing without bound).
+- (NBSampler *)withLodMin:(float)lodMin max:(float)lodMax {
+ if(lodMin==_descriptor.lod_min && lodMax==_descriptor.lod_max)return self;
+ NSString *key=[NSString stringWithFormat:@"%a %a",lodMin,lodMax];
+ @synchronized(self) {
+  if(!_clamped || _clamped.count>=64)_clamped=[NSMutableDictionary dictionary];
+  if(NBSampler *found=_clamped[key])return found;
+  NmbSamplerDescriptor d=_descriptor;d.lod_min=lodMin;d.lod_max=lodMax;
+  NmbSampler *handle=nmb_sampler_new(gDevice,&d);
+  if(!handle){NBLOG(@"native-metal: sampler with LOD clamps refused: %@",lastError());return nil;}
+  NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=d;_clamped[key]=sampler;
+  return sampler;
+ }
+}
 @end
 @interface NBDepthStencil : NBObject
 @property(nonatomic) NmbDepthStencil *handle;
@@ -1090,6 +1108,12 @@ static void waitForResource(id resource) {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
+- (void)sampler:(id<MTLSamplerState>)sampler lodMin:(float)lodMin max:(float)lodMax index:(NSUInteger)index stage:(uint32_t)stage {
+ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ NBSampler *clamped=sampler?[(NBSampler *)sampler withLodMin:lodMin max:lodMax]:nil;
+ if(sampler && !clamped){[_commandBuffer refuse:@"sampler with LOD clamps refused"];return;}
+ [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
+}
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
@@ -1124,6 +1148,13 @@ static void waitForResource(id resource) {
  for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:0];
 }
 - (void)setSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:0];}
+- (void)setSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {[self sampler:s lodMin:a max:b index:i stage:0];}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:0];
+}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])a lodMaxClamps:(const float [])b withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] lodMin:a[k] max:b[k] index:r.location+k stage:0];
+}
 - (void)setThreadgroupMemoryLength:(NSUInteger)n atIndex:(NSUInteger)i {
  [self check:nmb_compute_set_threadgroup_memory(self.handle,(uint32_t)n,(uint32_t)i) what:"setThreadgroupMemoryLength"];
 }
@@ -1171,6 +1202,20 @@ static void waitForResource(id resource) {
 }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:1];}
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:2];}
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {[self sampler:s lodMin:a max:b index:i stage:1];}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {[self sampler:s lodMin:a max:b index:i stage:2];}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:1];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:2];
+}
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])a lodMaxClamps:(const float [])b withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] lodMin:a[k] max:b[k] index:r.location+k stage:1];
+}
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s lodMinClamps:(const float [])a lodMaxClamps:(const float [])b withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] lodMin:a[k] max:b[k] index:r.location+k stage:2];
+}
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
@@ -2251,7 +2296,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
      (uint64_t)d.borderColor,(uint64_t)d.normalizedCoordinates,d.maxAnisotropy,(uint64_t)d.compareFunction,(uint64_t)d.lodAverage,d.lodMinClamp,d.lodMaxClamp};
  NmbSampler *handle=nmb_sampler_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: sampler refused: %@",lastError());return nil;}
- NBSampler *sampler=[NBSampler new];sampler.handle=handle;return (id<MTLSamplerState>)sampler;
+ NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=s;return (id<MTLSamplerState>)sampler;
 }
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)d {
  auto face=[](MTLStencilDescriptor *s)->NmbStencil {
