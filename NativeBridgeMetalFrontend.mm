@@ -1394,12 +1394,14 @@ static bool dumpOnly() {static const bool only=getenv("NATIVE_METAL_DUMP_ONLY")!
 static void dumpLine(NBCommandBuffer *commandBuffer,NSString *line) {
  if(dumpOnly() || !dumpMaybe(commandBuffer))return;
  if(!commandBuffer.dumpLog)commandBuffer.dumpLog=[NSMutableArray array];
- if(commandBuffer.dumpLog.count<2000)[commandBuffer.dumpLog addObject:line];
+ if(commandBuffer.dumpLog.count<20000)[commandBuffer.dumpLog addObject:line];
 }
-// The first 16 words of bound data as floats, and how many of its first 256 words are zero or NaN.
+// The first 16 words of bound data as floats (NATIVE_METAL_DUMP_WORDS=N: N of them), and how many of its first 256 words are zero
+// or NaN.
 static NSString *dumpWords(const uint8_t *p,size_t n) {
+ static const size_t words=[]{const char *v=getenv("NATIVE_METAL_DUMP_WORDS");return v && atoi(v)>0?size_t(atoi(v)):size_t(16);}();
  NSMutableString *s=[NSMutableString string];
- for(size_t i=0;i<std::min<size_t>(n/4,16);i++){float f;memcpy(&f,p+4*i,4);[s appendFormat:@" %.4g",f];}
+ for(size_t i=0;i<std::min<size_t>(n/4,words);i++){float f;memcpy(&f,p+4*i,4);[s appendFormat:@" %.4g",f];}
  size_t zero=0,nan=0;const size_t all=std::min<size_t>(n/4,256);
  for(size_t i=0;i<all;i++){uint32_t w;memcpy(&w,p+4*i,4);float f;memcpy(&f,&w,4);zero+=!w;nan+=std::isnan(f);}
  [s appendFormat:@" (of %zu words %zu zero, %zu NaN)",all,zero,nan];
@@ -1414,6 +1416,12 @@ static bool dumpShown(uint32_t draw) {
   return std::make_pair(first,last);
  }();
  return draw>=shown.first && draw<=shown.second;
+}
+// NATIVE_METAL_DUMP_DRAWS_MATCH=TEXT: also every draw whose pipeline's description holds TEXT (renderDumpInfo, e.g. "c5=f92b" for
+// the pipelines that blend into color 5), whatever its number.
+static bool dumpMatched(NSString *pipeline) {
+ static NSString *const text=[]{const char *v=getenv("NATIVE_METAL_DUMP_DRAWS_MATCH");return v?@(v):nil;}();
+ return text.length && [pipeline containsString:text];
 }
 static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id texture,NSUInteger level,NSUInteger slice,NSString *where) {
  if(!texture || ![texture isKindOfClass:[NBTexture class]])return;
@@ -1473,13 +1481,27 @@ static void waitForResource(id resource) {
   if(!_dumpRuns)_dumpRuns=[NSMutableArray array];
   [_dumpRuns addObject:[NSMutableArray arrayWithObjects:pipeline,depth,@(_dumpDraws+1),@1,nil]];
  }
- if(!dumpShown(++_dumpDraws))return;
+ if(!dumpShown(++_dumpDraws) && !dumpMatched(pipeline))return;
  dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u draw %u: %@ | %@ | depth %@",_commandBuffer.dumpPasses,_dumpDraws,what,
                           [_dumpPipeline dumpInfo]?:@"no pipeline",_dumpDepth?[_dumpDepth dumpInfo]:@"none"]);
  for(NSNumber *key in [_dumpBound.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
   const uint32_t k=key.unsignedIntValue;id value=_dumpBound[key];
-  NSString *where=[NSString stringWithFormat:@"  %s %u",(k>>8)==1?"vertex":(k>>8)==2?"fragment":"kernel",k&0xff];
-  if([value isKindOfClass:[NSData class]]) {
+  // Key stage << 8 | index: stages 0-2 buffers and bytes, 4-6 textures, 8-10 samplers (compute, vertex, fragment).
+  const uint32_t stage=(k>>8)&3,kind=(k>>8)>>2;
+  NSString *where=[NSString stringWithFormat:@"  %s %s %u",stage==1?"vertex":stage==2?"fragment":"kernel",kind==1?"texture":kind==2?"sampler":"",
+                   k&0xff];
+  if(kind==1 && [value isKindOfClass:[NBTexture class]]) {
+   NBTexture *t=value;const NmbTextureDescriptor d=t.descriptor;
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@: type %llu f%llu %llux%llux%llu array %llu mips %llu%@",where,(unsigned long long)d.type,
+                            (unsigned long long)d.format,(unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.depth,
+                            (unsigned long long)d.array_length,(unsigned long long)d.levels,t.label.length?[@" " stringByAppendingString:t.label]:@""]);
+  } else if(kind==2 && [value isKindOfClass:[NBSampler class]]) {
+   const NmbSamplerDescriptor d=[(NBSampler *)value descriptor];
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@: min %llu mag %llu mip %llu address %llu,%llu,%llu compare %llu lod %g..%g",where,
+                            (unsigned long long)d.min_filter,(unsigned long long)d.mag_filter,(unsigned long long)d.mip_filter,
+                            (unsigned long long)d.s_address,(unsigned long long)d.t_address,(unsigned long long)d.r_address,
+                            (unsigned long long)d.compare,d.lod_min,d.lod_max]);
+  } else if([value isKindOfClass:[NSData class]]) {
    NSData *data=value;
    dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ bytes %lu:%@",where,(unsigned long)data.length,dumpWords((const uint8_t *)data.bytes,data.length)]);
   } else if([value isKindOfClass:[NSArray class]]) {
@@ -1508,12 +1530,14 @@ static void waitForResource(id resource) {
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
+ [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  [self check:nmb_encoder_set_texture(_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ [self dumpBind:sampler index:index stage:stage+8];
  [self check:nmb_encoder_set_sampler(_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"];
 }
 - (void)sampler:(id<MTLSamplerState>)sampler lodMin:(float)lodMin max:(float)lodMax index:(NSUInteger)index stage:(uint32_t)stage {
