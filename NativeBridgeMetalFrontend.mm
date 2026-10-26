@@ -565,7 +565,13 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
 }
 // Metal source, request 13: two little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments
 // NUL-terminated.
+// DEBUG: NATIVE_METAL_DUMP_TESS=1 writes to standard error every Metal source with a patch function, and every tessellation
+// pipeline's tessellation state and vertex inputs (what an app's tessellation asks of the bridge).
+static const bool gDumpTessellation=getenv("NATIVE_METAL_DUMP_TESS")!=nullptr;
+static void dumpText(NSString *text) {NSData *bytes=[text dataUsingEncoding:NSUTF8StringEncoding];(void)!write(2,bytes.bytes,bytes.length);}
 static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString **warnings,NSString **failure) {
+ if(gDumpTessellation && [source containsString:@"[[patch"])
+  dumpText([NSString stringWithFormat:@"\n=== native-metal tessellation source (options %@) ===\n%@\n=== end ===\n",arguments,source]);
  NSData *text=[source dataUsingEncoding:NSUTF8StringEncoding];
  const char *options=arguments.UTF8String;
  const uint64_t sourceBytes=(text.length+1+3)&~uint64_t(3),optionBytes=strlen(options)+1;
@@ -2156,6 +2162,21 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
   p->tessellation={1,d.maxTessellationFactor,(uint64_t)d.tessellationPartitionMode,(uint64_t)d.tessellationFactorFormat,
       (uint64_t)d.tessellationFactorStepFunction,(uint64_t)d.tessellationOutputWindingOrder,(uint64_t)d.tessellationControlPointIndexType,
       (uint64_t)d.tessellationFactorScaleEnabled};
+ if(gDumpTessellation && p->tessellation.tessellates) {
+  NSMutableString *line=[NSMutableString stringWithFormat:@"=== native-metal tessellation pipeline %@: vertex %@ fragment %@ patch type %llu control points %llu "
+   @"max factor %lu partition %lu factor format %lu step %lu winding %lu index type %lu scale %d\n",d.label,d.vertexFunction.name,d.fragmentFunction.name,
+   (unsigned long long)nmb_function_patch_type(p->vertex),(unsigned long long)nmb_function_patch_control_point_count(p->vertex),
+   (unsigned long)d.maxTessellationFactor,(unsigned long)d.tessellationPartitionMode,(unsigned long)d.tessellationFactorFormat,
+   (unsigned long)d.tessellationFactorStepFunction,(unsigned long)d.tessellationOutputWindingOrder,(unsigned long)d.tessellationControlPointIndexType,
+   d.tessellationFactorScaleEnabled];
+  if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
+   MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
+   MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex];
+   [line appendFormat:@"    attribute %u format %lu offset %lu buffer %lu stride %lu step %lu rate %lu\n",i,(unsigned long)a.format,(unsigned long)a.offset,
+    (unsigned long)a.bufferIndex,(unsigned long)l.stride,(unsigned long)l.stepFunction,(unsigned long)l.stepRate];
+  }
+  dumpText(line);
+ }
  return true;
 }
 
