@@ -39,6 +39,82 @@ extern "C" void sys_dcache_flush(void *start, size_t length);
 
 static NmbDevice *gDevice;
 static id gDeviceObject;
+
+// DEBUG (the guest's memory corruption, 2026-10-26): with NATIVE_METAL_ABORT_PROBE=1 in its environment, a process that aborts
+// (a __stack_chk_fail among them) or faults (SIGSEGV, SIGBUS) first writes to its standard error whether the stack guard changed
+// since this library loaded, the words around the guard, the thread's registers with, for each one that points at mapped
+// memory, the first words there and how many of the 512 words of its 4 KiB page are zero (a page the kernel dropped reads all
+// zero), and the thread's frames (fp, lr and the 12 words below each fp, where a frame keeps its copy of the guard).
+extern "C" uintptr_t __stack_chk_guard;
+static uintptr_t gGuardAtLoad;
+static char *probeHex(char *at, uint64_t value) {
+ for (int i = 15; i >= 0; --i) *at++ = "0123456789abcdef"[(value >> (i * 4)) & 0xf];
+ return at;
+}
+static char *probeText(char *at, const char *text) {while (*text) *at++ = *text++; return at;}
+extern "C" kern_return_t mach_vm_region(vm_map_read_t, mach_vm_address_t *, mach_vm_size_t *, vm_region_flavor_t, vm_region_info_t,
+                                        mach_msg_type_number_t *, mach_port_t *);
+// Whether [address, address + 4096) is mapped readable.
+static bool probeReadable(uint64_t address) {
+ mach_vm_address_t start = address & ~4095ull; mach_vm_size_t size = 0;
+ vm_region_basic_info_data_64_t info; mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t object = MACH_PORT_NULL;
+ if (mach_vm_region(mach_task_self(), &start, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count, &object)) return false;
+ return start <= (address & ~4095ull) && (address & ~4095ull) + 4096 <= start + size && (info.protection & VM_PROT_READ);
+}
+static void abortProbe(int signal, siginfo_t *si, void *context) {
+ char line[512], *at = line;
+ at = probeText(at, "native-metal abort probe: signal "); *at++ = char('0' + signal / 10); *at++ = char('0' + signal % 10);
+ at = probeText(at, " address "); at = probeHex(at, (uint64_t)(uintptr_t)si->si_addr); *at++ = '\n';
+ (void)!write(2, line, (size_t)(at - line)); at = line;
+ const __darwin_arm_thread_state64 &ss = ((ucontext_t *)context)->uc_mcontext->__ss;
+ for (int r = 0; r < 33; ++r) {
+  const uint64_t value = r < 29 ? ss.__x[r] : r == 29 ? ss.__fp : r == 30 ? ss.__lr : r == 31 ? ss.__sp : ss.__pc;
+  at = line; at = probeText(at, "  r"); *at++ = char('0' + r / 10); *at++ = char('0' + r % 10); *at++ = ' ';
+  at = probeHex(at, value & 0x0000ffffffffffffull);
+  const uint64_t pointer = value & 0x0000ffffffffffffull;
+  if (pointer >= 0x100000000ull && pointer < 0x1000000000ull && probeReadable(pointer)) {
+   const volatile uint64_t *page = (const volatile uint64_t *)(pointer & ~4095ull);
+   unsigned zero = 0;
+   for (unsigned w = 0; w < 512; ++w) zero += !page[w];
+   at = probeText(at, " zero words in its page ");
+   *at++ = char('0' + zero / 100); *at++ = char('0' + zero / 10 % 10); *at++ = char('0' + zero % 10);
+   at = probeText(at, ", at it:");
+   const volatile uint64_t *word = (const volatile uint64_t *)(pointer & ~7ull);
+   for (int i = 0; i < 4 && ((uint64_t)(uintptr_t)(word + i) & 4095) >= ((uint64_t)(uintptr_t)word & 4095); ++i) {*at++ = ' '; at = probeHex(at, word[i]);}
+  }
+  *at++ = '\n'; (void)!write(2, line, (size_t)(at - line));
+ }
+ at = line;
+ at = probeText(at, "native-metal abort probe: stack guard now "); at = probeHex(at, __stack_chk_guard);
+ at = probeText(at, ", at load "); at = probeHex(at, gGuardAtLoad); at = probeText(at, "; around it:");
+ const volatile uintptr_t *guard = &__stack_chk_guard;
+ for (int i = -4; i <= 4; ++i) {*at++ = ' '; at = probeHex(at, guard[i]);}
+ *at++ = '\n'; (void)!write(2, line, (size_t)(at - line));
+ uint64_t fp = ((ucontext_t *)context)->uc_mcontext->__ss.__fp;
+ for (int frame = 0; frame < 8 && fp && !(fp & 7); ++frame) {
+  if (!probeReadable(fp) || !probeReadable(fp - 96)) break;
+  const volatile uint64_t *f = (const volatile uint64_t *)fp;
+  at = line;
+  at = probeText(at, "  frame "); *at++ = char('0' + frame);
+  at = probeText(at, " fp "); at = probeHex(at, fp);
+  at = probeText(at, " lr "); at = probeHex(at, f[1] & 0x0000ffffffffffffull);
+  at = probeText(at, " below:");
+  for (int i = 1; i <= 12; ++i) {*at++ = ' '; at = probeHex(at, f[-i]);}
+  *at++ = '\n'; (void)!write(2, line, (size_t)(at - line));
+  fp = f[0];
+  if (!probeReadable(fp)) break;
+ }
+ if (signal != SIGABRT) {   // the fault happens again, unhandled: the crash report as before
+  struct sigaction fallback = {}; fallback.sa_handler = SIG_DFL; sigaction(signal, &fallback, nullptr);
+ }
+}
+__attribute__((constructor)) static void installAbortProbe() {
+ if (!getenv("NATIVE_METAL_ABORT_PROBE")) return;
+ gGuardAtLoad = __stack_chk_guard;
+ struct sigaction action = {};
+ action.sa_sigaction = abortProbe; action.sa_flags = SA_SIGINFO;
+ sigaction(SIGABRT, &action, nullptr); sigaction(SIGSEGV, &action, nullptr); sigaction(SIGBUS, &action, nullptr);
+}
 static uint64_t gRegistryID;
 static NSString *gName;
 static void (*gMissing)(const char *, const char *);
