@@ -109,6 +109,23 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
   struct sigaction fallback = {}; fallback.sa_handler = SIG_DFL; sigaction(signal, &fallback, nullptr);
  }
 }
+// NATIVE_METAL_TIMING=1: the telemetry table (where the CPU side's time went: pipelines, libraries, compiles and the shader cache)
+// written to standard error every 20 s (an app the system ends at the end of a test never reaches atexit).
+extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size);
+static void *reportTiming(void *) {
+ static char table[6144];
+ for(;;) {
+  sleep(20);
+  const size_t length=native_bridge_metal_telemetry(table,sizeof table);
+  const char *title="native-metal timing:\n";
+  (void)!write(2,title,strlen(title));(void)!write(2,table,length);
+ }
+}
+__attribute__((constructor)) static void installTimingReport() {
+ if(!getenv("NATIVE_METAL_TIMING"))return;
+ pthread_t thread;
+ if(!pthread_create(&thread,nullptr,reportTiming,nullptr))pthread_detach(thread);
+}
 __attribute__((constructor)) static void installAbortProbe() {
  if (!getenv("NATIVE_METAL_ABORT_PROBE")) return;
  gGuardAtLoad = __stack_chk_guard;
@@ -132,6 +149,8 @@ static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
+static Timed gTimeCompile;                     // the system compiler's requests (codeGenRequest), the shader cache's misses
+static std::atomic<uint64_t> gCompileCached;   // requests the shader cache answered
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
 static Timed gTimeResourceWait;
 static std::atomic<uint64_t> gResourceChecks,gResourceSkipped;
@@ -499,7 +518,6 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  static unsigned char compilerUuid[16];
  static dispatch_once_t once;
  static std::mutex lock;
- static std::atomic<uint64_t> cacheHits,compiled;
  dispatch_once(&once,^{
   void *library=dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler",RTLD_NOW);
   void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
@@ -517,7 +535,7 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  NSString *cached=shaderCachePath(compilerUuid,type,request);
  NSData *kept=nil;NSString *keptWarnings=nil;
  if(shaderCacheRead(cached,&kept,&keptWarnings)) {
-  if(++cacheHits==1)NSLog(@"native-metal: shader cache: the first reply read from %@",cached.stringByDeletingLastPathComponent);
+  gCompileCached++;
   *warnings=keptWarnings;*failure=nil;
   return kept;
  }
@@ -526,6 +544,7 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  __block bool called=false;
  {
   std::lock_guard<std::mutex> guard(lock);
+  const uint64_t compileBegan=nowUs();
   onLargeStack(^{build(service,nullptr,type,request.data(),request.size(),^(int32_t status,const void *reply,size_t length,const char *why) {
    called=true;
    uint32_t header=0,warning=0;
@@ -537,11 +556,11 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
    if(warning)warned=[[NSString alloc] initWithBytes:(const uint8_t *)reply+header length:warning encoding:NSUTF8StringEncoding];
    metallib=[NSData dataWithBytes:(const uint8_t *)reply+header+warning length:length-header-warning];
   });});
+  gTimeCompile.add(compileBegan);
  }
  if(!called)message=@"the Metal compiler did not answer";
  *warnings=warned;*failure=message;
  if(!message)shaderCacheWrite(cached,metallib,warned);
- if(!(++compiled%64))NSLog(@"native-metal: shader cache: %llu compiled, %llu read",(unsigned long long)compiled,(unsigned long long)cacheHits);
  return message?nil:metallib;
 }
 // Metal source, request 13: two little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments
@@ -641,6 +660,8 @@ static void waitForResource(id resource);
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
+@property(nonatomic) uint32_t pvrtc;   // the PVRTC format the texture was asked for, decoded into its RGBA8 (0: none)
+- (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length;
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
@@ -710,16 +731,106 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  }
  return buffer;
 }
+// PVRTC (PowerVR's compressed formats, MTLPixelFormatPVRTC_* 160-167) has no Vulkan format on Adreno, and metal2vulkan keeps such a
+// texture's blocks for copies only: every command that samples it is refused (GFXBench's T-Rex drew nothing, half its command
+// buffers refused). So a PVRTC texture is made RGBA8 (sRGB for the sRGB formats), still answers its own pixelFormat, and its blocks
+// are decoded on the CPU as they are written: replaceRegion, and a copy from a buffer, which is done as the copy is encoded. The
+// decoder is PVRTC1's: a block (8 bytes, 4 x 4 texels at 4 bits, 8 x 4 at 2) is a modulation word and a colour word with two
+// colours, A (bits 15-1) and B (bits 31-16), each opaque (RGB 5:5:4 or 5:5:5) or translucent (ARGB 3:4:4:3 or 3:4:4:4); every
+// texel blends the A and B images, each interpolated bilinearly between the four block centres around it (wrapping at the edges),
+// by its modulation value. A level's blocks lie in Morton order, the y bit lowest. The 2-bit format's interpolated modulation
+// mode is approximated (the texels it stores, their neighbours' mean between).
+static bool isPvrtc(uint64_t format) {return format>=160 && format<=167;}
+static uint64_t pvrtcCarrier(uint64_t format) {return (format&1)?71 /* RGBA8Unorm_sRGB */:70 /* RGBA8Unorm */;}
+struct PvrtcColor {float r,g,b,a;};
+static int pvrtc45(int v) {return (v<<1)|(v>>3);}
+static int pvrtc35(int v) {return (v<<2)|(v>>1);}
+static PvrtcColor pvrtcColor(uint32_t word,bool b) {
+ const uint32_t w=b?word>>16:word&0xffff;
+ int r,g,bl,a;
+ if(w&0x8000) {
+  r=(w>>10)&31;g=(w>>5)&31;bl=b?(int)(w&31):pvrtc45((w>>1)&15);a=15;
+ } else {
+  r=pvrtc45((w>>8)&15);g=pvrtc45((w>>4)&15);bl=b?pvrtc45(w&15):pvrtc35((w>>1)&7);a=((w>>12)&7)<<1;
+ }
+ return {r/31.0f,g/31.0f,bl/31.0f,a/15.0f};
+}
+static uint32_t pvrtcMorton(uint32_t x,uint32_t y,uint32_t across,uint32_t down) {
+ const uint32_t smaller=std::min(across,down);
+ uint32_t index=0,shift=0;
+ for(uint32_t bit=1;bit<smaller;bit<<=1){if(y&bit)index|=1u<<shift;shift++;if(x&bit)index|=1u<<shift;shift++;}
+ if(across>down)index|=(x/smaller)<<shift;else if(down>across)index|=(y/smaller)<<shift;
+ return index;
+}
+// Decodes a level of width x height texels from `length` bytes of blocks into RGBA8 rows of width * 4 bytes.
+static void pvrtcDecode(const uint8_t *data,size_t length,uint32_t width,uint32_t height,bool twoBit,bool alpha,uint8_t *out) {
+ const int bw=twoBit?8:4,bh=4;
+ uint32_t across=1,down=1;
+ while(across*bw<width)across<<=1;
+ while(down*bh<height)down<<=1;
+ std::vector<PvrtcColor> colorA(across*down),colorB(across*down);
+ std::vector<uint32_t> modulation(across*down),mode(across*down);
+ for(uint32_t y=0;y<down;y++)for(uint32_t x=0;x<across;x++) {
+  const size_t at=(size_t)pvrtcMorton(x,y,across,down)*8;uint32_t m=0,c=0;
+  if(at+8<=length){memcpy(&m,data+at,4);memcpy(&c,data+at+4,4);}
+  const size_t i=y*across+x;modulation[i]=m;mode[i]=c&1;colorA[i]=pvrtcColor(c,false);colorB[i]=pvrtcColor(c,true);
+ }
+ static const int fourBit[2][4]={{0,3,5,8},{0,4,4,8}};
+ for(uint32_t y=0;y<height;y++)for(uint32_t x=0;x<width;x++) {
+  // The four block centres around the texel, and its weights between them.
+  const int px=(int)x-bw/2,py=(int)y-bh/2;
+  const int x0=px>=0?px/bw:-((bw-1-px)/bw),y0=py>=0?py/bh:-((bh-1-py)/bh);
+  const float fx=(float)(px-x0*bw)/bw,fy=(float)(py-y0*bh)/bh;
+  auto at=[&](int bx,int by){return (size_t)(((by%(int)down)+(int)down)%(int)down)*across+(size_t)(((bx%(int)across)+(int)across)%(int)across);};
+  const size_t p=at(x0,y0),q=at(x0+1,y0),r=at(x0,y0+1),t=at(x0+1,y0+1);
+  auto blend=[&](const std::vector<PvrtcColor> &c){
+   PvrtcColor o;
+   o.r=(c[p].r*(1-fx)+c[q].r*fx)*(1-fy)+(c[r].r*(1-fx)+c[t].r*fx)*fy;
+   o.g=(c[p].g*(1-fx)+c[q].g*fx)*(1-fy)+(c[r].g*(1-fx)+c[t].g*fx)*fy;
+   o.b=(c[p].b*(1-fx)+c[q].b*fx)*(1-fy)+(c[r].b*(1-fx)+c[t].b*fx)*fy;
+   o.a=(c[p].a*(1-fx)+c[q].a*fx)*(1-fy)+(c[r].a*(1-fx)+c[t].a*fx)*fy;
+   return o;};
+  const PvrtcColor a=blend(colorA),b=blend(colorB);
+  // The texel's own block: its modulation.
+  const size_t own=(size_t)(y/bh)%down*across+(size_t)(x/bw)%across;
+  const uint32_t m=modulation[own],tx=x%bw,ty=y%bh;
+  int weight=0;bool punch=false;
+  if(!twoBit) {
+   const int v=(int)((m>>(2*(ty*4+tx)))&3);weight=fourBit[mode[own]][v];punch=mode[own] && v==2;
+  } else if(!mode[own]) {
+   weight=((m>>(ty*8+tx))&1)?8:0;
+  } else {
+   auto stored=[&](uint32_t sx){return fourBit[0][(m>>(2*((ty*8+sx)/2)))&3];};
+   weight=((tx+ty)&1)?(stored((tx+7)%8)+stored((tx+1)%8))/2:stored(tx);
+  }
+  const float w=weight/8.0f;
+  uint8_t *o=out+((size_t)y*width+x)*4;
+  o[0]=(uint8_t)lrintf((a.r+(b.r-a.r)*w)*255.0f);o[1]=(uint8_t)lrintf((a.g+(b.g-a.g)*w)*255.0f);
+  o[2]=(uint8_t)lrintf((a.b+(b.b-a.b)*w)*255.0f);
+  o[3]=!alpha?255:punch?0:(uint8_t)lrintf((a.a+(b.a-a.a)*w)*255.0f);
+ }
+}
+static size_t pvrtcLevelBytes(uint32_t width,uint32_t height,bool twoBit) {
+ uint32_t across=1,down=1;
+ while(across*(twoBit?8u:4u)<width)across<<=1;
+ while(down*4u<height)down<<=1;
+ return (size_t)across*down*8;
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
        textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable")};
+ if(isPvrtc(out->format)) {
+  static std::atomic<bool> told;
+  if(!told.exchange(true)){const char *note="native-metal: PVRTC textures are made RGBA8 and decoded on the CPU\n";(void)!write(2,note,strlen(note));}
+  out->format=pvrtcCarrier(out->format);out->usage|=MTLTextureUsageShaderRead;
+ }
  return true;
 }
 @implementation NBTexture
 - (void)dealloc {nmb_texture_release(_handle);if(_surface)CFRelease(_surface);}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
-- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)_descriptor.format;}
+- (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
 - (NSUInteger)width {return _descriptor.width;}
 - (NSUInteger)height {return _descriptor.height;}
 - (NSUInteger)depth {return _descriptor.depth;}
@@ -753,10 +864,12 @@ NB_RESOURCE_SPI
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
+ if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
  return [self view:nmb_texture_new_view(_handle,format,0,nullptr,nullptr,true)];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
+ if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
@@ -768,7 +881,22 @@ NB_RESOURCE_SPI
         (unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)level,(unsigned long)slice,(unsigned long)row,
         (unsigned long long)_descriptor.width,(unsigned long long)_descriptor.height,(unsigned long long)_descriptor.format,
         (unsigned long long)_descriptor.options,_surface?IOSurfaceGetID(_surface):0u);
+ if(_pvrtc) {   // PVRTC blocks: decoded into the RGBA8 texture (the region taken as a whole level of its size)
+  [self replacePvrtcRegion:r mipmapLevel:level slice:slice withBytes:bytes length:pvrtcLevelBytes((uint32_t)r.size.width,(uint32_t)r.size.height,
+   _pvrtc==160 || _pvrtc==161 || _pvrtc==164 || _pvrtc==165)];
+  return;
+ }
  if(!nmb_texture_replace(_handle,region,level,slice,bytes,row,image,length))NBLOG(@"native-metal: replaceRegion refused: %@",lastError());
+}
+- (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes length:(size_t)length {
+ const bool twoBit=_pvrtc==160 || _pvrtc==161 || _pvrtc==164 || _pvrtc==165,alpha=_pvrtc>=164;
+ const uint32_t width=(uint32_t)r.size.width,height=(uint32_t)r.size.height;
+ if(!bytes || !width || !height)return;
+ std::vector<uint8_t> rgba((size_t)width*height*4);
+ pvrtcDecode((const uint8_t *)bytes,length,width,height,twoBit,alpha,rgba.data());
+ const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,width,height,1};
+ if(!nmb_texture_replace(_handle,region,level,slice,rgba.data(),(uint64_t)width*4,(uint64_t)width*4*height,rgba.size()))
+  NBLOG(@"native-metal: PVRTC replaceRegion refused: %@",lastError());
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row {
  [self replaceRegion:r mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:row bytesPerImage:row*r.size.height];
@@ -1539,6 +1667,14 @@ static void waitForResource(id resource) {
         (unsigned long)image,(unsigned long)o,(unsigned long)[s length],[(NBBuffer *)s wrapped]?" no-copy":"",
         (unsigned long long)t.width,(unsigned long long)t.height,(unsigned long long)t.format,(unsigned long long)t.options);
  }
+ if([(NBTexture *)d pvrtc]) {   // PVRTC blocks: decoded from the buffer's contents now, as the copy is encoded
+  const uint8_t *contents=(const uint8_t *)[s contents];
+  if(!contents){[self.commandBuffer refuse:@"a PVRTC copy from a buffer with no CPU contents"];return;}
+  const uint32_t f=[(NBTexture *)d pvrtc];const bool twoBit=f==160 || f==161 || f==164 || f==165;
+  const size_t want=pvrtcLevelBytes((uint32_t)z.width,(uint32_t)z.height,twoBit),have=[s length]>o?[s length]-o:0;
+  [(NBTexture *)d replacePvrtcRegion:MTLRegionMake2D(dO.x,dO.y,z.width,z.height) mipmapLevel:level slice:slice withBytes:contents+o length:std::min(want,have)];
+  return;
+ }
  const uint64_t size[3]={z.width,z.height,z.depth},b[3]={dO.x,dO.y,dO.z};
  [self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size,[(NBTexture *)d handle],slice,level,b) what:"copyFromBuffer:toTexture:"];
 }
@@ -2063,6 +2199,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
  if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {return [self textureWithDescriptor:d offset:UINT64_MAX];}
@@ -2275,7 +2412,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
- NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;return (id<MTLTexture>)texture;
+ NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
+ if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
+ return (id<MTLTexture>)texture;
 }
 // The surface's pages are the texels: its mapping in this process is imported without a copy (pinned by the kernel, mapped into the GPU's
 // 4 KiB context by Turnip), so every process that imports the surface renders and samples the same memory.
@@ -2709,6 +2848,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
+ row("T compile n=%llu total=%llums max=%llums cached=%llu",(unsigned long long)gTimeCompile.count.load(),ms(gTimeCompile.total.load()),
+  ms(gTimeCompile.slowest.load()),(unsigned long long)gCompileCached.load());
  row("T function n=%llu total=%llums max=%llums",
   (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
