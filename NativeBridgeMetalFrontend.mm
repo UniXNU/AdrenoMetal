@@ -22,6 +22,7 @@
 #include <sys/mman.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#include <mach-o/loader.h>
 #include <execinfo.h>
 #include <mach/mach.h>
 #include <thread>
@@ -437,18 +438,89 @@ static void onLargeStack(void (^body)(void)) {
  pthread_attr_destroy(&attr);
  if(made)pthread_join(thread,nullptr);else body();
 }
+// A request's reply depends only on its bytes and the compiler, so a compiled one is kept in the process's Caches directory
+// (Library/Caches/native-metal-shaders/SHA256.reply, SHA-256 of MTLCompiler's LC_UUID, the request type and its bytes): an
+// app that compiles its shaders from source at every launch (GFXBench spends minutes of Clang and LLVM loading a test)
+// compiles each one once. A file is the magic, the warning and metallib lengths and the SHA-256 of both, then both; it is
+// written to a temporary name and renamed, and one that does not check out is compiled again. Failures are not kept.
+// NATIVE_METAL_NO_SHADER_CACHE=1 turns it off.
+struct NBShaderCacheHeader {uint32_t magic,warningBytes;uint64_t metallibBytes;unsigned char digest[CC_SHA256_DIGEST_LENGTH];};
+static const uint32_t kNBShaderCacheMagic=0x3143534e;   // "NSC1"
+static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,const std::vector<uint8_t> &request) {
+ static NSString *directory;
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  if(getenv("NATIVE_METAL_NO_SHADER_CACHE"))return;
+  NSString *caches=NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject;
+  NSString *path=caches?[caches stringByAppendingPathComponent:@"native-metal-shaders"]:nil;
+  if(path && [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil])directory=path;
+ });
+ if(!directory)return nil;
+ CC_SHA256_CTX context;CC_SHA256_Init(&context);
+ CC_SHA256_Update(&context,uuid,16);CC_SHA256_Update(&context,&type,sizeof type);
+ CC_SHA256_Update(&context,request.data(),(CC_LONG)request.size());
+ unsigned char key[CC_SHA256_DIGEST_LENGTH];CC_SHA256_Final(key,&context);
+ char name[2*CC_SHA256_DIGEST_LENGTH+8];
+ for(int i=0;i<CC_SHA256_DIGEST_LENGTH;i++)snprintf(name+2*i,3,"%02x",key[i]);
+ strlcat(name,".reply",sizeof name);
+ return [directory stringByAppendingPathComponent:@(name)];
+}
+static bool shaderCacheRead(NSString *path,NSData **metallib,NSString **warnings) {
+ NSData *file=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil]:nil;
+ NBShaderCacheHeader header;
+ if(file.length<sizeof header)return false;
+ memcpy(&header,file.bytes,sizeof header);
+ if(header.magic!=kNBShaderCacheMagic || !header.metallibBytes || sizeof header+header.warningBytes+header.metallibBytes!=file.length)return false;
+ const uint8_t *payload=(const uint8_t *)file.bytes+sizeof header;
+ unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+ CC_SHA256(payload,(CC_LONG)(header.warningBytes+header.metallibBytes),digest);
+ if(memcmp(digest,header.digest,sizeof digest))return false;
+ *warnings=header.warningBytes?[[NSString alloc] initWithBytes:payload length:header.warningBytes encoding:NSUTF8StringEncoding]:nil;
+ *metallib=[NSData dataWithBytes:payload+header.warningBytes length:(NSUInteger)header.metallibBytes];
+ return true;
+}
+static void shaderCacheWrite(NSString *path,NSData *metallib,NSString *warnings) {
+ if(!path || !metallib.length)return;
+ NSData *warned=[warnings dataUsingEncoding:NSUTF8StringEncoding];
+ NBShaderCacheHeader header={kNBShaderCacheMagic,(uint32_t)warned.length,metallib.length,{}};
+ NSMutableData *file=[NSMutableData dataWithCapacity:sizeof header+warned.length+metallib.length];
+ [file appendBytes:&header length:sizeof header];
+ if(warned.length)[file appendData:warned];
+ [file appendData:metallib];
+ uint8_t *bytes=(uint8_t *)file.mutableBytes;
+ CC_SHA256(bytes+sizeof header,(CC_LONG)(warned.length+metallib.length),((NBShaderCacheHeader *)bytes)->digest);
+ NSString *temporary=[path stringByAppendingFormat:@".%d.%u.tmp",getpid(),pthread_mach_thread_np(pthread_self())];
+ if(![file writeToFile:temporary atomically:NO] || rename(temporary.fileSystemRepresentation,path.fileSystemRepresentation))
+  unlink(temporary.fileSystemRepresentation);
+}
 static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
  static void *service;
  static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
+ static unsigned char compilerUuid[16];
  static dispatch_once_t once;
  static std::mutex lock;
+ static std::atomic<uint64_t> cacheHits,compiled;
  dispatch_once(&once,^{
   void *library=dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler",RTLD_NOW);
   void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
   build=library?(void (*)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply))dlsym(library,"MTLCodeGenServiceBuildRequest"):nullptr;
   service=create && build?create("native-metal"):nullptr;
+  Dl_info info;
+  if(build && dladdr((const void *)build,&info) && info.dli_fbase) {
+   const mach_header_64 *header=(const mach_header_64 *)info.dli_fbase;
+   const uint8_t *command=(const uint8_t *)(header+1);
+   for(uint32_t i=0;i<header->ncmds;i++,command+=((const load_command *)command)->cmdsize)
+    if(((const load_command *)command)->cmd==LC_UUID){memcpy(compilerUuid,((const uuid_command *)command)->uuid,16);break;}
+  }
  });
  if(!service){*failure=@"the system's Metal compiler (MTLCompiler.framework) is not available";return nil;}
+ NSString *cached=shaderCachePath(compilerUuid,type,request);
+ NSData *kept=nil;NSString *keptWarnings=nil;
+ if(shaderCacheRead(cached,&kept,&keptWarnings)) {
+  if(++cacheHits==1)NSLog(@"native-metal: shader cache: the first reply read from %@",cached.stringByDeletingLastPathComponent);
+  *warnings=keptWarnings;*failure=nil;
+  return kept;
+ }
  __block NSData *metallib=nil;
  __block NSString *warned=nil,*message=nil;
  __block bool called=false;
@@ -468,6 +540,8 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  }
  if(!called)message=@"the Metal compiler did not answer";
  *warnings=warned;*failure=message;
+ if(!message)shaderCacheWrite(cached,metallib,warned);
+ if(!(++compiled%64))NSLog(@"native-metal: shader cache: %llu compiled, %llu read",(unsigned long long)compiled,(unsigned long long)cacheHits);
  return message?nil:metallib;
 }
 // Metal source, request 13: two little-endian u64 lengths, the source NUL-padded to a multiple of 4 bytes and the arguments
