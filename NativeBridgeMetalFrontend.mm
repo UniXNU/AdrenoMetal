@@ -1363,6 +1363,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NSMutableDictionary *dumpBound;
 @property(nonatomic,strong) id dumpPipeline,dumpDepth;
 @property(nonatomic) uint32_t dumpDraws;
+@property(nonatomic,strong) NSMutableArray *dumpRuns;
+@property(nonatomic) uint32_t drawIndex;   // this encoder's draws so far, for NATIVE_METAL_SKIP_DRAWS   // [pipeline info, depth info, first draw, count] for each run of draws with one state
 @end
 // NATIVE_METAL_DUMP_CB=FIRST[:COUNT]: the app's command buffers FIRST..FIRST+COUNT-1 (counted from 1, the plugin's own readbacks left
 // out) have what they rendered read back after them, by a command buffer of the plugin's own on the same queue: every render pass's
@@ -1386,10 +1388,13 @@ static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
  return next+16>=range.first && next<(uint64_t)range.first+range.second;
 }
 // A line of the command buffer's NATIVE_METAL_DUMP_CB log (its passes, first draws and their state), printed before its readback.
+// NATIVE_METAL_DUMP_ONLY=1: only the NATIVE_METAL_DUMP_IMAGE targets are read back and written, with no log, so a long range of
+// command buffers (a small texture over hundreds of frames) costs little.
+static bool dumpOnly() {static const bool only=getenv("NATIVE_METAL_DUMP_ONLY")!=nullptr;return only;}
 static void dumpLine(NBCommandBuffer *commandBuffer,NSString *line) {
- if(!dumpMaybe(commandBuffer))return;
+ if(dumpOnly() || !dumpMaybe(commandBuffer))return;
  if(!commandBuffer.dumpLog)commandBuffer.dumpLog=[NSMutableArray array];
- if(commandBuffer.dumpLog.count<600)[commandBuffer.dumpLog addObject:line];
+ if(commandBuffer.dumpLog.count<2000)[commandBuffer.dumpLog addObject:line];
 }
 // The first 16 words of bound data as floats, and how many of its first 256 words are zero or NaN.
 static NSString *dumpWords(const uint8_t *p,size_t n) {
@@ -1399,6 +1404,16 @@ static NSString *dumpWords(const uint8_t *p,size_t n) {
  for(size_t i=0;i<all;i++){uint32_t w;memcpy(&w,p+4*i,4);float f;memcpy(&f,&w,4);zero+=!w;nan+=std::isnan(f);}
  [s appendFormat:@" (of %zu words %zu zero, %zu NaN)",all,zero,nan];
  return s;
+}
+// NATIVE_METAL_DUMP_DRAWS=FIRST:LAST: which draws of each pass (counted from 1) are written in full, with the state set before them
+// (default the first 6).
+static bool dumpShown(uint32_t draw) {
+ static const std::pair<unsigned,unsigned> shown=[]{
+  unsigned first=1,last=6;const char *v=getenv("NATIVE_METAL_DUMP_DRAWS");
+  if(v && sscanf(v,"%u:%u",&first,&last)!=2){first=1;last=6;}
+  return std::make_pair(first,last);
+ }();
+ return draw>=shown.first && draw<=shown.second;
 }
 static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id texture,NSUInteger level,NSUInteger slice,NSString *where) {
  if(!texture || ![texture isKindOfClass:[NBTexture class]])return;
@@ -1431,6 +1446,9 @@ static void waitForResource(id resource) {
 - (void)endEncoding {
  if(self.label.length)for(NSMutableDictionary *entry in _dumpEntries)entry[@"encoder"]=self.label;
  if(_dumpDraws)dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u: %u draws %@",_commandBuffer.dumpPasses,_dumpDraws,self.label?:@""]);
+ if(_dumpRuns.count>1 || _dumpDraws>6)for(NSArray *run in _dumpRuns)
+  dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u run: draws %@..%lu | %@ | depth %@",_commandBuffer.dumpPasses,run[2],
+                           (unsigned long)([run[2] unsignedIntegerValue]+[run[3] unsignedIntegerValue]-1),run[0],run[1]]);
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
@@ -1446,7 +1464,16 @@ static void waitForResource(id resource) {
 }
 // NATIVE_METAL_DUMP_CB: the first 6 draws of each pass, with the pipeline, the depth/stencil state and every bound buffer's first words.
 - (void)dumpDraw:(NSString *)what {
- if(!dumpMaybe(_commandBuffer) || ++_dumpDraws>6)return;
+ if(!dumpMaybe(_commandBuffer))return;
+ // Runs of draws with one pipeline and depth state, every draw counted: a pass's structure (geometry, then light volumes, ...).
+ NSString *pipeline=[_dumpPipeline dumpInfo]?:@"no pipeline",*depth=_dumpDepth?[_dumpDepth dumpInfo]:@"none";
+ NSMutableArray *last=_dumpRuns.lastObject;
+ if(last && [last[0] isEqualToString:pipeline] && [last[1] isEqualToString:depth])last[3]=@([last[3] unsignedIntegerValue]+1);
+ else if(_dumpRuns.count<200) {
+  if(!_dumpRuns)_dumpRuns=[NSMutableArray array];
+  [_dumpRuns addObject:[NSMutableArray arrayWithObjects:pipeline,depth,@(_dumpDraws+1),@1,nil]];
+ }
+ if(!dumpShown(++_dumpDraws))return;
  dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u draw %u: %@ | %@ | depth %@",_commandBuffer.dumpPasses,_dumpDraws,what,
                           [_dumpPipeline dumpInfo]?:@"no pipeline",_dumpDepth?[_dumpDepth dumpInfo]:@"none"]);
  for(NSNumber *key in [_dumpBound.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
@@ -1608,20 +1635,20 @@ static void waitForResource(id resource) {
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
- if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
+ if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
                                                  v.originX,v.originY,v.width,v.height,v.znear,v.zfar]);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
- if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
+ if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
                                                  (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {
  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
- if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
+ if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
                                                  cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue]);
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
 }
@@ -1653,7 +1680,20 @@ static void waitForResource(id resource) {
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
  const float c[4]={r,g,b,a};[self check:nmb_render_set_blend_color(self.handle,c) what:"setBlendColor"];
 }
+// NATIVE_METAL_SKIP_DRAWS=PASS:FIRST:LAST: every command buffer's render pass PASS (counted from 1) leaves out its draws FIRST..LAST
+// (counted from 1), to find which draws make what a frame shows.
+- (BOOL)skipDraw {
+ struct Skip {unsigned pass,first,last;};
+ static const Skip skip=[]{
+  Skip s={};const char *v=getenv("NATIVE_METAL_SKIP_DRAWS");
+  if(v && sscanf(v,"%u:%u:%u",&s.pass,&s.first,&s.last)!=3)s.pass=0;
+  return s;
+ }();
+ const uint32_t index=++self.drawIndex;
+ return skip.pass && self.commandBuffer.dumpPasses==skip.pass && index>=skip.first && index<=skip.last;
+}
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
+ if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                  (unsigned long)i,(unsigned long)b]];
@@ -1669,8 +1709,9 @@ static void waitForResource(id resource) {
                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
+ if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
- if(dumpMaybe(self.commandBuffer) && self.dumpDraws<6) {
+ if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
   const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
   NSMutableString *first=[NSMutableString string];
   for(NSUInteger j=0;indices && j<4 && o+(j+1)*size<=b.length;j++) {
@@ -1706,6 +1747,7 @@ static void waitForResource(id resource) {
 - (void)patches:(NSUInteger)points start:(NSUInteger)start count:(NSUInteger)count patchIndex:(id<MTLBuffer>)pi offset:(NSUInteger)po
           points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
+ if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
  [self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                  (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
@@ -1919,12 +1961,33 @@ static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
   }
   fprintf(stderr,"native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
  }
+ // NATIVE_METAL_DUMP_IMAGE: the whole texture, its rows top down as the format stores them, in base64 lines of 6 KiB.
+ if([read[@"image"] boolValue]) {
+  NSString *text=[[NSData dataWithBytesNoCopy:(void *)bytes length:(NSUInteger)rows*w*bpp freeWhenDone:NO] base64EncodedStringWithOptions:0];
+  const NSUInteger part=8192,parts=(text.length+part-1)/part;
+  for(NSUInteger i=0;i<parts;i++)
+   fprintf(stderr,"native-metal dump image cb %llu: %s|%ux%u f%u bpp %u|%lu/%lu|%s\n",(unsigned long long)appIndex,[t[@"where"] UTF8String],w,rows,format,bpp,
+           (unsigned long)i+1,(unsigned long)parts,[text substringWithRange:NSMakeRange(i*part,std::min(part,text.length-i*part))].UTF8String);
+ }
+}
+// NATIVE_METAL_DUMP_IMAGE=WHERE[,WHERE...]: the NATIVE_METAL_DUMP_CB targets whose place ("pass 7 color 0", "kernel 2 texture 1")
+// contains one of these are read back whole and written out (dumpPrint); "all" names every one.
+static bool dumpImageWanted(NSString *where) {
+ static NSArray<NSString *> *wanted=[]{
+  const char *v=getenv("NATIVE_METAL_DUMP_IMAGE");
+  return v?[@(v) componentsSeparatedByString:@","]:@[];
+ }();
+ for(NSString *w in wanted)if(w.length && ([w isEqualToString:@"all"] || [where containsString:w]))return true;
+ return false;
 }
 // The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
 static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  NSArray *targets=[source.dumpTargets copy];
- fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
-         (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
+ if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
+  return dumpImageWanted(t[@"where"]);
+ }]];
+ else fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
+              (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
  for(NSString *line in source.dumpLog)fprintf(stderr,"native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
  if(!targets.count)return;
  NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
@@ -1941,14 +2004,15 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
                  texture.storageMode==MTLStorageModeMemoryless?@"memoryless":nil;
   if(skip){[reads addObject:@{@"target":t,@"skip":skip}];continue;}
   const NSUInteger w=std::max<NSUInteger>(1,(NSUInteger)d.width>>level),h=std::max<NSUInteger>(1,(NSUInteger)d.height>>level);
-  const NSUInteger rows=std::min<NSUInteger>(h,64),rowBytes=w*bpp;
+  const bool image=dumpImageWanted(t[@"where"]);
+  const NSUInteger rows=image?h:std::min<NSUInteger>(h,64),rowBytes=w*bpp;
   id<MTLBuffer> buffer=[gDeviceObject newBufferWithLength:rowBytes*rows options:MTLResourceStorageModeShared];
   if(!buffer){[reads addObject:@{@"target":t,@"skip":@"no readback buffer"}];continue;}
   for(NSUInteger r=0;r<rows;r++)
    [blit copyFromTexture:(id<MTLTexture>)texture sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,(2*r+1)*h/(2*rows),0)
               sourceSize:MTLSizeMake(w,1,1) toBuffer:buffer destinationOffset:r*rowBytes destinationBytesPerRow:rowBytes
               destinationBytesPerImage:rowBytes];
-  [reads addObject:@{@"target":t,@"buffer":buffer,@"w":@(w),@"rows":@(rows),@"bpp":@(bpp),@"format":@((uint32_t)d.format)}];
+  [reads addObject:@{@"target":t,@"buffer":buffer,@"w":@(w),@"rows":@(rows),@"bpp":@(bpp),@"format":@((uint32_t)d.format),@"image":@(image)}];
  }
  [blit endEncoding];
  [(id<MTLCommandBuffer>)readback addCompletedHandler:^(id<MTLCommandBuffer> done) {
