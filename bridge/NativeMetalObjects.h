@@ -178,6 +178,13 @@ bool nmb_binary_archive_add_render(NmbBinaryArchive *, const struct NmbRenderPip
 bool nmb_binary_archive_add_compute(NmbBinaryArchive *, NmbFunction *);
 bool nmb_binary_archive_add_compute_descriptor(NmbBinaryArchive *, const struct NmbComputePipelineDescriptor *);
 void nmb_render_pipeline_release(NmbRenderPipeline *);
+// A pipeline's reflection, as its creation's `reflection:` answers it, in JSON: {"vertex":[...],"fragment":[...]} for a render pipeline,
+// {"bindings":[...]} for a compute pipeline; each binding has Metal's raw values and a buffer's nested struct/array/pointer types. Null: refused.
+typedef struct NmbReflection NmbReflection;
+NmbReflection *nmb_render_pipeline_reflection(const struct NmbRenderPipelineDescriptor *);
+NmbReflection *nmb_compute_pipeline_reflection(const struct NmbComputePipelineDescriptor *);
+const char *nmb_reflection_json(const NmbReflection *);
+void nmb_reflection_release(NmbReflection *);
 
 struct NmbSamplerDescriptor {
     uint64_t min_filter, mag_filter, mip_filter, s_address, t_address, r_address, border_color, normalized, max_anisotropy, compare, lod_average;

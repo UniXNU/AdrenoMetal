@@ -225,6 +225,24 @@ fn note_shadow(text: &str) {
     }
 }
 
+// NATIVE_METAL_WARNINGS=1: each kind of message (its id and the text's first 48 characters) the first time it comes, in full and
+// with its severity, to standard error, for the first 400 kinds. The telemetry keeps only the last warning, and a degradation that
+// draws nothing is otherwise silent.
+fn log_message(message: &DebugMessage) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    if !*ENABLED.get_or_init(|| std::env::var_os("NATIVE_METAL_WARNINGS").is_some()) {
+        return;
+    }
+    let key = format!("{} {}", message.id_name, message.text.chars().take(48).collect::<String>());
+    let Ok(mut seen) = SEEN.lock() else { return };
+    if seen.len() >= 400 || seen.contains(&key) {
+        return;
+    }
+    seen.push(key);
+    eprintln!("native-metal message {} {:?}: [{}] {}", seen.len(), message.severity, message.id_name, message.text);
+}
+
 fn observe_message(message: &DebugMessage) {
     use std::sync::atomic::Ordering::Relaxed;
     if message.id_name == "shadowed-texture" {
@@ -242,6 +260,7 @@ fn observe_message(message: &DebugMessage) {
         }
         return;
     }
+    log_message(message);
     if message.severity >= MessageSeverity::Warning {
         OTHER_MESSAGES[1].fetch_add(1, Relaxed);
         if let Ok(mut last) = LAST_WARNING.lock() {
@@ -1559,6 +1578,187 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) {
     release(pipeline)
+}
+
+// ---- pipeline reflection ----
+
+/// A pipeline's reflection, as the `reflection:` out-parameter of a pipeline's creation answers it, in JSON for the frontend's
+/// MTLArgument/MTLBinding objects: Metal's raw enumeration values, and a buffer's struct, array, pointer and texture reference types
+/// nested as Metal nests them. GFXBench's NGL engine (Aztec Ruins) finds every uniform's buffer offset and every texture's index in it.
+pub struct NmbReflection(std::ffi::CString);
+
+mod reflection_json {
+    use metal2vulkan::reflection::{ArrayType, Binding, PointerType, StructType, TextureReferenceType};
+    use std::fmt::Write;
+
+    fn string(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if (c as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", c as u32);
+                }
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+    }
+
+    fn structure(out: &mut String, s: &StructType) {
+        out.push_str("{\"members\":[");
+        for (i, m) in s.members().iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("{\"name\":");
+            string(out, m.name());
+            let _ = write!(out, ",\"offset\":{},\"dataType\":{},\"argumentIndex\":{}", m.offset(), m.data_type().as_raw(), m.argument_index());
+            if let Some(t) = m.struct_type() {
+                out.push_str(",\"struct\":");
+                structure(out, t);
+            }
+            if let Some(t) = m.array_type() {
+                out.push_str(",\"array\":");
+                array(out, t);
+            }
+            if let Some(t) = m.pointer_type() {
+                out.push_str(",\"pointer\":");
+                pointer(out, t);
+            }
+            if let Some(t) = m.texture_reference_type() {
+                out.push_str(",\"texture\":");
+                texture_reference(out, t);
+            }
+            out.push('}');
+        }
+        out.push_str("]}");
+    }
+
+    fn array(out: &mut String, a: &ArrayType) {
+        let _ = write!(out, "{{\"elementType\":{},\"length\":{},\"stride\":{},\"argumentIndexStride\":{}", a.element_type().as_raw(),
+                       a.array_length(), a.stride(), a.argument_index_stride());
+        if let Some(t) = a.element_struct_type() {
+            out.push_str(",\"struct\":");
+            structure(out, t);
+        }
+        if let Some(t) = a.element_array_type() {
+            out.push_str(",\"array\":");
+            array(out, t);
+        }
+        if let Some(t) = a.element_pointer_type() {
+            out.push_str(",\"pointer\":");
+            pointer(out, t);
+        }
+        if let Some(t) = a.element_texture_reference_type() {
+            out.push_str(",\"texture\":");
+            texture_reference(out, t);
+        }
+        out.push('}');
+    }
+
+    fn pointer(out: &mut String, p: &PointerType) {
+        let _ = write!(out, "{{\"elementType\":{},\"access\":{},\"alignment\":{},\"size\":{},\"argumentBuffer\":{}", p.element_type().as_raw(),
+                       p.access().as_raw(), p.alignment(), p.data_size(), p.element_is_argument_buffer());
+        if let Some(t) = p.element_struct_type() {
+            out.push_str(",\"struct\":");
+            structure(out, t);
+        }
+        if let Some(t) = p.element_array_type() {
+            out.push_str(",\"array\":");
+            array(out, t);
+        }
+        out.push('}');
+    }
+
+    fn texture_reference(out: &mut String, t: &TextureReferenceType) {
+        let _ = write!(out, "{{\"dataType\":{},\"textureType\":{},\"access\":{},\"depth\":{}}}", t.texture_data_type().as_raw(),
+                       t.texture_type().as_raw(), t.access().as_raw(), t.is_depth_texture());
+    }
+
+    fn binding(out: &mut String, b: &Binding) {
+        out.push_str("{\"name\":");
+        string(out, b.name());
+        let _ = write!(out, ",\"type\":{},\"access\":{},\"index\":{},\"used\":{},\"argument\":{}", b.binding_type().as_raw(), b.access().as_raw(),
+                       b.index(), b.is_used(), b.is_argument());
+        if let Some(buffer) = b.buffer() {
+            let _ = write!(out, ",\"buffer\":{{\"alignment\":{},\"size\":{},\"dataType\":{}", buffer.buffer_alignment(), buffer.buffer_data_size(),
+                           buffer.buffer_data_type().as_raw());
+            if let Some(t) = buffer.buffer_struct_type() {
+                out.push_str(",\"struct\":");
+                structure(out, t);
+            }
+            if let Some(t) = buffer.buffer_pointer_type() {
+                out.push_str(",\"pointer\":");
+                pointer(out, t);
+            }
+            out.push('}');
+        }
+        if let Some(t) = b.threadgroup() {
+            let _ = write!(out, ",\"threadgroup\":{{\"alignment\":{},\"size\":{}}}", t.threadgroup_memory_alignment(), t.threadgroup_memory_data_size());
+        }
+        if let Some(t) = b.texture() {
+            let _ = write!(out, ",\"texture\":{{\"textureType\":{},\"dataType\":{},\"depth\":{},\"arrayLength\":{}}}", t.texture_type().as_raw(),
+                           t.texture_data_type().as_raw(), t.is_depth_texture(), t.array_length());
+        }
+        out.push('}');
+    }
+
+    /// `"name":[binding,...]`.
+    pub(super) fn stage(out: &mut String, name: &str, bindings: &[Binding]) {
+        let _ = write!(out, "\"{name}\":[");
+        for (i, b) in bindings.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            binding(out, b);
+        }
+        out.push(']');
+    }
+}
+
+fn reflection_handle(json: String) -> Result<*mut NmbReflection, String> {
+    Ok(boxed(NmbReflection(std::ffi::CString::new(json).map_err(|_| "a NUL in the reflection".to_string())?)))
+}
+
+/// The reflection of the render pipeline `descriptor` describes: `{"vertex":[...],"fragment":[...]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_pipeline_reflection(descriptor: *const NmbRenderPipelineDescriptor) -> *mut NmbReflection {
+    guard(std::ptr::null_mut(), || {
+        let budget = metal2vulkan::Budget::with_deadline(None);
+        let reflection = render_descriptor(descriptor)?.reflection(&budget).map_err(e("render pipeline reflection"))?;
+        let mut json = String::from("{");
+        reflection_json::stage(&mut json, "vertex", reflection.vertex_bindings());
+        json.push(',');
+        reflection_json::stage(&mut json, "fragment", reflection.fragment_bindings());
+        json.push('}');
+        reflection_handle(json)
+    })
+}
+
+/// The reflection of the compute pipeline `descriptor` describes: `{"bindings":[...]}`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_pipeline_reflection(descriptor: *const NmbComputePipelineDescriptor) -> *mut NmbReflection {
+    guard(std::ptr::null_mut(), || {
+        let budget = metal2vulkan::Budget::with_deadline(None);
+        let reflection = compute_descriptor(descriptor)?.reflection(&budget).map_err(e("compute pipeline reflection"))?;
+        let mut json = String::from("{");
+        reflection_json::stage(&mut json, "bindings", reflection.bindings());
+        json.push('}');
+        reflection_handle(json)
+    })
+}
+
+/// The reflection's JSON, valid until its release.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_reflection_json(reflection: *const NmbReflection) -> *const c_char {
+    guard(std::ptr::null(), || Ok(get(reflection)?.0.as_ptr()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_reflection_release(reflection: *mut NmbReflection) {
+    release(reflection)
 }
 
 // ---- binary archives ----

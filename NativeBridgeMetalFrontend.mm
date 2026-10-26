@@ -12,6 +12,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <algorithm>
+#include <cmath>
 #include <atomic>
 #include <mutex>
 #include <pthread.h>
@@ -1161,6 +1162,7 @@ static NSData *functionBitcode(NBFunction *function) {
 @end
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
+@property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its functions, formats and vertex layout
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -1197,6 +1199,7 @@ static NSData *functionBitcode(NBFunction *function) {
 @end
 @interface NBDepthStencil : NBObject
 @property(nonatomic) NmbDepthStencil *handle;
+@property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its depth test and write
 @end
 @implementation NBDepthStencil
 - (void)dealloc {nmb_depth_stencil_release(_handle);}
@@ -1343,12 +1346,68 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) dispatch_group_t handlers;
 @property(nonatomic,strong) dispatch_group_t schedulingHandlers;
 @property(nonatomic) BOOL schedulingDelivered;
+// NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
+// waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
+@property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
+@property(nonatomic) uint32_t dumpPasses,dumpKernels;
+@property(nonatomic) BOOL dumpReadback;
+@property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
 @end
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+@property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
+// NATIVE_METAL_DUMP_CB: what is bound (stage << 8 | index: an [buffer, offset] pair or the bytes), the pipeline and depth/stencil state
+// set, and how many draws so far.
+@property(nonatomic,strong) NSMutableDictionary *dumpBound;
+@property(nonatomic,strong) id dumpPipeline,dumpDepth;
+@property(nonatomic) uint32_t dumpDraws;
 @end
+// NATIVE_METAL_DUMP_CB=FIRST[:COUNT]: the app's command buffers FIRST..FIRST+COUNT-1 (counted from 1, the plugin's own readbacks left
+// out) have what they rendered read back after them, by a command buffer of the plugin's own on the same queue: every render pass's
+// attachments and every texture a kernel could write, in the order first met. For each, standard error gets its channels' minimum,
+// maximum and mean, its NaNs and infinities, and a 32x8 grid of brightness ('.' exactly black, 0-9, '+' above 1, '!' a NaN), from 64
+// rows spread down it: where a frame goes black or wrong, the first texture that does names the pass.
+static std::atomic<uint64_t> gAppCommits;
+static std::pair<uint32_t,uint32_t> dumpRange() {
+ static const std::pair<uint32_t,uint32_t> range=[]{
+  unsigned first=0,count=0;const char *v=getenv("NATIVE_METAL_DUMP_CB");
+  if(v && sscanf(v,"%u:%u",&first,&count)>=1)return std::make_pair((uint32_t)first,(uint32_t)(count?count:1));
+  return std::make_pair(0u,0u);
+ }();
+ return range;
+}
+// Whether a command buffer being encoded now may be one to dump: its number is not known until it commits, and others may commit first.
+static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
+ const auto range=dumpRange();
+ if(!range.first || commandBuffer.dumpReadback)return false;
+ const uint64_t next=gAppCommits.load()+1;
+ return next+16>=range.first && next<(uint64_t)range.first+range.second;
+}
+// A line of the command buffer's NATIVE_METAL_DUMP_CB log (its passes, first draws and their state), printed before its readback.
+static void dumpLine(NBCommandBuffer *commandBuffer,NSString *line) {
+ if(!dumpMaybe(commandBuffer))return;
+ if(!commandBuffer.dumpLog)commandBuffer.dumpLog=[NSMutableArray array];
+ if(commandBuffer.dumpLog.count<600)[commandBuffer.dumpLog addObject:line];
+}
+// The first 16 words of bound data as floats, and how many of its first 256 words are zero or NaN.
+static NSString *dumpWords(const uint8_t *p,size_t n) {
+ NSMutableString *s=[NSMutableString string];
+ for(size_t i=0;i<std::min<size_t>(n/4,16);i++){float f;memcpy(&f,p+4*i,4);[s appendFormat:@" %.4g",f];}
+ size_t zero=0,nan=0;const size_t all=std::min<size_t>(n/4,256);
+ for(size_t i=0;i<all;i++){uint32_t w;memcpy(&w,p+4*i,4);float f;memcpy(&f,&w,4);zero+=!w;nan+=std::isnan(f);}
+ [s appendFormat:@" (of %zu words %zu zero, %zu NaN)",all,zero,nan];
+ return s;
+}
+static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id texture,NSUInteger level,NSUInteger slice,NSString *where) {
+ if(!texture || ![texture isKindOfClass:[NBTexture class]])return;
+ for(NSDictionary *seen in commandBuffer.dumpTargets)
+  if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
+ for(NSDictionary *seen in commandBuffer.dumpPending)
+  if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
+ [into addObject:[NSMutableDictionary dictionaryWithDictionary:@{@"texture":texture,@"level":@(level),@"slice":@(slice),@"where":where}]];
+}
 static void waitForResource(id resource) {
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
@@ -1370,6 +1429,8 @@ static void waitForResource(id resource) {
  return ok;
 }
 - (void)endEncoding {
+ if(self.label.length)for(NSMutableDictionary *entry in _dumpEntries)entry[@"encoder"]=self.label;
+ if(_dumpDraws)dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u: %u draws %@",_commandBuffer.dumpPasses,_dumpDraws,self.label?:@""]);
  NmbEncoder *handle=_handle;_handle=nullptr;
  if(!handle){[_commandBuffer refuse:@"endEncoding twice"];return;}
  [self check:nmb_encoder_end(handle) what:"endEncoding"];
@@ -1377,14 +1438,48 @@ static void waitForResource(id resource) {
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
 - (void)popDebugGroup {}
+// NATIVE_METAL_DUMP_CB: what a stage has bound at an index, for the draws' lines.
+- (void)dumpBind:(id)what index:(NSUInteger)index stage:(uint32_t)stage {
+ if(!dumpMaybe(_commandBuffer))return;
+ if(!_dumpBound)_dumpBound=[NSMutableDictionary dictionary];
+ _dumpBound[@(stage<<8|(uint32_t)index)]=what?:[NSNull null];
+}
+// NATIVE_METAL_DUMP_CB: the first 6 draws of each pass, with the pipeline, the depth/stencil state and every bound buffer's first words.
+- (void)dumpDraw:(NSString *)what {
+ if(!dumpMaybe(_commandBuffer) || ++_dumpDraws>6)return;
+ dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u draw %u: %@ | %@ | depth %@",_commandBuffer.dumpPasses,_dumpDraws,what,
+                          [_dumpPipeline dumpInfo]?:@"no pipeline",_dumpDepth?[_dumpDepth dumpInfo]:@"none"]);
+ for(NSNumber *key in [_dumpBound.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+  const uint32_t k=key.unsignedIntValue;id value=_dumpBound[key];
+  NSString *where=[NSString stringWithFormat:@"  %s %u",(k>>8)==1?"vertex":(k>>8)==2?"fragment":"kernel",k&0xff];
+  if([value isKindOfClass:[NSData class]]) {
+   NSData *data=value;
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ bytes %lu:%@",where,(unsigned long)data.length,dumpWords((const uint8_t *)data.bytes,data.length)]);
+  } else if([value isKindOfClass:[NSArray class]]) {
+   id<MTLBuffer> buffer=value[0];const NSUInteger offset=[value[1] unsignedIntegerValue];const uint8_t *contents=(const uint8_t *)buffer.contents;
+   dumpLine(_commandBuffer,[NSString stringWithFormat:@"%@ buffer %lu+%lu%@:%@",where,(unsigned long)buffer.length,(unsigned long)offset,
+                            buffer.label.length?[@" " stringByAppendingString:buffer.label]:@"",
+                            contents && offset<buffer.length?dumpWords(contents+offset,buffer.length-offset):@" not CPU-visible"]);
+  } else dumpLine(_commandBuffer,[where stringByAppendingString:@" nil"]);
+ }
+}
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ [self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+ if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
+  if(!_dumpEntries)_dumpEntries=[NSMutableArray array];
+  if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
+  const NSUInteger before=_commandBuffer.dumpTargets.count;
+  dumpNote(_commandBuffer,_commandBuffer.dumpTargets,texture,0,0,
+           [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
+  if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
+ }
  if(texture)[_commandBuffer.resourceOwners addObject:texture];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
@@ -1401,6 +1496,7 @@ static void waitForResource(id resource) {
  [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
+ [self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
@@ -1411,6 +1507,8 @@ static void waitForResource(id resource) {
 - (void)updateFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:true];}
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
+ id bound=_dumpBound[@(stage<<8|(uint32_t)index)];
+ if([bound isKindOfClass:[NSArray class]])[self dumpBind:@[bound[0],@(offset)] index:index stage:stage];
  [self check:nmb_encoder_set_buffer_offset(_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"];
 }
 @end
@@ -1467,6 +1565,7 @@ static void waitForResource(id resource) {
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
+ if(dumpRange().first)self.dumpPipeline=state;
  [self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"];
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -1504,19 +1603,26 @@ static void waitForResource(id resource) {
 }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
+ if(dumpRange().first)self.dumpDepth=state;
  [self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"];
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
+ if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
+                                                 v.originX,v.originY,v.width,v.height,v.znear,v.zfar]);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
+ if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
+                                                 (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {
  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
+ if(self.dumpDraws<6)dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
+                                                 cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue]);
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
 }
 - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
@@ -1549,6 +1655,8 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
+                 (unsigned long)i,(unsigned long)b]];
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i {
@@ -1562,6 +1670,16 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ if(dumpMaybe(self.commandBuffer) && self.dumpDraws<6) {
+  const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
+  NSMutableString *first=[NSMutableString string];
+  for(NSUInteger j=0;indices && j<4 && o+(j+1)*size<=b.length;j++) {
+   uint32_t index=0;memcpy(&index,indices+o+j*size,size);[first appendFormat:@" %u",index];
+  }
+  [self dumpDraw:[NSString stringWithFormat:@"indexed prim %lu count %lu type %lu offset %lu of %lu (first%@) instances %lu baseVertex %ld base %lu",
+                  (unsigned long)t,(unsigned long)n,(unsigned long)k,(unsigned long)o,(unsigned long)b.length,first.length?first:@" unseen",
+                  (unsigned long)i,(long)v,(unsigned long)bi]];
+ } else [self dumpDraw:@"indexed"];
  [self check:nmb_render_draw_indexed(self.handle,t,(uint32_t)n,k,[(NBBuffer *)b handle],o,(uint32_t)i,(int32_t)v,(uint32_t)bi) what:"drawIndexedPrimitives"];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
@@ -1589,6 +1707,8 @@ static void waitForResource(id resource) {
           points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
+ [self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
+                 (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
  [self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
      ci?[(NBBuffer *)ci handle]:nullptr,co,(uint32_t)instances,(uint32_t)base,ib?[(NBBuffer *)ib handle]:nullptr,io) what:"drawPatches"];
 }
@@ -1709,6 +1829,136 @@ static bool onRenderServerThread() {
  return !strncmp(name,"com.apple.coreanimation",23);
 }
 extern "C" void NBWaitInFlight(uint64_t beforeUs);
+// ---- NATIVE_METAL_DUMP_CB ----
+static float dumpHalf(const uint8_t *p) {__fp16 h;memcpy(&h,p,2);return (float)h;}
+// A packed unsigned float of `mantissa` mantissa bits and 5 exponent bits (RG11B10Float's channels).
+static float dumpSmallFloat(uint32_t bits,int mantissa) {
+ const uint32_t m=bits&((1u<<mantissa)-1),e=bits>>mantissa;
+ if(e==31)return m?NAN:INFINITY;
+ if(!e)return ldexpf((float)m,-14-mantissa);
+ return ldexpf(1.0f+(float)m/(float)(1u<<mantissa),(int)e-15);
+}
+// A texel of `format` as up to four floats (red first); returns its bytes, 0 for a format not decoded here.
+static unsigned dumpTexel(uint32_t format,const uint8_t *p,float c[4],unsigned *channels) {
+ uint32_t v=0;
+ switch(format) {
+  case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: *channels=1;c[0]=p[0]/255.f;return 1;
+  case MTLPixelFormatR8Uint: *channels=1;c[0]=p[0];return 1;
+  case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: *channels=2;c[0]=p[0]/255.f;c[1]=p[1]/255.f;return 2;
+  case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB: *channels=4;for(int i=0;i<4;i++)c[i]=p[i]/255.f;return 4;
+  case MTLPixelFormatBGRA8Unorm: case MTLPixelFormatBGRA8Unorm_sRGB:
+   *channels=4;c[0]=p[2]/255.f;c[1]=p[1]/255.f;c[2]=p[0]/255.f;c[3]=p[3]/255.f;return 4;
+  case MTLPixelFormatR16Unorm: *channels=1;c[0]=*(const uint16_t *)p/65535.f;return 2;
+  case MTLPixelFormatR16Uint: *channels=1;c[0]=*(const uint16_t *)p;return 2;
+  case MTLPixelFormatRG16Unorm: *channels=2;for(int i=0;i<2;i++)c[i]=((const uint16_t *)p)[i]/65535.f;return 4;
+  case MTLPixelFormatRGBA16Unorm: *channels=4;for(int i=0;i<4;i++)c[i]=((const uint16_t *)p)[i]/65535.f;return 8;
+  case MTLPixelFormatR16Float: *channels=1;c[0]=dumpHalf(p);return 2;
+  case MTLPixelFormatRG16Float: *channels=2;for(int i=0;i<2;i++)c[i]=dumpHalf(p+2*i);return 4;
+  case MTLPixelFormatRGBA16Float: *channels=4;for(int i=0;i<4;i++)c[i]=dumpHalf(p+2*i);return 8;
+  case MTLPixelFormatR32Float: case MTLPixelFormatDepth32Float: *channels=1;memcpy(c,p,4);return 4;
+  case MTLPixelFormatR32Uint: *channels=1;memcpy(&v,p,4);c[0]=(float)v;return 4;
+  case MTLPixelFormatRG32Float: *channels=2;memcpy(c,p,8);return 8;
+  case MTLPixelFormatRGBA32Float: *channels=4;memcpy(c,p,16);return 16;
+  case MTLPixelFormatRGB10A2Unorm: case MTLPixelFormatBGR10A2Unorm: {
+   memcpy(&v,p,4);*channels=4;const bool bgr=format==MTLPixelFormatBGR10A2Unorm;
+   c[bgr?2:0]=(v&1023)/1023.f;c[1]=((v>>10)&1023)/1023.f;c[bgr?0:2]=((v>>20)&1023)/1023.f;c[3]=(v>>30)/3.f;return 4;
+  }
+  case MTLPixelFormatRG11B10Float:
+   memcpy(&v,p,4);*channels=3;c[0]=dumpSmallFloat(v&0x7ff,6);c[1]=dumpSmallFloat((v>>11)&0x7ff,6);c[2]=dumpSmallFloat(v>>22,5);return 4;
+  case MTLPixelFormatRGB9E5Float: {
+   memcpy(&v,p,4);*channels=3;const int e=(int)(v>>27)-24;
+   c[0]=ldexpf((float)(v&511),e);c[1]=ldexpf((float)((v>>9)&511),e);c[2]=ldexpf((float)((v>>18)&511),e);return 4;
+  }
+  default: return 0;
+ }
+}
+static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
+ NSDictionary *t=read[@"target"];NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
+ NSString *encoder=t[@"encoder"];
+ char head[400];
+ snprintf(head,sizeof head,"native-metal dump cb %llu: %s%s%s%s texture %s %llux%llu f%llu L%lu S%lu",(unsigned long long)appIndex,
+          [t[@"where"] UTF8String],encoder?" (":"",encoder?encoder.UTF8String:"",encoder?")":"",texture.label.length?texture.label.UTF8String:"-",
+          (unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.format,
+          (unsigned long)[t[@"level"] unsignedIntegerValue],(unsigned long)[t[@"slice"] unsignedIntegerValue]);
+ if(read[@"skip"]){fprintf(stderr,"%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
+ const unsigned w=[read[@"w"] unsignedIntValue],rows=[read[@"rows"] unsignedIntValue],bpp=[read[@"bpp"] unsignedIntValue];
+ const uint32_t format=[read[@"format"] unsignedIntValue];
+ const uint8_t *bytes=(const uint8_t *)[(id<MTLBuffer>)read[@"buffer"] contents];
+ if(!bytes){fprintf(stderr,"%s: no readback contents\n",head);return;}
+ double sum[4]={},lo[4]={INFINITY,INFINITY,INFINITY,INFINITY},hi[4]={-INFINITY,-INFINITY,-INFINITY,-INFINITY};
+ uint64_t finite[4]={},nans=0,infs=0,black=0,texels=0;unsigned channels=1;
+ double cell[8][32]={};uint32_t cellCount[8][32]={},cellNan[8][32]={},cellLit[8][32]={};
+ for(unsigned r=0;r<rows;r++)for(unsigned x=0;x<w;x++) {
+  float c[4]={};dumpTexel(format,bytes+((size_t)r*w+x)*bpp,c,&channels);
+  bool nan=false,zero=true;double light=0;unsigned lit=0;
+  for(unsigned i=0;i<channels;i++) {
+   if(std::isnan(c[i])){nan=true;continue;}
+   if(std::isinf(c[i])){infs++;continue;}
+   sum[i]+=c[i];finite[i]++;lo[i]=std::min(lo[i],(double)c[i]);hi[i]=std::max(hi[i],(double)c[i]);
+   if(c[i]!=0)zero=false;
+   if(i<3){light+=c[i];lit++;}
+  }
+  nans+=nan;texels++;black+=zero && !nan;
+  const unsigned gy=std::min(7u,r*8/rows),gx=std::min(31u,x*32/w);
+  cellCount[gy][gx]++;cellNan[gy][gx]+=nan;
+  if(lit){cell[gy][gx]+=light/lit;if(!zero)cellLit[gy][gx]++;}
+ }
+ std::string line=head;char part[120];
+ for(unsigned i=0;i<channels;i++) {
+  if(!finite[i]){snprintf(part,sizeof part," c%u none finite",i);line+=part;continue;}
+  snprintf(part,sizeof part," c%u %.4g..%.4g mean %.4g",i,lo[i],hi[i],sum[i]/finite[i]);line+=part;
+ }
+ snprintf(part,sizeof part,"; nan %llu inf %llu black %.1f%% of %llu",(unsigned long long)nans,(unsigned long long)infs,
+          texels?100.0*black/texels:0.0,(unsigned long long)texels);line+=part;
+ fprintf(stderr,"%s\n",line.c_str());
+ for(unsigned gy=0;gy<8;gy++) {
+  char grid[33]={};
+  for(unsigned gx=0;gx<32;gx++) {
+   const uint32_t n=cellCount[gy][gx];const double mean=n?cell[gy][gx]/n:0;
+   grid[gx]=!n?' ':cellNan[gy][gx]?'!':!cellLit[gy][gx]?'.':mean>1?'+':mean<0?'-':(char)('0'+std::min(9,(int)(mean*10)));
+  }
+  fprintf(stderr,"native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
+ }
+}
+// The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
+static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
+ NSArray *targets=[source.dumpTargets copy];
+ fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
+         (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
+ for(NSString *line in source.dumpLog)fprintf(stderr,"native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
+ if(!targets.count)return;
+ NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
+ if(!readback)return;
+ readback.dumpReadback=YES;
+ id<MTLBlitCommandEncoder> blit=[(id<MTLCommandBuffer>)readback blitCommandEncoder];
+ NSMutableArray *reads=[NSMutableArray array];
+ for(NSDictionary *t in targets) {
+  NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
+  const NSUInteger level=[t[@"level"] unsignedIntegerValue],slice=[t[@"slice"] unsignedIntegerValue];
+  float c[4];unsigned channels=0;const uint8_t zero[16]={};
+  const unsigned bpp=texture.pvrtc?0:dumpTexel((uint32_t)d.format,zero,c,&channels);
+  NSString *skip=!bpp?@"format not read back":d.samples>1?@"multisampled":d.type==MTLTextureType3D?@"3D":
+                 texture.storageMode==MTLStorageModeMemoryless?@"memoryless":nil;
+  if(skip){[reads addObject:@{@"target":t,@"skip":skip}];continue;}
+  const NSUInteger w=std::max<NSUInteger>(1,(NSUInteger)d.width>>level),h=std::max<NSUInteger>(1,(NSUInteger)d.height>>level);
+  const NSUInteger rows=std::min<NSUInteger>(h,64),rowBytes=w*bpp;
+  id<MTLBuffer> buffer=[gDeviceObject newBufferWithLength:rowBytes*rows options:MTLResourceStorageModeShared];
+  if(!buffer){[reads addObject:@{@"target":t,@"skip":@"no readback buffer"}];continue;}
+  for(NSUInteger r=0;r<rows;r++)
+   [blit copyFromTexture:(id<MTLTexture>)texture sourceSlice:slice sourceLevel:level sourceOrigin:MTLOriginMake(0,(2*r+1)*h/(2*rows),0)
+              sourceSize:MTLSizeMake(w,1,1) toBuffer:buffer destinationOffset:r*rowBytes destinationBytesPerRow:rowBytes
+              destinationBytesPerImage:rowBytes];
+  [reads addObject:@{@"target":t,@"buffer":buffer,@"w":@(w),@"rows":@(rows),@"bpp":@(bpp),@"format":@((uint32_t)d.format)}];
+ }
+ [blit endEncoding];
+ [(id<MTLCommandBuffer>)readback addCompletedHandler:^(id<MTLCommandBuffer> done) {
+  if(done.error){fprintf(stderr,"native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
+                         done.error.localizedDescription.UTF8String);return;}
+  for(NSDictionary *read in reads)dumpPrint(appIndex,read);
+ }];
+ [(id<MTLCommandBuffer>)readback commit];
+}
+
 @implementation NBCommandBuffer
 // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
@@ -1773,6 +2023,11 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   * encoder's IMPs with methodForSelector:, and on nil it called address 0 (i568: WidgetRenderer_Default crashed eight launches running, then
   * hit its open cap and lost the device). */
  if(!handle){[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];encoder.commandBuffer=self;return encoder;}
+ if([encoder isKindOfClass:[NBComputeEncoder class]])_dumpKernels++;
+ if(_dumpPending.count) {
+  if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
+  [_dumpTargets addObjectsFromArray:_dumpPending];encoder.dumpEntries=_dumpPending;_dumpPending=nil;
+ }
  encoder.handle=handle;encoder.commandBuffer=self;return encoder;
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
@@ -1788,6 +2043,34 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};
+ _dumpPasses++;
+ if(dumpMaybe(self)) {
+  if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
+  _dumpPending=[NSMutableArray array];
+  for(unsigned i=0;i<8;i++) {
+   MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   if(c.resolveTexture)dumpNote(self,_dumpPending,c.resolveTexture,c.resolveLevel,c.resolveSlice,
+                                [NSString stringWithFormat:@"pass %u resolve %u",_dumpPasses,i]);
+   else dumpNote(self,_dumpPending,c.texture,c.level,c.slice,[NSString stringWithFormat:@"pass %u color %u",_dumpPasses,i]);
+  }
+  dumpNote(self,_dumpPending,d.depthAttachment.texture,d.depthAttachment.level,d.depthAttachment.slice,
+           [NSString stringWithFormat:@"pass %u depth",_dumpPasses]);
+  // Load 0 don't care, 1 load, 2 clear; store 0 don't care, 1 store, 2 resolve, 3 store and resolve.
+  NSMutableString *line=[NSMutableString stringWithFormat:@"pass %u %lux%lu",_dumpPasses,(unsigned long)d.renderTargetWidth,(unsigned long)d.renderTargetHeight];
+  auto describe=[&](NSString *name,MTLRenderPassAttachmentDescriptor *a,NSString *clear) {
+   if(!a.texture)return;
+   [line appendFormat:@"; %@ f%lu %lux%lu%@ load %lu store %lu%@%@",name,(unsigned long)a.texture.pixelFormat,(unsigned long)a.texture.width,
+    (unsigned long)a.texture.height,a.texture.storageMode==MTLStorageModeMemoryless?@" memoryless":@"",(unsigned long)a.loadAction,
+    (unsigned long)a.storeAction,a.loadAction==MTLLoadActionClear?clear:@"",a.resolveTexture?@" resolve":@""];
+  };
+  for(unsigned i=0;i<8;i++) {
+   MTLClearColor c=d.colorAttachments[i].clearColor;
+   describe([NSString stringWithFormat:@"c%u",i],d.colorAttachments[i],[NSString stringWithFormat:@" clear %g,%g,%g,%g",c.red,c.green,c.blue,c.alpha]);
+  }
+  describe(@"depth",d.depthAttachment,[NSString stringWithFormat:@" clear %g",d.depthAttachment.clearDepth]);
+  describe(@"stencil",d.stencilAttachment,[NSString stringWithFormat:@" clear %u",d.stencilAttachment.clearStencil]);
+  dumpLine(self,line);
+ }
  {
   id<MTLTexture> first=d.colorAttachments[0].texture;
   if(first) {
@@ -1919,8 +2202,13 @@ extern "C" void NBWaitInFlight(uint64_t beforeUs);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
+  const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {[self fireEarly];return;}
+     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
+   const auto range=dumpRange();
+   if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
+   [self fireEarly];return;
+  }
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
   [self refuse:[@"commit: " stringByAppendingString:lastError()]];
  }
@@ -2178,6 +2466,199 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDes
   dumpText(line);
  }
  return true;
+}
+// NATIVE_METAL_DUMP_CB: a render pipeline's functions, color formats (b blends, m its write mask), depth format and vertex layout
+// (attribute=format@offset/buffer, layout=stride/step/rate), for its draws' lines.
+static NSString *renderDumpInfo(MTLRenderPipelineDescriptor *d) {
+ NSMutableString *s=[NSMutableString stringWithFormat:@"%@ v=%@ f=%@",d.label?:@"-",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-"];
+ for(unsigned i=0;i<8;i++) {
+  MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;
+  [s appendFormat:@" c%u=f%lu%@",i,(unsigned long)a.pixelFormat,a.blendingEnabled?@"b":@""];
+  if(a.writeMask!=MTLColorWriteMaskAll)[s appendFormat:@"m%lu",(unsigned long)a.writeMask];
+ }
+ if(d.depthAttachmentPixelFormat)[s appendFormat:@" d=f%lu",(unsigned long)d.depthAttachmentPixelFormat];
+ if(d.stencilAttachmentPixelFormat)[s appendFormat:@" s=f%lu",(unsigned long)d.stencilAttachmentPixelFormat];
+ if(d.rasterSampleCount>1)[s appendFormat:@" samples %lu",(unsigned long)d.rasterSampleCount];
+ if(!d.rasterizationEnabled)[s appendString:@" no rasterization"];
+ if(MTLVertexDescriptor *v=d.vertexDescriptor)for(unsigned i=0;i<31;i++) {
+  MTLVertexAttributeDescriptor *a=v.attributes[i];if(a.format==MTLVertexFormatInvalid)continue;
+  MTLVertexBufferLayoutDescriptor *l=v.layouts[a.bufferIndex];
+  [s appendFormat:@" a%u=%lu@%lu/b%lu=%lu/%lu/%lu",i,(unsigned long)a.format,(unsigned long)a.offset,(unsigned long)a.bufferIndex,
+   (unsigned long)l.stride,(unsigned long)l.stepFunction,(unsigned long)l.stepRate];
+ }
+ return s;
+}
+
+// ---- pipeline reflection ----
+// The `reflection:` of a pipeline's creation, from the runtime's JSON (nmb_*_pipeline_reflection): subclasses of Metal's own reflection
+// classes (MTLArgument, which also answers MTLBinding's selectors, MTLStructType, MTLStructMember, MTLArrayType, MTLPointerType,
+// MTLTextureReferenceType and the pipeline reflections), so a caller's class checks pass and a getter not answered here is the base
+// class's. GFXBench's NGL engine (Aztec Ruins) reads every uniform's offset and every texture's index from it: without it, it binds
+// nothing and every draw reads zeros.
+@class NBStructType,NBArrayType,NBPointerType,NBTextureReferenceType;
+static NSUInteger reflectionValue(NSDictionary *json,NSString *key) {return [json[key] unsignedIntegerValue];}
+static NBStructType *reflectionStruct(NSDictionary *json);
+static NBArrayType *reflectionArray(NSDictionary *json);
+static NBPointerType *reflectionPointer(NSDictionary *json);
+static NBTextureReferenceType *reflectionTexture(NSDictionary *json);
+@interface NBTextureReferenceType : MTLTextureReferenceType
+@property(nonatomic,strong) NSDictionary *json;
+@end
+@implementation NBTextureReferenceType
+- (MTLDataType)dataType {return MTLDataTypeTexture;}
+- (MTLDataType)textureDataType {return (MTLDataType)reflectionValue(_json,@"dataType");}
+- (MTLTextureType)textureType {return (MTLTextureType)reflectionValue(_json,@"textureType");}
+- (MTLBindingAccess)access {return (MTLBindingAccess)reflectionValue(_json,@"access");}
+- (BOOL)isDepthTexture {return [_json[@"depth"] boolValue];}
+@end
+@interface NBPointerType : MTLPointerType
+@property(nonatomic,strong) NSDictionary *json;
+@end
+@implementation NBPointerType
+- (MTLDataType)dataType {return MTLDataTypePointer;}
+- (MTLDataType)elementType {return (MTLDataType)reflectionValue(_json,@"elementType");}
+- (MTLBindingAccess)access {return (MTLBindingAccess)reflectionValue(_json,@"access");}
+- (NSUInteger)alignment {return reflectionValue(_json,@"alignment");}
+- (NSUInteger)dataSize {return reflectionValue(_json,@"size");}
+- (BOOL)elementIsArgumentBuffer {return [_json[@"argumentBuffer"] boolValue];}
+- (MTLStructType *)elementStructType {return (MTLStructType *)reflectionStruct(_json[@"struct"]);}
+- (MTLArrayType *)elementArrayType {return (MTLArrayType *)reflectionArray(_json[@"array"]);}
+@end
+@interface NBArrayType : MTLArrayType
+@property(nonatomic,strong) NSDictionary *json;
+@end
+@implementation NBArrayType
+- (MTLDataType)dataType {return MTLDataTypeArray;}
+- (MTLDataType)elementType {return (MTLDataType)reflectionValue(_json,@"elementType");}
+- (NSUInteger)arrayLength {return reflectionValue(_json,@"length");}
+- (NSUInteger)stride {return reflectionValue(_json,@"stride");}
+- (NSUInteger)argumentIndexStride {return reflectionValue(_json,@"argumentIndexStride");}
+- (MTLStructType *)elementStructType {return (MTLStructType *)reflectionStruct(_json[@"struct"]);}
+- (MTLArrayType *)elementArrayType {return (MTLArrayType *)reflectionArray(_json[@"array"]);}
+- (MTLPointerType *)elementPointerType {return (MTLPointerType *)reflectionPointer(_json[@"pointer"]);}
+- (MTLTextureReferenceType *)elementTextureReferenceType {return (MTLTextureReferenceType *)reflectionTexture(_json[@"texture"]);}
+@end
+@interface NBStructMember : MTLStructMember
+@property(nonatomic,strong) NSDictionary *json;
+@end
+@implementation NBStructMember
+- (NSString *)name {return _json[@"name"];}
+- (NSUInteger)offset {return reflectionValue(_json,@"offset");}
+- (MTLDataType)dataType {return (MTLDataType)reflectionValue(_json,@"dataType");}
+- (NSUInteger)argumentIndex {return reflectionValue(_json,@"argumentIndex");}
+- (MTLStructType *)structType {return (MTLStructType *)reflectionStruct(_json[@"struct"]);}
+- (MTLArrayType *)arrayType {return (MTLArrayType *)reflectionArray(_json[@"array"]);}
+- (MTLPointerType *)pointerType {return (MTLPointerType *)reflectionPointer(_json[@"pointer"]);}
+- (MTLTextureReferenceType *)textureReferenceType {return (MTLTextureReferenceType *)reflectionTexture(_json[@"texture"]);}
+@end
+@interface NBStructType : MTLStructType
+@property(nonatomic,strong) NSArray *memberList;
+@end
+@implementation NBStructType
+- (MTLDataType)dataType {return MTLDataTypeStruct;}
+- (NSArray<MTLStructMember *> *)members {return _memberList;}
+- (MTLStructMember *)memberByName:(NSString *)name {
+ for(NBStructMember *member in _memberList)if([member.name isEqualToString:name])return member;
+ return nil;
+}
+@end
+static NBStructType *reflectionStruct(NSDictionary *json) {
+ if(![json isKindOfClass:[NSDictionary class]])return nil;
+ NSMutableArray *members=[NSMutableArray array];
+ for(NSDictionary *m in json[@"members"]){NBStructMember *member=[NBStructMember new];member.json=m;[members addObject:member];}
+ NBStructType *type=[NBStructType new];type.memberList=members;return type;
+}
+static NBArrayType *reflectionArray(NSDictionary *json) {
+ if(![json isKindOfClass:[NSDictionary class]])return nil;
+ NBArrayType *type=[NBArrayType new];type.json=json;return type;
+}
+static NBPointerType *reflectionPointer(NSDictionary *json) {
+ if(![json isKindOfClass:[NSDictionary class]])return nil;
+ NBPointerType *type=[NBPointerType new];type.json=json;return type;
+}
+static NBTextureReferenceType *reflectionTexture(NSDictionary *json) {
+ if(![json isKindOfClass:[NSDictionary class]])return nil;
+ NBTextureReferenceType *type=[NBTextureReferenceType new];type.json=json;return type;
+}
+// One argument: MTLArgument's getters, and MTLBinding's (with MTLBufferBinding's, MTLTextureBinding's and MTLThreadgroupBinding's),
+// whose `type` values are MTLArgumentType's.
+@interface NBArgument : MTLArgument
+@property(nonatomic,strong) NSDictionary *json;
+@property(nonatomic,strong) NBStructType *madeStruct;   // made once: callers walk its members by identity
+@end
+@implementation NBArgument
+- (NSString *)name {return _json[@"name"];}
+- (MTLArgumentType)type {return (MTLArgumentType)reflectionValue(_json,@"type");}
+- (MTLBindingAccess)access {return (MTLBindingAccess)reflectionValue(_json,@"access");}
+- (NSUInteger)index {return reflectionValue(_json,@"index");}
+- (BOOL)isActive {return [_json[@"used"] boolValue];}
+- (BOOL)isUsed {return self.isActive;}
+- (BOOL)isArgument {return [_json[@"argument"] boolValue];}
+- (NSUInteger)bufferAlignment {return reflectionValue(_json[@"buffer"],@"alignment");}
+- (NSUInteger)bufferDataSize {return reflectionValue(_json[@"buffer"],@"size");}
+- (MTLDataType)bufferDataType {return (MTLDataType)reflectionValue(_json[@"buffer"],@"dataType");}
+- (MTLStructType *)bufferStructType {
+ if(!_madeStruct)_madeStruct=reflectionStruct(_json[@"buffer"][@"struct"]);
+ return _madeStruct;
+}
+- (MTLPointerType *)bufferPointerType {return (MTLPointerType *)reflectionPointer(_json[@"buffer"][@"pointer"]);}
+- (NSUInteger)threadgroupMemoryAlignment {return reflectionValue(_json[@"threadgroup"],@"alignment");}
+- (NSUInteger)threadgroupMemoryDataSize {return reflectionValue(_json[@"threadgroup"],@"size");}
+- (MTLTextureType)textureType {return (MTLTextureType)reflectionValue(_json[@"texture"],@"textureType");}
+- (MTLDataType)textureDataType {return (MTLDataType)reflectionValue(_json[@"texture"],@"dataType");}
+- (BOOL)isDepthTexture {return [_json[@"texture"][@"depth"] boolValue];}
+- (NSUInteger)arrayLength {return _json[@"texture"]?reflectionValue(_json[@"texture"],@"arrayLength"):1;}
+- (NSString *)description {return [NSString stringWithFormat:@"<NBArgument %@ type %lu index %lu>",self.name,(unsigned long)self.type,(unsigned long)self.index];}
+@end
+@interface NBRenderPipelineReflection : MTLRenderPipelineReflection
+@property(nonatomic,strong) NSArray *vertexList,*fragmentList;
+@end
+@implementation NBRenderPipelineReflection
+- (NSArray *)vertexArguments {return _vertexList;}
+- (NSArray *)fragmentArguments {return _fragmentList;}
+- (NSArray *)tileArguments {return @[];}
+- (NSArray *)vertexBindings {return _vertexList;}
+- (NSArray *)fragmentBindings {return _fragmentList;}
+- (NSArray *)tileBindings {return @[];}
+- (NSArray *)objectBindings {return @[];}
+- (NSArray *)meshBindings {return @[];}
+@end
+@interface NBComputePipelineReflection : MTLComputePipelineReflection
+@property(nonatomic,strong) NSArray *argumentList;
+@end
+@implementation NBComputePipelineReflection
+- (NSArray *)arguments {return _argumentList;}
+- (NSArray *)bindings {return _argumentList;}
+@end
+// The runtime's JSON as objects (nil, with the reason logged, for a refusal).
+static NSDictionary *reflectionJSON(NmbReflection *reflection,const char *what) {
+ if(!reflection){NBLOG(@"native-metal: %s reflection refused: %@",what,lastError());return nil;}
+ const char *text=nmb_reflection_json(reflection);
+ NSData *data=text?[NSData dataWithBytes:text length:strlen(text)]:nil;
+ NSDictionary *json=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+ nmb_reflection_release(reflection);
+ if(![json isKindOfClass:[NSDictionary class]]){NBLOG(@"native-metal: %s reflection is not JSON",what);return nil;}
+ return json;
+}
+static NSArray *reflectionArguments(NSArray *bindings) {
+ NSMutableArray *arguments=[NSMutableArray array];
+ for(NSDictionary *b in bindings)if([b isKindOfClass:[NSDictionary class]]){NBArgument *argument=[NBArgument new];argument.json=b;[arguments addObject:argument];}
+ return arguments;
+}
+// Metal answers a reflection where the options ask for argument or buffer type information.
+static bool wantsReflection(MTLPipelineOption options) {return options&(MTLPipelineOptionArgumentInfo|MTLPipelineOptionBufferTypeInfo);}
+static id renderReflection(const NmbRenderPipelineDescriptor *p) {
+ NSDictionary *json=reflectionJSON(nmb_render_pipeline_reflection(p),"render pipeline");
+ if(!json)return nil;
+ NBRenderPipelineReflection *reflection=[NBRenderPipelineReflection new];
+ reflection.vertexList=reflectionArguments(json[@"vertex"]);reflection.fragmentList=reflectionArguments(json[@"fragment"]);
+ return reflection;
+}
+static id computeReflection(const NmbComputePipelineDescriptor *p) {
+ NSDictionary *json=reflectionJSON(nmb_compute_pipeline_reflection(p),"compute pipeline");
+ if(!json)return nil;
+ NBComputePipelineReflection *reflection=[NBComputePipelineReflection new];reflection.argumentList=reflectionArguments(json[@"bindings"]);
+ return reflection;
 }
 
 // ---- heaps ----
@@ -2563,12 +3044,19 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);
- if(!handle)if(NBFunction *rebuilt=zeroRestFunction((NBFunction *)function))handle=nmb_compute_pipeline_new_with_options(gDevice,rebuilt.handle,&creation);
+ NBFunction *built=(NBFunction *)function;
+ if(!handle)if(NBFunction *rebuilt=zeroRestFunction((NBFunction *)function)) {
+  handle=nmb_compute_pipeline_new_with_options(gDevice,rebuilt.handle,&creation);if(handle)built=rebuilt;
+ }
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
   NBFunction *f=(NBFunction *)function;
   noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ }
+ if(reflection && wantsReflection(options)) {
+  NmbComputePipelineDescriptor p={};p.function=built.handle;p.max_call_stack_depth=1;
+  *reflection=(MTLComputePipelineReflection *)computeReflection(&p);
  }
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
@@ -2593,6 +3081,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
+ if(reflection && wantsReflection(options))*reflection=(MTLComputePipelineReflection *)computeReflection(&p);
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
@@ -2608,10 +3097,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);delete p;gTimePipeline.add(pipelineBegan);
+ NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
+ delete p;
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
  if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLRenderPipelineState>)state;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
+ return (id<MTLRenderPipelineState>)state;
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
 // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
@@ -2621,8 +3114,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
                            completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
- NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:nil error:&error];
- handler(state,nil,error);
+ NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
+ id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ handler(state,reflection,error);
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
@@ -2630,8 +3124,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                           completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
- NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:nil error:&error];
- handler(state,nil,error);
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;
+ id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
+ handler(state,reflection,error);
 }
 // SPI: a precompiled pipeline library (RenderBox.framework/default.pipelinelib) holds Apple GPU binaries. None is opened; the caller logs the
 // error and builds its pipelines from the shader library instead (RB::Device::render_pipeline_state).
@@ -2664,7 +3159,10 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbDepthStencilDescriptor s={(uint64_t)d.depthCompareFunction,(uint64_t)d.depthWriteEnabled,face(d.frontFaceStencil),face(d.backFaceStencil)};
  NmbDepthStencil *handle=nmb_depth_stencil_new(gDevice,&s);
  if(!handle){NBLOG(@"native-metal: depth/stencil state refused: %@",lastError());return nil;}
- NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;return (id<MTLDepthStencilState>)state;
+ NBDepthStencil *state=[NBDepthStencil new];state.handle=handle;
+ if(dumpRange().first)state.dumpInfo=[NSString stringWithFormat:@"compare %lu write %d%@",(unsigned long)d.depthCompareFunction,d.depthWriteEnabled,
+                                      d.frontFaceStencil.stencilCompareFunction!=MTLCompareFunctionAlways || d.frontFaceStencil.depthStencilPassOperation?@" stencil":@""];
+ return (id<MTLDepthStencilState>)state;
 }
 @end
 
