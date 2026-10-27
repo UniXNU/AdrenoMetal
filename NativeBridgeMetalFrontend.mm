@@ -3263,14 +3263,17 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 static std::unordered_map<SEL,uint64_t> gAnswers;
 static NSUInteger countAnswer(id,SEL cmd) {return (NSUInteger)gAnswers.at(cmd);}
 static BOOL flagAnswer(id,SEL cmd) {return gAnswers.at(cmd)!=0;}
+// Diagnostic A/B switch, read when the process starts: ask the runtime on every call again.
+static const bool gNoAnswerCache=access("/private/var/ngpu/debug/no-answer-cache",F_OK)==0;
 static uint64_t askAnswer(SEL cmd,NSUInteger arg) {
  static std::mutex lock;
  static std::unordered_map<SEL,std::unordered_map<NSUInteger,uint64_t>> kept;
- {std::lock_guard<std::mutex> hold(lock);
+ if(!gNoAnswerCache) {std::lock_guard<std::mutex> hold(lock);
   auto answers=kept.find(cmd);
   if(answers!=kept.end()){auto answer=answers->second.find(arg);if(answer!=answers->second.end())return answer->second;}}
  uint64_t value=0;
  if(!nmb_device_answer(gDevice,sel_getName(cmd),arg,&value)){NBLOG(@"native-metal: %s(%lu): %@",sel_getName(cmd),(unsigned long)arg,lastError());value=0;}
+ if(gNoAnswerCache)return value;
  std::lock_guard<std::mutex> hold(lock);
  kept[cmd][arg]=value;
  return value;
