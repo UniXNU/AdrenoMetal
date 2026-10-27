@@ -930,8 +930,10 @@ static constexpr bool kSurfaceFlush=false;
 #else
 static constexpr bool kSurfaceFlush=true;
 #endif
+// Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here either.
+static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
 static void flushSurfaces(NSMutableSet *surfaces) {
- if(!kSurfaceFlush || !surfaces.count)return;
+ if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
  for(NBTexture *texture in surfaces)if(texture.surface)
