@@ -1473,6 +1473,8 @@ static void waitForResource(id resource) {
  _dumpBound[@(stage<<8|(uint32_t)index)]=what?:[NSNull null];
 }
 // NATIVE_METAL_DUMP_CB: the first 6 draws of each pass, with the pipeline, the depth/stencil state and every bound buffer's first words.
+// A caller builds a dump's text only under dumpMaybe(): without NATIVE_METAL_DUMP_CB the text was made and thrown away on every call
+// (a setScissorRect: was a fifth of GFXBench's Driver Overhead 2 thread, and every drawPrimitives: formatted its line).
 - (void)dumpDraw:(NSString *)what {
  if(!dumpMaybe(_commandBuffer))return;
  // Runs of draws with one pipeline and depth state, every draw counted: a pass's structure (geometry, then light volumes, ...).
@@ -1518,7 +1520,7 @@ static void waitForResource(id resource) {
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
- [self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
+ if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
  [self check:nmb_encoder_set_buffer(_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"];
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
@@ -1549,7 +1551,7 @@ static void waitForResource(id resource) {
  [self sampler:(id<MTLSamplerState>)clamped index:index stage:stage];
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
- [self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
+ if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
  [self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
@@ -1661,20 +1663,20 @@ static void waitForResource(id resource) {
 }
 - (void)setViewport:(MTLViewport)v {
  const double values[6]={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
- if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
+ if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
                                                  v.originX,v.originY,v.width,v.height,v.znear,v.zfar]);
  [self check:nmb_render_set_viewport(self.handle,values) what:"setViewport"];
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const uint64_t values[4]={r.x,r.y,r.width,r.height};
- if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
+ if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
                                                  (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
  [self check:nmb_render_set_scissor(self.handle,values) what:"setScissorRect"];
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
 - (void)raster {
  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
- if(dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
+ if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
                                                  cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue]);
  [self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"];
 }
@@ -1721,7 +1723,7 @@ static void waitForResource(id resource) {
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
- [self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
+ if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                  (unsigned long)i,(unsigned long)b]];
  [self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"];
 }
@@ -1775,7 +1777,7 @@ static void waitForResource(id resource) {
  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
  if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;
- [self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
+ if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                  (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
  [self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
      ci?[(NBBuffer *)ci handle]:nullptr,co,(uint32_t)instances,(uint32_t)base,ib?[(NBBuffer *)ib handle]:nullptr,io) what:"drawPatches"];
