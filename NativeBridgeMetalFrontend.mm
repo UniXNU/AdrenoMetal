@@ -13,6 +13,9 @@
 #import <objc/message.h>
 #include <algorithm>
 #include <array>
+#include <memory>
+#include <deque>
+#include <condition_variable>
 #include <cmath>
 #include <atomic>
 #include <mutex>
@@ -1442,23 +1445,62 @@ static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id text
 // its own encoding and the runtime's run on two cores at once. What reads a command buffer's state back -- a wait, its status, the
 // in-flight use of a resource -- first lets the queue catch up (encodeDrain). Off, each call runs at once on the caller's thread.
 static const bool gEncodeThread=access("/private/var/ngpu/debug/encode-thread",F_OK)==0;
-static char gEncodeKey;
-static dispatch_queue_t encodeQueue() {
- static dispatch_queue_t queue=[]{
-  dispatch_queue_t q=dispatch_queue_create("native-metal.encode",
-                                           dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL,QOS_CLASS_USER_INTERACTIVE,0));
-  dispatch_queue_set_specific(q,&gEncodeKey,&gEncodeKey,nullptr);
-  return q;
+// One thread of its own runs the work, in batches a calling thread hands over at 64 calls, at an encoder's end, at a commit and before a
+// wait: a dispatch queue took a call at a time and woke one of the pool's threads for each, a cost above a cheap call's own (GFXBench's
+// Driver Overhead 2 drew 16% fewer frames on 60% more CPU a frame), and spread the work over half a dozen threads.
+struct EncodeThread {
+ std::mutex lock;
+ std::condition_variable work,idle;
+ std::deque<std::shared_ptr<std::vector<dispatch_block_t>>> batches;
+ uint64_t queued=0,done=0;
+};
+static thread_local bool tOnEncodeThread;
+static thread_local std::vector<dispatch_block_t> tBatch;
+static EncodeThread &encodeThread() {
+ static EncodeThread *thread=[]{
+  EncodeThread *t=new EncodeThread;
+  pthread_t id;pthread_attr_t attr;pthread_attr_init(&attr);
+  pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
+  pthread_create(&id,&attr,[](void *arg)->void * {
+   EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
+   pthread_setname_np("native-metal-encode");
+   std::unique_lock<std::mutex> lock(t.lock);
+   for(;;) {
+    t.work.wait(lock,[&]{return !t.batches.empty();});
+    auto batch=std::move(t.batches.front());t.batches.pop_front();
+    lock.unlock();
+    @autoreleasepool {for(dispatch_block_t block:*batch)block();}
+    batch.reset();
+    lock.lock();t.done++;t.idle.notify_all();
+   }
+   return nullptr;
+  },t);
+  pthread_attr_destroy(&attr);
+  return t;
  }();
- return queue;
+ return *thread;
 }
-static bool onEncodeQueue() {return dispatch_get_specific(&gEncodeKey)!=nullptr;}
+static bool onEncodeQueue() {return tOnEncodeThread;}
+static void encodeFlush() {
+ if(tBatch.empty())return;
+ auto batch=std::make_shared<std::vector<dispatch_block_t>>();batch->swap(tBatch);
+ EncodeThread &t=encodeThread();
+ {std::lock_guard<std::mutex> lock(t.lock);t.batches.push_back(std::move(batch));t.queued++;}
+ t.work.notify_one();
+}
 // A block takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
 static void encodeLater(dispatch_block_t work) {
- if(!gEncodeThread || onEncodeQueue())work();else dispatch_async(encodeQueue(),work);
+ if(!gEncodeThread || onEncodeQueue()){work();return;}
+ tBatch.push_back(work);
+ if(tBatch.size()>=64)encodeFlush();
 }
 static void encodeDrain() {
- if(gEncodeThread && !onEncodeQueue())dispatch_sync(encodeQueue(),^{});
+ if(!gEncodeThread || onEncodeQueue())return;
+ encodeFlush();
+ EncodeThread &t=encodeThread();
+ std::unique_lock<std::mutex> lock(t.lock);
+ const uint64_t target=t.queued;
+ t.idle.wait(lock,[&]{return t.done>=target;});
 }
 #define ENCODE(...) encodeLater(^{__VA_ARGS__;})
 static void waitForResource(id resource) {
@@ -1491,6 +1533,7 @@ static void waitForResource(id resource) {
  ENCODE(NmbEncoder *handle=self->_handle;self->_handle=nullptr;
         if(!handle){[self->_commandBuffer refuse:@"endEncoding twice"];return;}
         [self check:nmb_encoder_end(handle) what:"endEncoding"]);
+ encodeFlush();
 }
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
 - (void)pushDebugGroup:(NSString *)s {(void)s;}
@@ -2332,6 +2375,7 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
  ENCODE([self submit]);
+ encodeFlush();
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
