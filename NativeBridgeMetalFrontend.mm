@@ -1438,13 +1438,17 @@ static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id text
   if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
  [into addObject:[NSMutableDictionary dictionaryWithDictionary:@{@"texture":texture,@"level":@(level),@"slice":@(slice),@"where":where}]];
 }
-// The encoding thread, while new a diagnostic switch read when the process starts (/private/var/ngpu/debug/encode-thread): the runtime's
-// half of each encoder call -- binding, draws, the end of a pass, an encoder's making and a command buffer's submission -- runs on a
-// serial queue of the process's own, in the order the calls were made, and the caller goes on once it has recorded the call. The render
-// server's display thread spent most of a frame in the runtime (a home-screen drag: about 60% of a thread busy 90% of the time); split,
-// its own encoding and the runtime's run on two cores at once. What reads a command buffer's state back -- a wait, its status, the
-// in-flight use of a resource -- first lets the queue catch up (encodeDrain). Off, each call runs at once on the caller's thread.
-static const bool gEncodeThread=access("/private/var/ngpu/debug/encode-thread",F_OK)==0;
+// The encoding thread, in the render server: the runtime's half of each encoder call -- binding, draws, the end of a pass, an encoder's
+// making and a command buffer's submission -- runs on a thread of the process's own, in the order the calls were made, and the caller
+// goes on once it has recorded the call. The render server's display thread spent most of a frame in the runtime (a home-screen drag:
+// about 60% of a thread busy 90% of the time); split, CoreAnimation's own encoding and the runtime's run on two cores at once (the
+// display thread at 34%, the drag 10% faster on as many cycles a frame). What reads a command buffer's state back -- a wait, its status,
+// the in-flight use of a resource -- first lets the thread catch up (encodeDrain). Other processes keep each call on the caller's
+// thread: where the runtime is nearly all a thread's work the split only adds its cost (GFXBench's Driver Overhead 2: 12% fewer frames
+// on 40% more CPU a frame). Switches read when a process starts: /private/var/ngpu/debug/encode-thread puts every process on one,
+// no-encode-thread none.
+static const bool gEncodeThread=access("/private/var/ngpu/debug/no-encode-thread",F_OK)!=0 &&
+                                (isRenderServer() || access("/private/var/ngpu/debug/encode-thread",F_OK)==0);
 // One thread of its own runs the work, in batches a calling thread hands over at 64 calls, at an encoder's end, at a commit and before a
 // wait: a dispatch queue took a call at a time and woke one of the pool's threads for each, a cost above a cheap call's own (GFXBench's
 // Driver Overhead 2 drew 16% fewer frames on 60% more CPU a frame), and spread the work over half a dozen threads.
