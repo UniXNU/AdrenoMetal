@@ -1372,6 +1372,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint32_t dumpDraws;
 @property(nonatomic,strong) NSMutableArray *dumpRuns;
 @property(nonatomic) uint32_t drawIndex;   // this encoder's draws so far, for NATIVE_METAL_SKIP_DRAWS   // [pipeline info, depth info, first draw, count] for each run of draws with one state
+- (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value;
+- (void)noteDraw;
 @end
 // NATIVE_METAL_DUMP_CB=FIRST[:COUNT]: the app's command buffers FIRST..FIRST+COUNT-1 (counted from 1, the plugin's own readbacks left
 // out) have what they rendered read back after them, by a command buffer of the plugin's own on the same queue: every render pass's
@@ -1566,8 +1568,50 @@ static void waitForResource(id resource) {
  }
  gTimeResourceWait.add(began);
 }
-@implementation NBEncoder
+// /private/var/ngpu/debug/draw-stats (read when a process starts): for each draw, which kinds of an encoder's state changed since the draw
+// before it in the encoder -- a setter that binds what is already bound changes nothing -- tallied per process into
+// /private/var/tmp/ngpu-draw-stats-<process>.txt every 2000 draws: how often a draw binds what the draw before it bound, which a runtime
+// that kept the last draw's bind work could skip.
+static const bool gDrawStats=access("/private/var/ngpu/debug/draw-stats",F_OK)==0;
+enum : uint32_t {kDSPipeline=1,kDSBuffer=2,kDSOffset=4,kDSBytes=8,kDSTexture=16,kDSSampler=32,kDSDepth=64,kDSViewport=128,kDSOther=256,kDSFirst=512};
+struct DrawStateNote {std::unordered_map<uint32_t,std::pair<uintptr_t,uint64_t>> bound;uint32_t changed=kDSFirst;};
+static std::atomic<uint64_t> gDSMasks[1024],gDSDraws,gDSRebinds;
+static uint64_t hashBytes(const void *bytes,size_t length) {return bytes?hashSource((const uint8_t *)bytes,length)^length:0;}
+static void writeDrawStats() {
+ static std::mutex lock;std::lock_guard<std::mutex> guard(lock);
+ std::vector<std::pair<uint64_t,uint32_t>> masks;
+ for(uint32_t m=0;m<1024;m++)if(uint64_t n=gDSMasks[m].load())masks.push_back({n,m});
+ std::sort(masks.rbegin(),masks.rend());
+ char path[160];snprintf(path,sizeof path,"/private/var/tmp/ngpu-draw-stats-%s.txt",getprogname());
+ FILE *f=fopen(path,"w");if(!f)return;
+ const uint64_t draws=gDSDraws.load();
+ fprintf(f,"draws %llu, setters binding what was bound %llu\n",(unsigned long long)draws,(unsigned long long)gDSRebinds.load());
+ static const char *const kinds[]={"pipeline","buffer","offset","bytes","texture","sampler","depth","viewport","other","first"};
+ for(auto &[n,m]:masks) {
+  std::string what;for(int k=0;k<10;k++)if(m&(1u<<k)){if(!what.empty())what+="+";what+=kinds[k];}
+  fprintf(f,"%6.2f%% %llu %s\n",100.0*n/draws,(unsigned long long)n,what.empty()?"(nothing)":what.c_str());
+ }
+ fclose(f);
+}
+@implementation NBEncoder {
+ std::unique_ptr<DrawStateNote> _drawNote;
+}
 - (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
+// A setter of `kind` at `key` (UINT32_MAX: one not compared) binding `object` with `value`, for the draw-stats tally.
+- (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value {
+ if(!_drawNote)_drawNote.reset(new DrawStateNote);
+ if(key!=UINT32_MAX) {
+  auto &slot=_drawNote->bound[kind<<16|key];
+  if(slot.first==(uintptr_t)object && slot.second==value){gDSRebinds++;return;}
+  slot={(uintptr_t)object,value};
+ }
+ _drawNote->changed|=kind;
+}
+- (void)noteDraw {
+ if(!_drawNote)_drawNote.reset(new DrawStateNote);
+ gDSMasks[_drawNote->changed&1023]++;_drawNote->changed=0;
+ if(++gDSDraws%2000==0)writeDrawStats();
+}
 - (bool)check:(bool)ok what:(const char *)what {
  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
  return ok;
@@ -1640,11 +1684,13 @@ static void waitForResource(id resource) {
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
  if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
  if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
  ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
 }
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
+ if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
  if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
   if(!_dumpEntries)_dumpEntries=[NSMutableArray array];
   if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
@@ -1662,6 +1708,7 @@ static void waitForResource(id resource) {
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
  [self dumpBind:sampler index:index stage:stage+8];
+ if(gDrawStats)[self noteState:kDSSampler key:stage<<8|(uint32_t)index object:(__bridge const void *)sampler value:0];
  ENCODE([self check:nmb_encoder_set_sampler(self->_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"]);
 }
 - (void)sampler:(id<MTLSamplerState>)sampler lodMin:(float)lodMin max:(float)lodMax index:(NSUInteger)index stage:(uint32_t)stage {
@@ -1672,6 +1719,7 @@ static void waitForResource(id resource) {
 }
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
+ if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
  if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
  const std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?length:0));   // the caller's bytes are its own again
  ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
@@ -1686,6 +1734,7 @@ static void waitForResource(id resource) {
 - (void)waitForFence:(id<MTLFence>)fence {[self fence:fence stages:0 update:false];}
 - (void)offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  id bound=_dumpBound[@(stage<<8|(uint32_t)index)];
+ if(gDrawStats)[self noteState:kDSOffset key:stage<<8|(uint32_t)index object:nullptr value:offset];
  if([bound isKindOfClass:[NSArray class]])[self dumpBind:@[bound[0],@(offset)] index:index stage:stage];
  ENCODE([self check:nmb_encoder_set_buffer_offset(self->_handle,stage,offset,(uint32_t)index) what:"setBufferOffset"]);
 }
@@ -1744,6 +1793,7 @@ static void waitForResource(id resource) {
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(dumpRange().first)self.dumpPipeline=state;
+ if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -1782,18 +1832,21 @@ static void waitForResource(id resource) {
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)state {
  if(state && ![(id)state isKindOfClass:[NBDepthStencil class]]){[self.commandBuffer refuse:@"foreign depth/stencil state"];return;}
  if(dumpRange().first)self.dumpDepth=state;
+ if(gDrawStats)[self noteState:kDSDepth key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_depth_stencil(self.handle,state?[(NBDepthStencil *)state handle]:nullptr) what:"setDepthStencilState"]);
 }
 - (void)setViewport:(MTLViewport)v {
  const std::array<double,6> values={v.originX,v.originY,v.width,v.height,v.znear,v.zfar};
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u viewport %g,%g %gx%g depth %g..%g",self.commandBuffer.dumpPasses,
                                                  v.originX,v.originY,v.width,v.height,v.znear,v.zfar]);
+ if(gDrawStats)[self noteState:kDSViewport key:0 object:nullptr value:hashBytes(values.data(),sizeof values)];
  ENCODE([self check:nmb_render_set_viewport(self.handle,values.data()) what:"setViewport"]);
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const std::array<uint64_t,4> values={r.x,r.y,r.width,r.height};
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
                                                  (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
+ if(gDrawStats)[self noteState:kDSViewport key:1 object:nullptr value:hashBytes(values.data(),sizeof values)];
  ENCODE([self check:nmb_render_set_scissor(self.handle,values.data()) what:"setScissorRect"]);
 }
 // The runtime takes cull mode, winding and fill mode together; this encoder keeps Metal's defaults until each is set.
@@ -1801,13 +1854,13 @@ static void waitForResource(id resource) {
  NSNumber *cull=objc_getAssociatedObject(self,"cull"),*winding=objc_getAssociatedObject(self,"winding"),*fill=objc_getAssociatedObject(self,"fill");
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u cull %llu winding %llu fill %llu",self.commandBuffer.dumpPasses,
                                                  cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue]);
- ENCODE([self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"]);
+ if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_raster(self.handle,cull.unsignedLongLongValue,winding.unsignedLongLongValue,fill.unsignedLongLongValue) what:"raster state"]);
 }
 - (void)setCullMode:(MTLCullMode)m {objc_setAssociatedObject(self,"cull",@(m),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setFrontFacingWinding:(MTLWinding)w {objc_setAssociatedObject(self,"winding",@(w),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setTriangleFillMode:(MTLTriangleFillMode)f {objc_setAssociatedObject(self,"fill",@(f),OBJC_ASSOCIATION_RETAIN);[self raster];}
 - (void)setDepthBias:(float)bias slopeScale:(float)slope clamp:(float)clamp {
- ENCODE([self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"]);
+ if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_depth_bias(self.handle,bias,slope,clamp) what:"setDepthBias"]);
 }
 - (void)setLineWidth:(float)width {ENCODE([self check:nmb_render_set_line_width(self.handle,width) what:"setLineWidth"]);}
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset {
@@ -1824,12 +1877,12 @@ static void waitForResource(id resource) {
 - (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
 - (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setStencilReferenceValue:(uint32_t)v {ENCODE([self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"]);}
+- (void)setStencilReferenceValue:(uint32_t)v {if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"]);}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
- ENCODE([self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"]);
+ if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"]);
 }
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a {
- const std::array<float,4> c={r,g,b,a};ENCODE([self check:nmb_render_set_blend_color(self.handle,c.data()) what:"setBlendColor"]);
+ const std::array<float,4> c={r,g,b,a};if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_blend_color(self.handle,c.data()) what:"setBlendColor"]);
 }
 // NATIVE_METAL_SKIP_DRAWS=PASS:FIRST:LAST: every command buffer's render pass PASS (counted from 1) leaves out its draws FIRST..LAST
 // (counted from 1), to find which draws make what a frame shows.
@@ -1845,7 +1898,7 @@ static void waitForResource(id resource) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                  (unsigned long)i,(unsigned long)b]];
  ENCODE([self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"]);
@@ -1861,7 +1914,7 @@ static void waitForResource(id resource) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer.resourceOwners addObject:b];
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
   const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
   NSMutableString *first=[NSMutableString string];
@@ -1899,7 +1952,7 @@ static void waitForResource(id resource) {
           points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                  (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
  ENCODE([self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
