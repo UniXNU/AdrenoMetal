@@ -1452,14 +1452,55 @@ static const bool gEncodeThread=access("/private/var/ngpu/debug/no-encode-thread
 // One thread of its own runs the work, in batches a calling thread hands over at 64 calls, at an encoder's end, at a commit and before a
 // wait: a dispatch queue took a call at a time and woke one of the pool's threads for each, a cost above a cheap call's own (GFXBench's
 // Driver Overhead 2 drew 16% fewer frames on 60% more CPU a frame), and spread the work over half a dozen threads.
+// A call is a C++ closure (it holds what it uses as the call made it; an object strongly, `self` too) moved into its batch's own memory
+// and run and destroyed there: a block per call cost a heap copy, the block runtime and a free on the other thread (6% of the thread's
+// busy time in an App Library swipe went to releasing a batch's blocks). Batches go back to the calling side to be filled again.
+class EncodeBatch {
+ struct Chunk {std::unique_ptr<uint8_t[]> bytes;size_t capacity=0,used=0;};
+ struct Header {void (*run)(void *closure);size_t size;};
+ static constexpr size_t kAlign=16,kChunk=16384;
+ static constexpr size_t rounded(size_t n) {return (n+kAlign-1)&~(kAlign-1);}
+ std::vector<Chunk> chunks;
+ size_t at=0;
+public:
+ size_t count=0;
+ template<class F> void add(F &&work) {
+  using Closure=std::decay_t<F>;
+  static_assert(alignof(Closure)<=kAlign,"an encoder call's closure is aligned beyond its batch's slots");
+  const size_t need=rounded(sizeof(Header))+rounded(sizeof(Closure));
+  while(at<chunks.size() && chunks[at].used+need>chunks[at].capacity)at++;
+  if(at==chunks.size()) {
+   static_assert(kAlign<=__STDCPP_DEFAULT_NEW_ALIGNMENT__,"operator new aligns a chunk for its slots");
+   Chunk chunk;chunk.capacity=std::max(kChunk,need);chunk.bytes.reset(new uint8_t[chunk.capacity]);
+   chunks.push_back(std::move(chunk));
+  }
+  Chunk &chunk=chunks[at];
+  uint8_t *slot=chunk.bytes.get()+chunk.used;chunk.used+=need;count++;
+  new(slot) Header{[](void *closure){Closure &call=*static_cast<Closure *>(closure);call();call.~Closure();},need};
+  new(slot+rounded(sizeof(Header))) Closure(std::forward<F>(work));
+ }
+ // Each call in the order added, each destroyed once it ran; the batch is empty after.
+ void run() {
+  for(Chunk &chunk:chunks) {
+   for(size_t offset=0;offset<chunk.used;) {
+    const Header &header=*reinterpret_cast<const Header *>(chunk.bytes.get()+offset);
+    header.run(chunk.bytes.get()+offset+rounded(sizeof(Header)));
+    offset+=header.size;
+   }
+   chunk.used=0;
+  }
+  at=0;count=0;
+ }
+};
 struct EncodeThread {
  std::mutex lock;
  std::condition_variable work,idle;
- std::deque<std::shared_ptr<std::vector<dispatch_block_t>>> batches;
+ std::deque<EncodeBatch *> batches;
+ std::vector<EncodeBatch *> spare;
  uint64_t queued=0,done=0;
 };
 static thread_local bool tOnEncodeThread;
-static thread_local std::vector<dispatch_block_t> tBatch;
+static thread_local EncodeBatch *tBatch;
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
@@ -1471,11 +1512,10 @@ static EncodeThread &encodeThread() {
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
-    auto batch=std::move(t.batches.front());t.batches.pop_front();
+    EncodeBatch *batch=t.batches.front();t.batches.pop_front();
     lock.unlock();
-    @autoreleasepool {for(dispatch_block_t block:*batch)block();}
-    batch.reset();
-    lock.lock();t.done++;t.idle.notify_all();
+    @autoreleasepool {batch->run();}
+    lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
    }
    return nullptr;
   },t);
@@ -1486,17 +1526,21 @@ static EncodeThread &encodeThread() {
 }
 static bool onEncodeQueue() {return tOnEncodeThread;}
 static void encodeFlush() {
- if(tBatch.empty())return;
- auto batch=std::make_shared<std::vector<dispatch_block_t>>();batch->swap(tBatch);
+ if(!tBatch || !tBatch->count)return;
  EncodeThread &t=encodeThread();
- {std::lock_guard<std::mutex> lock(t.lock);t.batches.push_back(std::move(batch));t.queued++;}
+ {std::lock_guard<std::mutex> lock(t.lock);t.batches.push_back(tBatch);t.queued++;tBatch=nullptr;}
  t.work.notify_one();
 }
-// A block takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
-static void encodeLater(dispatch_block_t work) {
+// A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
+template<class F> static void encodeLater(F &&work) {
  if(!gEncodeThread || onEncodeQueue()){work();return;}
- tBatch.push_back(work);
- if(tBatch.size()>=64)encodeFlush();
+ if(!tBatch) {
+  EncodeThread &t=encodeThread();
+  {std::lock_guard<std::mutex> lock(t.lock);if(!t.spare.empty()){tBatch=t.spare.back();t.spare.pop_back();}}
+  if(!tBatch)tBatch=new EncodeBatch;
+ }
+ tBatch->add(std::forward<F>(work));
+ if(tBatch->count>=64)encodeFlush();
 }
 static void encodeDrain() {
  if(!gEncodeThread || onEncodeQueue())return;
@@ -1506,7 +1550,7 @@ static void encodeDrain() {
  const uint64_t target=t.queued;
  t.idle.wait(lock,[&]{return t.done>=target;});
 }
-#define ENCODE(...) encodeLater(^{__VA_ARGS__;})
+#define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
 static void waitForResource(id resource) {
  encodeDrain();   // every committed command buffer's uses recorded
  const uint64_t began=nowUs();
@@ -2199,6 +2243,7 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
 - (id)encoder:(NBEncoder *)encoder make:(NmbEncoder *(^)(void))make what:(NSString *)what {
  if(self.committed){[self refuse:[what stringByAppendingString:@" after commit"]];return nil;}
  encoder.commandBuffer=self;
+ make=[make copy];   // the caller's block literal is on its stack; the encoding thread calls it later
  ENCODE(NmbEncoder *handle=make();
         if(!handle)[self refuse:[NSString stringWithFormat:@"%@: %@",what,lastError()]];
         encoder.handle=handle);
