@@ -1570,8 +1570,8 @@ static void waitForResource(id resource) {
 }
 // /private/var/ngpu/debug/draw-stats (read when a process starts): for each draw, which kinds of an encoder's state changed since the draw
 // before it in the encoder -- a setter that binds what is already bound changes nothing -- tallied per process into
-// /private/var/tmp/ngpu-draw-stats-<process>.txt every 2000 draws: how often a draw binds what the draw before it bound, which a runtime
-// that kept the last draw's bind work could skip.
+// ngpu-draw-stats-<process>.txt in its temporary directory every 2000 draws (the render server's sandbox refuses /private/var/tmp): how
+// often a draw binds what the draw before it bound, which a runtime that kept the last draw's bind work could skip.
 static const bool gDrawStats=access("/private/var/ngpu/debug/draw-stats",F_OK)==0;
 enum : uint32_t {kDSPipeline=1,kDSBuffer=2,kDSOffset=4,kDSBytes=8,kDSTexture=16,kDSSampler=32,kDSDepth=64,kDSViewport=128,kDSOther=256,kDSFirst=512};
 struct DrawStateNote {std::unordered_map<uint32_t,std::pair<uintptr_t,uint64_t>> bound;uint32_t changed=kDSFirst;};
@@ -1582,8 +1582,8 @@ static void writeDrawStats() {
  std::vector<std::pair<uint64_t,uint32_t>> masks;
  for(uint32_t m=0;m<1024;m++)if(uint64_t n=gDSMasks[m].load())masks.push_back({n,m});
  std::sort(masks.rbegin(),masks.rend());
- char path[160];snprintf(path,sizeof path,"/private/var/tmp/ngpu-draw-stats-%s.txt",getprogname());
- FILE *f=fopen(path,"w");if(!f)return;
+ NSString *path=[NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"ngpu-draw-stats-%s.txt",getprogname()]];
+ FILE *f=fopen(path.fileSystemRepresentation,"w");if(!f)return;
  const uint64_t draws=gDSDraws.load();
  fprintf(f,"draws %llu, setters binding what was bound %llu\n",(unsigned long long)draws,(unsigned long long)gDSRebinds.load());
  static const char *const kinds[]={"pipeline","buffer","offset","bytes","texture","sampler","depth","viewport","other","first"};
