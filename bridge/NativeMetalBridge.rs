@@ -11,6 +11,12 @@
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 
+/// The runtime allocates and frees on every encoder call (binding tables, recorded calls, tracked uses); mimalloc's thread-local free
+/// lists take those small blocks for less than the system allocator, whose frees from the encoding thread also gave pages back to the
+/// kernel (madvise) as they emptied. Every allocation of the bridge and the runtime is the Rust side's own, freed there.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
