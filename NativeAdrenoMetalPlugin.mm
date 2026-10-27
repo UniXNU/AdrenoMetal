@@ -263,6 +263,11 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
         }
 #endif
+        // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
+        // its MetalContext). A Vulkan queue's priority is fixed when the device opens, before that call, so the render server asks the
+        // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
+        // an app's.
+        setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);

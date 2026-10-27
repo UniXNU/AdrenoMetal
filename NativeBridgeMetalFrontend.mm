@@ -2395,9 +2395,18 @@ static void completed(void *context) {
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
 // setCompletionQueue: is the property's setter.
-// GPU priorities are not applied (one hardware queue): reported as not applied.
-- (BOOL)setGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
-- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {(void)priority;return NO;}
+// GPU priorities are not applied per queue (a process's queues share one hardware queue, whose priority is set when the device opens):
+// reported as not applied. What a process asks for is logged once (the render server's queue is the one CoreAnimation raises).
+- (BOOL)setGPUPriority:(NSUInteger)priority {
+ static std::atomic<bool> told{false};
+ if(!told.exchange(true))NBLOG(@"native-metal: setGPUPriority:%lu (not applied per queue)",(unsigned long)priority);
+ return NO;
+}
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {
+ static std::atomic<bool> told{false};
+ if(!told.exchange(true))NBLOG(@"native-metal: setBackgroundGPUPriority:%lu (not applied per queue)",(unsigned long)priority);
+ return NO;
+}
 // What a new Metal queue reports (MTLIOAccelCommandQueue: normal 1, background 3). RenderBox and Core Image read both before any frame.
 - (NSUInteger)getGPUPriority {return 1;}
 - (NSUInteger)getBackgroundGPUPriority {return 3;}
