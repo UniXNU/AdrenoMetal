@@ -1,0 +1,49 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index d90691f..8b18e14 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -313,22 +313,24 @@ impl CommandBufferShared {
+         let mut lead = Some(Barrier::after_completed());
+         let mut work = Vec::with_capacity(2 * (end - start) + 1);
+         if entry.is_some() {
+-            let globals: Vec<Barrier> = lead.take().into_iter().chain(entry_barrier).collect();
++            let (pair, count) = barrier_pair(lead.take(), entry_barrier);
++            let globals = &pair[..count];
+             let stamps = Stamps {
+                 start: start_stamp.take(),
+                 end: None,
+             };
+-            work.push(self.record_barriers(&mut state, &globals, &entries, stamps)?);
++            work.push(self.record_barriers(&mut state, globals, &entries, stamps)?);
+         }
+         for (offset, barrier) in barriers.iter().enumerate() {
+-            let globals: Vec<Barrier> = lead.take().into_iter().chain(*barrier).collect();
++            let (pair, count) = barrier_pair(lead.take(), *barrier);
++            let globals = &pair[..count];
+             if !globals.is_empty() {
+                 let stamps = Stamps {
+                     start: start_stamp.take(),
+                     end: None,
+                 };
+                 let kept = &mut scheduler.kept;
+-                work.push(self.barrier_buffer(&mut state, kept, at, &globals, &[], stamps)?);
++                work.push(self.barrier_buffer(&mut state, kept, at, globals, &[], stamps)?);
+             }
+             work.extend(&state.recorded[start + offset].raws);
+         }
+@@ -823,3 +825,15 @@ struct Stamps {
+     start: Option<(vk::QueryPool, u32)>,
+     end: Option<(vk::QueryPool, u32)>,
+ }
++
++/// `lead` then `barrier`, those of them there are, as the first `.1` of the array: the globals
++/// of a barrier between a batch's encoders, which takes no allocation.
++fn barrier_pair(lead: Option<Barrier>, barrier: Option<Barrier>) -> ([Barrier; 2], usize) {
++    let mut pair = [Barrier::default(); 2];
++    let mut count = 0;
++    for b in lead.into_iter().chain(barrier) {
++        pair[count] = b;
++        count += 1;
++    }
++    (pair, count)
++}

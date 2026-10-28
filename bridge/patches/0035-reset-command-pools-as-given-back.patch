@@ -1,0 +1,133 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 8b3a0c2..0c8537a 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1136,7 +1136,7 @@ impl Drop for CommandBufferShared {
+         // state.
+         let pool = lock(&self.state).pool.take();
+         if let Some(pool) = pool {
+-            self.device.shared().spares.give_command_pool(pool);
++            self.device.shared().spares.give_command_pool(self.device.shared(), pool);
+         }
+     }
+ }
+@@ -2723,7 +2723,7 @@ impl CommandBufferShared {
+             // buffer that completed gives back its descriptor pools too, one that failed releases
+             // them here.
+             if let Some(pool) = state.pool.take() {
+-                self.device.shared().spares.give_command_pool(pool);
++                self.device.shared().spares.give_command_pool(self.device.shared(), pool);
+             }
+             if state.status == CommandBufferStatus::Completed {
+                 state.descriptors.give_back();
+diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
+index 50856aa..8bb81ba 100644
+--- a/crates/metal2vulkan-runtime/src/device/prime.rs
++++ b/crates/metal2vulkan-runtime/src/device/prime.rs
+@@ -416,6 +416,9 @@ impl Primer<'_> {
+         let pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(vulkan)?;
+         self.made(Call::CreateCommandPool);
+         self.hold(pool);
++        // SAFETY: the pool was just made, and nothing of it is pending.
++        unsafe { device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()) }.map_err(vulkan)?;
++        self.made(Call::ResetCommandPool);
+         let allocate = vk::CommandBufferAllocateInfo::default()
+             .command_pool(pool)
+             .level(vk::CommandBufferLevel::PRIMARY)
+diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
+index 9f98943..110455f 100644
+--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
+@@ -303,6 +303,8 @@ calls! {
+     // (`Device::drain_queues`).
+     QueueWaitIdle => c"vkQueueWaitIdle",
+     ResetFences => c"vkResetFences",
++    // A command pool given back reset (`spares.rs`), on the completion thread.
++    ResetCommandPool => c"vkResetCommandPool",
+     DestroyCommandPool => c"vkDestroyCommandPool",
+     DestroyFence => c"vkDestroyFence",
+     DestroySemaphore => c"vkDestroySemaphore",
+@@ -470,7 +472,7 @@ pub(crate) const HOST_STEP: &[Call] = &[
+ ];
+ 
+ impl Call {
+-    /// Its bit. The table fills 88 of the word's 128 (widened from 64): when it next outgrows the
++    /// Its bit. The table fills 90 of the word's 128 (widened from 64): when it next outgrows the
+     /// word, widen the word (here, [`CALLED`], `PENDING` and the priming's calls); do not add a
+     /// second table.
+     pub(crate) fn bit(self) -> u128 {
+diff --git a/crates/metal2vulkan-runtime/src/spares.rs b/crates/metal2vulkan-runtime/src/spares.rs
+index 39ac4d8..6480b4f 100644
+--- a/crates/metal2vulkan-runtime/src/spares.rs
++++ b/crates/metal2vulkan-runtime/src/spares.rs
+@@ -20,7 +20,12 @@
+ //! - **Descriptor pools are bounded.** At most [`DESCRIPTOR_POOLS`] descriptor pools of at most
+ //!   [`DESCRIPTORS`] descriptors together; a descriptor pool given back past them releases the
+ //!   oldest spares first, so the spares follow the shapes in use.
+-//! - **Reset by the taker**, on the thread that encodes: the program's own, or one running the
++//! - **Reset as given back**, inside a section on the thread that completed the command buffer
++//!   (the completion thread's, or the dropping one's), so the encoding thread takes a pool ready
++//!   to record: turnip's reset of a frame's command buffers cost ~30 us of the program's thread
++//!   per commit on the host (m2vsim), about three times that in the guest. A pool whose reset
++//!   there failed is released; one given back as the process exits stays unreset and is
++//!   **reset by the taker**, on the thread that encodes: the program's own, or one running the
+ //!   program's code (a handler). A section of the exit guard (a host step's recording on the
+ //!   scheduler's thread) calls only the guard's table of entry points, which holds no reset, so a
+ //!   command buffer or command recorded there makes its pools as before; what it made is given back
+@@ -62,6 +67,8 @@ pub(super) struct CommandPool {
+     family: u32,
+     made: [Vec<vk::CommandBuffer>; 2],
+     handed: [usize; 2],
++    /// Reset since a command buffer last recorded into it (as it was given back).
++    reset: bool,
+ }
+ 
+ impl CommandPool {
+@@ -72,6 +79,7 @@ impl CommandPool {
+             family,
+             made: [Vec::new(), Vec::new()],
+             handed: [0, 0],
++            reset: false,
+         }
+     }
+ 
+@@ -127,6 +135,10 @@ impl Spares {
+         let Some(mut pool) = take_command_pool(&mut lock(&self.command_pools), family) else {
+             return Ok(None);
+         };
++        if std::mem::take(&mut pool.reset) {
++            pool.reset_handed();
++            return Ok(Some(pool));
++        }
+         // SAFETY: the pool is the caller's alone now, and nothing of it is pending: a command
+         // buffer that completed gave it back.
+         let reset = unsafe {
+@@ -143,9 +155,25 @@ impl Spares {
+         Ok(Some(pool))
+     }
+ 
+-    /// Keep `pool`, of a command buffer whose work ended or that was never submitted: nothing of
+-    /// it is pending, and nothing else holds it. Never released here (the module docs).
+-    pub(super) fn give_command_pool(&self, pool: CommandPool) {
++    /// Keep `pool` of `device`, of a command buffer whose work ended or that was never
++    /// submitted: nothing of it is pending, and nothing else holds it. Reset here, inside a
++    /// section; released only where that reset failed (the module docs).
++    pub(super) fn give_command_pool(&self, device: &DeviceShared, mut pool: CommandPool) {
++        if let Some(_busy) = exit_guard::enter() {
++            // SAFETY: nothing of the pool is pending, and nothing else holds it.
++            let reset = unsafe {
++                device
++                    .vk()
++                    .reset_command_pool(pool.raw, vk::CommandPoolResetFlags::empty())
++            };
++            exit_guard::called(exit_guard::Call::ResetCommandPool);
++            if reset.is_err() {
++                // SAFETY: as above.
++                unsafe { release::object(device.vk(), pool.raw) };
++                return;
++            }
++            pool.reset = true;
++        }
+         keep_command_pool(&mut lock(&self.command_pools), pool);
+     }
+ 

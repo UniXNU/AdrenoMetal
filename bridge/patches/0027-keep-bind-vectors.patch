@@ -1,0 +1,129 @@
+diff --git a/crates/metal2vulkan-runtime/src/binding.rs b/crates/metal2vulkan-runtime/src/binding.rs
+index d54a41e..5caa3f2 100644
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -454,8 +454,17 @@ pub(super) fn bind(
+     tables: &Tables<'_>,
+     mut memo: Option<&mut BindMemo>,
+ ) -> Result<Bound, Error> {
+-    let mut writes = Vec::with_capacity(plan.descriptors.len());
+-    let mut samplers = Vec::new();
++    // The vectors a memo keeps from the last bind, emptied.
++    let (mut writes, mut holes, mut samplers, mut roots) = match memo.as_deref_mut() {
++        Some(memo) => (
++            std::mem::take(&mut memo.writes),
++            std::mem::take(&mut memo.holes),
++            std::mem::take(&mut memo.bound_samplers),
++            std::mem::take(&mut memo.roots),
++        ),
++        None => Default::default(),
++    };
++    writes.reserve(plan.descriptors.len());
+     // The sampler tables, whose regions the command buffer writes again as it commits.
+     let sampler_keys = plan.sampler_tables();
+     let mut sampler_tables = Vec::with_capacity(sampler_keys.len());
+@@ -533,11 +542,11 @@ pub(super) fn bind(
+             held,
+         });
+     }
+-    let mut roots = Vec::with_capacity(command.root_tables.len());
++    roots.clear();
+     for &(stages, table) in &command.root_tables {
+         roots.push((stages, root_table(device, state, table)?));
+     }
+-    let mut holes = Vec::with_capacity(command.push_holes.len());
++    holes.reserve(command.push_holes.len());
+     for hole in command.push_holes {
+         holes.push(match *hole {
+             PushHole::RootTableAddress { stages, offset } => Hole {
+@@ -588,6 +597,9 @@ pub(super) fn bind(
+             },
+         });
+     }
++    if let Some(memo) = memo {
++        memo.roots = roots;
++    }
+     Ok(Bound {
+         writes,
+         holes,
+@@ -889,6 +901,32 @@ pub(super) struct BindMemo {
+     epoch: u64,
+     views: HashMap<ViewKey, vk::ImageView>,
+     samplers: Vec<KeptSampler>,
++    /// The vectors of the last bind's [`Bound`] its consumer gave back ([`BindMemo::give_back`])
++    /// and its root table addresses, emptied: the next bind fills them.
++    writes: Vec<Write>,
++    holes: Vec<Hole>,
++    bound_samplers: Vec<Arc<OwnedSampler>>,
++    roots: Vec<(metal2vulkan::vk::ShaderStageFlags, u64)>,
++}
++
++impl BindMemo {
++    /// Keep the vectors of a [`Bound`] its consumer is done with for the next bind; samplers
++    /// where the consumer did not keep them.
++    pub(super) fn give_back(
++        &mut self,
++        mut writes: Vec<Write>,
++        mut holes: Vec<Hole>,
++        samplers: Option<Vec<Arc<OwnedSampler>>>,
++    ) {
++        writes.clear();
++        holes.clear();
++        self.writes = writes;
++        self.holes = holes;
++        if let Some(mut samplers) = samplers {
++            samplers.clear();
++            self.bound_samplers = samplers;
++        }
++    }
+ }
+ 
+ /// What a view a bind made or found is a function of ([`BindMemo`]): a binding of the texture as
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index d50c194..62a3082 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1186,18 +1186,25 @@ impl LastRetained {
+     /// Retain into `core` the samplers a draw's bind named, unless they are the ones the last
+     /// draw's named, in order: each by another reference to it, the last first, so they go in
+     /// their order (`retained.rs`).
+-    fn retain_samplers(&mut self, core: &mut EncoderCore, samplers: Vec<Arc<OwnedSampler>>) {
++    /// Answers the list where it keeps the one it had, which is the same: the next bind fills it.
++    fn retain_samplers(
++        &mut self,
++        core: &mut EncoderCore,
++        samplers: Vec<Arc<OwnedSampler>>,
++    ) -> Option<Vec<Arc<OwnedSampler>>> {
+         let same = samplers.len() == self.samplers.len()
+             && samplers
+                 .iter()
+                 .zip(&self.samplers)
+                 .all(|(a, b)| Arc::ptr_eq(a, b));
+-        if !same {
+-            for sampler in samplers.iter().rev() {
+-                core.retain_shared(sampler.clone());
+-            }
+-            self.samplers = samplers;
++        if same {
++            return Some(samplers);
+         }
++        for sampler in samplers.iter().rev() {
++            core.retain_shared(sampler.clone());
++        }
++        self.samplers = samplers;
++        None
+     }
+ }
+ 
+@@ -7306,8 +7313,10 @@ impl RenderCommandEncoder {
+         {
+             self.core.retain_shared(buffer.held());
+         }
+-        self.last_retained
++        let unkept = self
++            .last_retained
+             .retain_samplers(&mut self.core, bound.samplers);
++        self.bind_memo.give_back(writes, bound.holes, unkept);
+         if let Some(unlisted) = unlisted {
+             heap_sets::degrade_unlisted(&device, unlisted, "a render pipeline state's draws");
+             // A host step's draw, which no commit lists again, fails its command buffer.

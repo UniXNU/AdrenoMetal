@@ -1,0 +1,50 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index af866a3..38bb81b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -292,6 +292,9 @@ fn run(watch: &Watch) {
+                 buffer.read_stamps();
+                 buffer.place_gpu_times();
+             }
++            // The calibration pair the next commits take, refreshed here when old rather than at
++            // a commit (`Timing::kept_pair`).
++            device.shared().timing.pair();
+         }
+         drop(device);
+         match settled {
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 0c8537a..6e92f2b 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2401,7 +2401,7 @@ impl CommandBufferShared {
+             Some(slot) => {
+                 shared.counts.timestamp_slot_taken();
+                 state.times.slot = Some(slot);
+-                state.times.pair = timing.pair();
++                state.times.pair = timing.kept_pair();
+             }
+             None => state.times.stamped = Stamped::NoSlot,
+         }
+diff --git a/crates/metal2vulkan-runtime/src/gpu_time.rs b/crates/metal2vulkan-runtime/src/gpu_time.rs
+index f265af0..8b09e6e 100644
+--- a/crates/metal2vulkan-runtime/src/gpu_time.rs
++++ b/crates/metal2vulkan-runtime/src/gpu_time.rs
+@@ -610,6 +610,18 @@ impl Timing {
+         self.from_host
+     }
+ 
++    /// The device's latest calibration pair, however old, taken now only where there is none: a
++    /// commit's, on the program's thread. A reading is a round trip to the GPU's driver (on
++    /// DroidVM a request to the host, from WindowServer's main thread every 100 ms); the
++    /// completion thread refreshes the pair instead ([`pair`](Self::pair)), so the one a commit
++    /// takes is at most [`REFRESH`] and a command buffer's completion old.
++    pub(crate) fn kept_pair(&self) -> Option<Pair> {
++        if let Some((_, pair)) = *lock(&self.latest) {
++            return Some(pair);
++        }
++        self.pair()
++    }
++
+     /// The device's latest calibration pair, taken now when the last is [`REFRESH`] old or
+     /// there is none; `None` where the device has no calibration or the reading fails.
+     pub(crate) fn pair(&self) -> Option<Pair> {

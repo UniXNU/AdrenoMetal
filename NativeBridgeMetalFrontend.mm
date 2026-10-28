@@ -27,6 +27,8 @@
 #include <sys/mman.h>
 #include <CommonCrypto/CommonDigest.h>
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <mach-o/getsect.h>
 #include <mach-o/loader.h>
 #include <execinfo.h>
 #include <mach/mach.h>
@@ -561,6 +563,24 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
   // Image's create_metal_dag, RenderBox's custom_blend) and every source compile was refused.
   std::string path=std::string(kFramework)+"/MTLCompiler";
   void *library=dlopen(path.c_str(),RTLD_NOW);
+  // The version Apple's Metal.framework itself loads: the compiler path recorded among its C strings (24A446: Versions/32023). Read from
+  // the loaded image, so a sandbox that refuses to list the framework's directory does not matter.
+  if(!library) {
+   static const char kPrefix[]="/System/Library/PrivateFrameworks/MTLCompiler.framework/Versions/";
+   for(uint32_t i=0,n=_dyld_image_count();i<n && !library;i++) {
+    const char *name=_dyld_get_image_name(i);
+    if(!name || !strstr(name,"/Metal.framework/") || strcmp(strrchr(name,'/'),"/Metal"))continue;
+    unsigned long size=0;
+    const char *strings=(const char *)getsectiondata((const struct mach_header_64 *)_dyld_get_image_header(i),"__TEXT","__cstring",&size);
+    for(unsigned long at=0;strings && at+sizeof kPrefix<size;) {
+     const char *text=strings+at;const size_t length=strnlen(text,size-at);
+     if(!strncmp(text,kPrefix,sizeof kPrefix-1) && length>sizeof kPrefix && !strcmp(text+length-12,"/MTLCompiler")) {
+      path.assign(text,length);library=dlopen(path.c_str(),RTLD_NOW);break;
+     }
+     at+=length+1;
+    }
+   }
+  }
   if(!library && !access((std::string(kFramework)+"/Versions/Current/MTLCompiler").c_str(),R_OK)) {
    path=std::string(kFramework)+"/Versions/Current/MTLCompiler";
    library=dlopen(path.c_str(),RTLD_NOW);
@@ -3340,7 +3360,7 @@ static char dvmMemoryReleaseKey;
   NSString *why=lastError();
   uint64_t answer[2]={0,0};
   (void)nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer);
-  NBLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
+  NSLog(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
         (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
         (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
         (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
@@ -3667,7 +3687,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NSString *warnings=nil,*failure=nil;
  NSData *metallib=compileMetalSource(source,compileArguments(options),&warnings,&failure);
  if(!metallib) {
-  NBLOG(@"native-metal: newLibraryWithSource: %@",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)]);
+  NBLOG(@"native-metal: newLibraryWithSource: %@ | compiler %s",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)],gCompilerLoaded);
   if(error)*error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey:failure}];
   return nil;
  }

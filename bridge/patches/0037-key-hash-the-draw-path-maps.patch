@@ -1,0 +1,278 @@
+diff --git a/crates/metal2vulkan-runtime/src/binding.rs b/crates/metal2vulkan-runtime/src/binding.rs
+index a916162..9d9eeb8 100644
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -51,6 +51,7 @@ use super::command_buffer::{NotedTable, State};
+ use super::error::{internal, Error, RuntimeGap};
+ use super::function_table::{self, TableSnapshot, VisibleFunctionTable};
+ use super::heap_sets::{Keeper, TextureTable, HEAP_SET};
++use super::key_hash::KeyMap;
+ use super::render_pass::{PassLayout, Target};
+ use super::render_target;
+ use super::residency::{Residency, Used};
+@@ -69,7 +70,7 @@ use metal2vulkan::bind::{
+ };
+ use metal2vulkan::metal::sampler::OpaqueBlackBorder;
+ use metal2vulkan::pipeline::{HandleClass, SlotClass, SlotRef, Stage, StorageAttachmentView};
+-use std::collections::{BTreeSet, HashMap};
++use std::collections::BTreeSet;
+ use std::ops::Deref;
+ use std::sync::atomic::Ordering;
+ use std::sync::Arc;
+@@ -899,7 +900,7 @@ const KEPT_VIEWS: usize = 256;
+ pub(super) struct BindMemo {
+     /// The views epoch the views were kept under.
+     epoch: u64,
+-    views: HashMap<ViewKey, vk::ImageView>,
++    views: KeyMap<ViewKey, vk::ImageView>,
+     samplers: Vec<KeptSampler>,
+     /// The vectors of the last bind's [`Bound`] its consumer gave back ([`BindMemo::give_back`])
+     /// and its root table addresses, emptied: the next bind fills them.
+diff --git a/crates/metal2vulkan-runtime/src/neutral.rs b/crates/metal2vulkan-runtime/src/neutral.rs
+index 4cf4a44..def66ee 100644
+--- a/crates/metal2vulkan-runtime/src/neutral.rs
++++ b/crates/metal2vulkan-runtime/src/neutral.rs
+@@ -26,6 +26,7 @@
+ //! work samples, its bind waited for that work on NVIDIA's driver (`memory.rs`'s `Fit`).
+ 
+ use super::device::lock;
++use super::key_hash::KeyMap;
+ use super::error::{vulkan, Error};
+ use super::memory::{Memory, MemoryClass, Placement};
+ use super::resource::ResourceKey;
+@@ -85,9 +86,9 @@ impl Filled for NeutralTexels {
+ /// A device's neutral images, texel buffers and samplers, made at first use.
+ #[derive(Default)]
+ pub(super) struct Neutrals {
+-    images: HashMap<NeutralResource, Arc<NeutralImage>>,
++    images: KeyMap<NeutralResource, Arc<NeutralImage>>,
+     /// By format and whether the view is a storage texel buffer's.
+-    texels: HashMap<(Format, bool), Arc<NeutralTexels>>,
++    texels: KeyMap<(Format, bool), Arc<NeutralTexels>>,
+     /// By whether depth comparison is enabled.
+     samplers: HashMap<bool, vk::Sampler>,
+ }
+diff --git a/crates/metal2vulkan-runtime/src/pipeline/memo.rs b/crates/metal2vulkan-runtime/src/pipeline/memo.rs
+index c2054d9..76187df 100644
+--- a/crates/metal2vulkan-runtime/src/pipeline/memo.rs
++++ b/crates/metal2vulkan-runtime/src/pipeline/memo.rs
+@@ -19,10 +19,11 @@
+ use super::render::RenderVariant;
+ use super::Variant;
+ use crate::device::lock;
++use crate::key_hash::KeyMap;
+ use metal2vulkan::cache::PipelineKey;
+ use metal2vulkan::library::{CompiledFunction, FunctionCompileKey};
+ use metal2vulkan::pipeline::{ComputePipeline, RenderPipeline};
+-use std::collections::{BTreeMap, HashMap};
++use std::collections::BTreeMap;
+ use std::hash::Hash;
+ use std::sync::{Arc, Mutex, Weak};
+ 
+@@ -33,7 +34,7 @@ pub(crate) const MEMO_ENTRIES: usize = 4096;
+ /// entries, removing the least recently used past either. A lookup or an insert is a use.
+ pub(crate) struct Lru<K, V> {
+     /// Each entry's number: the stamp of the insert that kept it.
+-    numbers: HashMap<K, u64>,
++    numbers: KeyMap<K, u64>,
+     /// The entries, by number.
+     entries: BTreeMap<u64, Slot<K, V>>,
+     /// Each entry's number by its last use, oldest first.
+@@ -61,7 +62,7 @@ impl<K: Clone + Eq + Hash, V> Lru<K, V> {
+     /// An empty map bounded by `max_weight` and `max_entries`.
+     pub(crate) fn new(max_weight: u64, max_entries: usize) -> Lru<K, V> {
+         Lru {
+-            numbers: HashMap::new(),
++            numbers: KeyMap::default(),
+             entries: BTreeMap::new(),
+             order: BTreeMap::new(),
+             clock: 0,
+diff --git a/crates/metal2vulkan-runtime/src/render/pass_start_reads.rs b/crates/metal2vulkan-runtime/src/render/pass_start_reads.rs
+index 04982ae..40c1471 100644
+--- a/crates/metal2vulkan-runtime/src/render/pass_start_reads.rs
++++ b/crates/metal2vulkan-runtime/src/render/pass_start_reads.rs
+@@ -54,7 +54,7 @@ use crate::values::{CpuCacheMode, HazardTrackingMode, ResourceOptions, StorageMo
+ use crate::Device;
+ use ash::vk;
+ use metal2vulkan::pipeline::{PipelineInterface, SlotClass, SlotInterface, Stage};
+-use std::collections::HashMap;
++use crate::key_hash::KeyMap;
+ use std::ops::Range;
+ 
+ /// The byte ranges one key holds before they are merged into their hull.
+@@ -74,7 +74,7 @@ const MESH_STAGES: vk::PipelineStageFlags2 = vk::PipelineStageFlags2::from_raw(
+ 
+ /// Byte ranges of buffers, tracked or not, by key.
+ #[derive(Clone, Default)]
+-struct Written(HashMap<ResourceKey, Vec<Range<u64>>>);
++struct Written(KeyMap<ResourceKey, Vec<Range<u64>>>);
+ 
+ impl Written {
+     fn add(&mut self, key: ResourceKey, range: &Range<u64>) {
+@@ -89,7 +89,9 @@ impl Written {
+     }
+ 
+     fn overlaps(&self, key: ResourceKey, range: &Range<u64>) -> bool {
+-        self.0.get(&key).is_some_and(|ranges| {
++        // Most passes' fragment stages write no buffer: no key to hash.
++        !self.0.is_empty()
++            && self.0.get(&key).is_some_and(|ranges| {
+             ranges
+                 .iter()
+                 .any(|r| r.start < range.end && range.start < r.end)
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index 63a28ae..5f7b8fa 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -107,6 +107,7 @@
+ 
+ use super::attachment_stand_in::Cause;
+ use super::attachmentless;
++use super::key_hash::KeyMap;
+ use super::binding_view::VkView;
+ use super::device::lock;
+ use super::error::{internal, Error};
+@@ -124,7 +125,6 @@ use crate::release;
+ use ash::vk;
+ use metal2vulkan::bind::ViewSetup;
+ use metal2vulkan::device::{DeviceProfile, DriverFact};
+-use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ /// What makes two passes compatible: each color index's format (`None` without a texture), the
+@@ -652,7 +652,7 @@ const KEPT_SHAPES: usize = 64;
+ 
+ /// The compatible passes a device keeps, by shape ([`shared_compatible_pass`]).
+ #[derive(Default)]
+-pub(super) struct KeptCompatible(HashMap<PassShape, vk::RenderPass>);
++pub(super) struct KeptCompatible(KeyMap<PassShape, vk::RenderPass>);
+ 
+ impl KeptCompatible {
+     /// Destroy every kept pass; the device is idle, and is destroyed next.
+@@ -859,7 +859,7 @@ impl<'a> std::borrow::Borrow<dyn FinalKeyed + 'a> for FinalMakings {
+ 
+ /// The final passes a device keeps, by what they are made of ([`kept_final_pass`]).
+ #[derive(Default)]
+-pub(super) struct KeptFinal(HashMap<FinalMakings, vk::RenderPass>);
++pub(super) struct KeptFinal(KeyMap<FinalMakings, vk::RenderPass>);
+ 
+ impl KeptFinal {
+     /// Destroy every kept pass; the device is idle, and is destroyed next.
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 071beb8..46097c9 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -57,6 +57,7 @@
+ //!   blits of textures over buffers, are refused `NotImplemented`.
+ 
+ use super::address::{ObjectsToken, RangeToken};
++use super::key_hash::KeyMap;
+ use super::address_map::AddressModeMap;
+ use super::attachment_stand_in::KeptBacking;
+ use super::attributes::PurgeableState;
+@@ -452,7 +453,7 @@ struct Image {
+     identity: Identity,
+     /// The `VkImageView`s bindings of the image's textures needed (`binding_view.rs`), made at
+     /// their first bind. A finite set per image: its view types, formats and level ranges.
+-    views: Mutex<HashMap<VkView, vk::ImageView>>,
++    views: Mutex<KeyMap<VkView, vk::ImageView>>,
+     /// The image's depth twin: a `D32_SFLOAT` image of the same texels, which the views a
+     /// comparison reads present, for an `R32_SFLOAT` image holding a `Depth32Float` texture.
+     twin: Option<Box<Image>>,
+@@ -1642,7 +1643,7 @@ impl Device {
+             options: ResourceOptions::new(StorageMode::Private, cache, hazard),
+             allow_gpu_optimized_contents: allow,
+             identity: Identity::new(hazard, false),
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -1765,7 +1766,7 @@ impl Device {
+             options: ResourceOptions::new(StorageMode::Private, cache, hazard),
+             allow_gpu_optimized_contents,
+             identity: Identity::new(hazard, false),
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -2331,7 +2332,7 @@ impl Device {
+                 tracked: texels.tracked(),
+                 ..texels.buffer.identity()
+             },
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -2419,7 +2420,7 @@ impl Device {
+                 tracked: texels.tracked(),
+                 ..texels.buffer.identity()
+             },
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -2555,7 +2556,7 @@ impl Device {
+             options,
+             allow_gpu_optimized_contents,
+             identity,
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -3383,7 +3384,7 @@ impl Device {
+             options: descriptor.resource_options,
+             allow_gpu_optimized_contents: descriptor.allow_gpu_optimized_contents,
+             identity,
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(KeyMap::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index 1210427..096ded4 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -179,7 +179,6 @@ use metal2vulkan::metal::{PixelFormat, TextureType, TextureUsage};
+ use metal2vulkan::vk::{
+     Format, FormatFeatureFlags2, ImageAspectFlags, ImageUsageFlags, SampleCountFlags,
+ };
+-use std::collections::HashMap;
+ use std::ptr::NonNull;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+@@ -2089,7 +2088,7 @@ impl Device {
+             options: binding.options,
+             allow_gpu_optimized_contents: binding.allow_gpu_optimized_contents,
+             identity: binding.identity,
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(Default::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+@@ -2125,7 +2124,7 @@ impl Device {
+             options: binding.options,
+             allow_gpu_optimized_contents: binding.allow_gpu_optimized_contents,
+             identity: binding.identity,
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(Default::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),
+diff --git a/crates/metal2vulkan-runtime/src/texture/wrapped.rs b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+index fcd1c46..211d0fe 100644
+--- a/crates/metal2vulkan-runtime/src/texture/wrapped.rs
++++ b/crates/metal2vulkan-runtime/src/texture/wrapped.rs
+@@ -611,7 +611,7 @@ impl Device {
+             options,
+             allow_gpu_optimized_contents: descriptor.allow_gpu_optimized_contents,
+             identity,
+-            views: Mutex::new(HashMap::new()),
++            views: Mutex::new(Default::default()),
+             twin: None,
+             decoded: None,
+             form: Default::default(),

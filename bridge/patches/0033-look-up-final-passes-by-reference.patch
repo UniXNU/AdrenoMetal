@@ -1,0 +1,176 @@
+diff --git a/crates/metal2vulkan-runtime/src/render_target.rs b/crates/metal2vulkan-runtime/src/render_target.rs
+index e7f7391..63a28ae 100644
+--- a/crates/metal2vulkan-runtime/src/render_target.rs
++++ b/crates/metal2vulkan-runtime/src/render_target.rs
+@@ -723,36 +723,48 @@ pub(super) fn final_pass(
+     }
+     let anchor = shape.anchor(device.compile_device().profile());
+     let dont_care = DontCare::of(device);
+-    let colors: Vec<Ops> = layout
+-        .colors
+-        .iter()
+-        .enumerate()
+-        .filter_map(|(index, color)| Some((index, color.as_ref()?)))
+-        .map(|(index, color)| color_ops(color, anchor == Some(index as u32), at, dont_care))
+-        .collect();
++    // The operations go in this thread's kept vectors: a pass found kept copies none of them.
++    let (mut colors, mut resolves) = FINAL_OPS.take();
++    colors.clear();
++    colors.extend(
++        layout
++            .colors
++            .iter()
++            .enumerate()
++            .filter_map(|(index, color)| Some((index, color.as_ref()?)))
++            .map(|(index, color)| color_ops(color, anchor == Some(index as u32), at, dont_care)),
++    );
+     let depth_stencil = layout
+         .depth_stencil
+         .as_ref()
+         .map(|ds| depth_stencil_ops(layout, ds, at, dont_care));
+-    let resolves = vec![
+-        RESOLVED;
++    resolves.clear();
++    resolves.resize(
+         layout
+             .colors
+             .iter()
+             .filter(|c| subpass_resolve(c.as_ref()).is_some())
+-            .count()
+-    ];
+-    kept_final_pass(
++            .count(),
++        RESOLVED,
++    );
++    let pass = kept_final_pass(
+         device,
+-        FinalMakings {
+-            shape: shape.clone(),
+-            colors,
++        FinalKey {
++            shape,
++            colors: &colors,
+             depth_stencil,
+-            resolves,
++            resolves: &resolves,
+             depth_stencil_resolve: subpass_step(layout).map(step_ops),
+             resolving: at.last,
+         },
+-    )
++    );
++    FINAL_OPS.set((colors, resolves));
++    pass
++}
++
++thread_local! {
++    /// The vectors [`final_pass`] puts a pass's operations in, emptied by the next.
++    static FINAL_OPS: std::cell::Cell<(Vec<Ops>, Vec<Ops>)> = std::cell::Cell::default();
+ }
+ 
+ /// The most final passes a device keeps ([`kept_final_pass`]): a program's passes take a few
+@@ -760,7 +772,7 @@ pub(super) fn final_pass(
+ const KEPT_FINALS: usize = 256;
+ 
+ /// What a final pass is made of: [`create`]'s arguments past the device.
+-#[derive(Clone, PartialEq, Eq, Hash)]
++#[derive(Clone, PartialEq, Eq)]
+ pub(super) struct FinalMakings {
+     shape: PassShape,
+     colors: Vec<Ops>,
+@@ -770,6 +782,81 @@ pub(super) struct FinalMakings {
+     resolving: bool,
+ }
+ 
++/// [`FinalMakings`] by reference: what a kept pass is looked up by, hashed and compared as the
++/// makings it stands for, so a lookup that finds one copies nothing.
++#[derive(Clone, Copy, PartialEq, Eq, Hash)]
++struct FinalKey<'a> {
++    shape: &'a PassShape,
++    colors: &'a [Ops],
++    depth_stencil: Option<Ops>,
++    resolves: &'a [Ops],
++    depth_stencil_resolve: Option<Ops>,
++    resolving: bool,
++}
++
++impl FinalKey<'_> {
++    fn to_makings(self) -> FinalMakings {
++        FinalMakings {
++            shape: self.shape.clone(),
++            colors: self.colors.to_vec(),
++            depth_stencil: self.depth_stencil,
++            resolves: self.resolves.to_vec(),
++            depth_stencil_resolve: self.depth_stencil_resolve,
++            resolving: self.resolving,
++        }
++    }
++}
++
++/// What has a [`FinalKey`]: the kept makings, and a key looked up by.
++trait FinalKeyed {
++    fn key(&self) -> FinalKey<'_>;
++}
++
++impl FinalKeyed for FinalMakings {
++    fn key(&self) -> FinalKey<'_> {
++        FinalKey {
++            shape: &self.shape,
++            colors: &self.colors,
++            depth_stencil: self.depth_stencil,
++            resolves: &self.resolves,
++            depth_stencil_resolve: self.depth_stencil_resolve,
++            resolving: self.resolving,
++        }
++    }
++}
++
++impl FinalKeyed for FinalKey<'_> {
++    fn key(&self) -> FinalKey<'_> {
++        *self
++    }
++}
++
++impl std::hash::Hash for FinalMakings {
++    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
++        self.key().hash(state);
++    }
++}
++
++impl std::hash::Hash for dyn FinalKeyed + '_ {
++    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
++        self.key().hash(state);
++    }
++}
++
++impl PartialEq for dyn FinalKeyed + '_ {
++    fn eq(&self, other: &Self) -> bool {
++        self.key() == other.key()
++    }
++}
++
++impl Eq for dyn FinalKeyed + '_ {}
++
++impl<'a> std::borrow::Borrow<dyn FinalKeyed + 'a> for FinalMakings {
++    fn borrow(&self) -> &(dyn FinalKeyed + 'a) {
++        self
++    }
++}
++
+ /// The final passes a device keeps, by what they are made of ([`kept_final_pass`]).
+ #[derive(Default)]
+ pub(super) struct KeptFinal(HashMap<FinalMakings, vk::RenderPass>);
+@@ -790,11 +877,12 @@ impl KeptFinal {
+ /// before, it cost a `vkCreateRenderPass2` (where Turnip lays out its attachments in GMEM for
+ /// every tile layout) and a `vkDestroyRenderPass` each time a pass ended, 19 times a frame of
+ /// iOS's compositor. Past [`KEPT_FINALS`] a pass is made for its instance alone, as before.
+-fn kept_final_pass(device: &Device, makings: FinalMakings) -> Result<RenderPassObject, Error> {
++fn kept_final_pass(device: &Device, key: FinalKey<'_>) -> Result<RenderPassObject, Error> {
+     let kept = &device.shared().final_passes;
+-    if let Some(&raw) = lock(kept).0.get(&makings) {
++    if let Some(&raw) = lock(kept).0.get(&key as &dyn FinalKeyed) {
+         return Ok(RenderPassObject::kept(device, raw));
+     }
++    let makings = key.to_makings();
+     let pass = create(
+         device,
+         &makings.shape,

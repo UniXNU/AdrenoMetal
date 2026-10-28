@@ -1,0 +1,69 @@
+diff --git a/crates/metal2vulkan-runtime/src/render_state.rs b/crates/metal2vulkan-runtime/src/render_state.rs
+index e231b10..c7b6521 100644
+--- a/crates/metal2vulkan-runtime/src/render_state.rs
++++ b/crates/metal2vulkan-runtime/src/render_state.rs
+@@ -252,19 +252,18 @@ impl EncoderState {
+         refused: Option<Error>,
+     ) -> Result<(), Error> {
+         check_count(call, viewports.len())?;
+-        // A NaN origin x draws nothing, as plain Metal's: a viewport of no width.
+-        let viewports: Vec<Viewport> = viewports
+-            .iter()
+-            .map(|v| match v.origin_x.is_nan() {
+-                true => Viewport {
+-                    origin_x: 0.0,
+-                    width: 0.0,
+-                    ..*v
+-                },
+-                false => *v,
+-            })
+-            .collect();
+-        for v in &viewports {
++        // A NaN origin x draws nothing, as plain Metal's: a viewport of no width. The vector is
++        // written in place, so a draw's call allocates nothing once the encoder's has its room.
++        self.viewports.clear();
++        self.viewports.extend(viewports.iter().map(|v| match v.origin_x.is_nan() {
++            true => Viewport {
++                origin_x: 0.0,
++                width: 0.0,
++                ..*v
++            },
++            false => *v,
++        }));
++        for v in &self.viewports {
+             let fields = [v.origin_x, v.origin_y, v.width, v.height, v.znear, v.zfar];
+             if fields.iter().any(|f| !f.is_finite()) {
+                 return Err(invalid(
+@@ -273,10 +272,9 @@ impl EncoderState {
+                 ));
+             }
+         }
+-        if let Some(error) = refused.filter(|_| viewports.iter().any(outside_depth)) {
++        if let Some(error) = refused.filter(|_| self.viewports.iter().any(outside_depth)) {
+             return Err(error);
+         }
+-        self.viewports = viewports;
+         Ok(())
+     }
+ 
+@@ -302,14 +300,12 @@ impl EncoderState {
+             let start = origin.min(end);
+             (start, origin.saturating_add(size).min(end) - start)
+         };
+-        self.scissors = scissors
+-            .iter()
+-            .map(|s| {
+-                let (x, width) = clip(s.x, s.width, width);
+-                let (y, height) = clip(s.y, s.height, height);
+-                ScissorRect::new(x, y, width, height)
+-            })
+-            .collect();
++        self.scissors.clear();
++        self.scissors.extend(scissors.iter().map(|s| {
++            let (x, width) = clip(s.x, s.width, width);
++            let (y, height) = clip(s.y, s.height, height);
++            ScissorRect::new(x, y, width, height)
++        }));
+         Ok(())
+     }
+ 

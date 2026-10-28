@@ -1,0 +1,89 @@
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index ae505fa..8a327a7 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1159,6 +1159,7 @@ pub(crate) struct DrawRooms {
+     argument_samplers: Vec<SamplerState>,
+     vertex_buffers: Vec<(u32, vk::Buffer, u64, u64)>,
+     bind_memo: binding::BindMemo,
++    bound: Bound,
+ }
+ 
+ /// The most [`DrawRooms`] a device keeps: one per encoder encoding at once.
+@@ -1178,6 +1179,7 @@ impl DrawRooms {
+         self.argument_samplers.clear();
+         self.vertex_buffers.clear();
+         self.bind_memo = self.bind_memo.emptied();
++        self.bound = self.bound.emptied();
+         let mut kept = crate::device::lock(&device.shared().draw_rooms);
+         if kept.len() < KEPT_DRAW_ROOMS {
+             kept.push(self);
+@@ -1375,7 +1377,7 @@ impl CommandBuffer {
+                 reformats: Vec::new(),
+                 positioned: None,
+                 rerecord: rerecord.then(Vec::new),
+-                bound: Bound::default(),
++                bound: rooms.bound,
+             },
+             state: EncoderState::metal_defaults(
+                 rate_map
+@@ -3080,7 +3082,7 @@ impl RenderCommandEncoder {
+         let RenderCommandEncoder {
+             mut core,
+             mut earlier,
+-            current,
++            mut current,
+             mut layout,
+             passes,
+             mut visibility,
+@@ -3119,6 +3121,7 @@ impl RenderCommandEncoder {
+             argument_samplers: argument_samplers_room,
+             vertex_buffers: vertex_buffers_room,
+             bind_memo,
++            bound: std::mem::take(&mut current.bound),
+         }
+         .keep(core.device());
+         earlier.push(current);
+diff --git a/crates/metal2vulkan-runtime/src/render/bound.rs b/crates/metal2vulkan-runtime/src/render/bound.rs
+index be326c0..3892fed 100644
+--- a/crates/metal2vulkan-runtime/src/render/bound.rs
++++ b/crates/metal2vulkan-runtime/src/render/bound.rs
+@@ -87,11 +87,37 @@ impl Bound {
+         if self.command_buffer != command_buffer {
+             *self = Bound {
+                 command_buffer,
+-                ..Bound::default()
++                ..std::mem::take(self).emptied()
+             };
+         }
+     }
+ 
++    /// Nothing bound, its vectors' room kept: an ended encoder's for the next encoder's
++    /// (`DrawRooms`).
++    pub(super) fn emptied(self) -> Bound {
++        let Bound {
++            mut sets,
++            mut pushes,
++            mut push_bytes,
++            mut vertex,
++            mut set,
++            ..
++        } = self;
++        sets.clear();
++        pushes.clear();
++        push_bytes.clear();
++        vertex.clear();
++        set.clear();
++        Bound {
++            sets,
++            pushes,
++            push_bytes,
++            vertex,
++            set,
++            ..Bound::default()
++        }
++    }
++
+     /// Whether binding `pipeline`, which holds the dynamic states `dynamic` (the module docs),
+     /// sets anything: noted as bound where it does.
+     pub(super) fn pipeline(

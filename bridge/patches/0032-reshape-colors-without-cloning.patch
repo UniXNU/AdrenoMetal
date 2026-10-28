@@ -1,0 +1,35 @@
+diff --git a/crates/metal2vulkan-runtime/src/live_bind.rs b/crates/metal2vulkan-runtime/src/live_bind.rs
+index 8696754..b4f1a7c 100644
+--- a/crates/metal2vulkan-runtime/src/live_bind.rs
++++ b/crates/metal2vulkan-runtime/src/live_bind.rs
+@@ -66,6 +66,15 @@ impl Reshape {
+         }
+         *field = value;
+     }
++
++    /// [`field`](Self::field) of `value`, cloned only where it changes the field: a draw of the
++    /// same state copies nothing.
++    pub(super) fn field_from<T: PartialEq + Clone>(&mut self, field: &mut T, value: &T) {
++        if field != value {
++            self.0 = true;
++            field.clone_from(value);
++        }
++    }
+ }
+ 
+ /// A render encoder's bind state as its last draw bound it, and its shape while no change may
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 8a327a7..0ed9ae7 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -7692,8 +7692,8 @@ impl RenderCommandEncoder {
+                 &mut state.depth_clamp_range,
+                 settings.written_clamp.map(|w| w.range),
+             );
+-            reshape.field(&mut state.zeroed_colors, settings.zeroed_colors.clone());
+-            reshape.field(&mut state.dropped_colors, settings.dropped_colors.clone());
++            reshape.field_from(&mut state.zeroed_colors, &settings.zeroed_colors);
++            reshape.field_from(&mut state.dropped_colors, &settings.dropped_colors);
+             reshape.field(&mut state.interlocked_colors, interlocked.clone());
+             reshape.field(&mut state.extended_shadows, shadows.clone());
+             let depth_stencil = match &settings.failing_state {

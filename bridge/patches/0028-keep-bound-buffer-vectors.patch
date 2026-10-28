@@ -1,0 +1,45 @@
+diff --git a/crates/metal2vulkan/src/bind/graphics.rs b/crates/metal2vulkan/src/bind/graphics.rs
+index 896c4ba..ca8bf54 100644
+--- a/crates/metal2vulkan/src/bind/graphics.rs
++++ b/crates/metal2vulkan/src/bind/graphics.rs
+@@ -3333,6 +3333,12 @@ fn instantiate(
+     Ok(out)
+ }
+ 
++thread_local! {
++    /// The residual and root entry vectors of this thread's last draw's bound buffers, emptied by
++    /// the next, which fills them: no draw's [`DrawCommands`] holds them.
++    static BOUND_ROOM: std::cell::Cell<BoundBuffers> = std::cell::Cell::new(BoundBuffers::default());
++}
++
+ fn instantiate_into(
+     t: &GraphicsTemplate,
+     state: &BindState,
+@@ -3359,13 +3365,14 @@ fn instantiate_into(
+         }
+     };
+     let command = mesh.as_ref().map_or(command, |m| m.command);
++    let room = BOUND_ROOM.take();
+     let bound = bind_buffers_in(
+         &t.buffers,
+         state,
+         BoundBuffers {
+             descriptor_ranges: kept.descriptor_ranges,
+             extents: kept.extents,
+-            ..BoundBuffers::default()
++            ..room
+         },
+     )?;
+     let mut descriptor_ranges = bound.descriptor_ranges;
+@@ -3600,6 +3607,11 @@ fn instantiate_into(
+     // The last draw's writes this one has fewer of: their vectors' room is not kept.
+     push_constants.truncate(pushes);
+     descriptor_bytes.truncate(tables_written);
++    BOUND_ROOM.set(BoundBuffers {
++        residuals: bound.residuals,
++        statics: bound.statics,
++        ..BoundBuffers::default()
++    });
+ 
+     // Vertex buffers: offsets, per-bind strides, the address rules, and the bytes the draw's
+     // vertex and instance ranges fetch.

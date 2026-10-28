@@ -1,0 +1,70 @@
+--- a/crates/metal2vulkan-air/src/container/mtlb.rs
++++ b/crates/metal2vulkan-air/src/container/mtlb.rs
+@@ -41,6 +41,13 @@
+ const FILE_TYPE_EXECUTABLE: u8 = 0;
+ /// `file_type` of a dynamic library (`MTLLibraryTypeDynamic`).
+ const FILE_TYPE_DYNAMIC: u8 = 2;
++/// `file_type` of a Core Image kernel library (`metal -cikernel`: ci_stdlib.metallib and
++/// ci_filters.metallib of Core Image under iOS 27 and macOS 27): one module whose functions are
++/// listed `TYPE` 5 and carry `!air.ci`. Metal loads it as an executable library that names none
++/// of them (an M1 under macOS 27.0.1: `type` 0, `functionNames` empty, `installName` its file).
++const FILE_TYPE_CI_KERNELS: u8 = 1;
++/// `TYPE` of a Core Image kernel in such a library.
++const TYPE_CI_KERNEL: u8 = 5;
+ 
+ /// A metallib's library type (`MTLLibraryType`), from its header's `file_type`.
+ #[non_exhaustive]
+@@ -248,7 +255,10 @@
+             6,
+         ));
+     }
+-    if header.file_type != FILE_TYPE_EXECUTABLE && header.file_type != FILE_TYPE_DYNAMIC {
++    if header.file_type != FILE_TYPE_EXECUTABLE
++        && header.file_type != FILE_TYPE_DYNAMIC
++        && header.file_type != FILE_TYPE_CI_KERNELS
++    {
+         return Err(InputError::new(
+             InputErrorKind::Unsupported(Feature::LibraryKind(header.file_type)),
+             Location::container(10),
+@@ -317,6 +327,11 @@
+     }
+     if at != entries_end {
+         return Err(container_error(ContainerError::BadOffset, 32));
++    }
++    // A Core Image kernel library lists its kernels over one shared module; Metal names none of
++    // them, so neither does the library here.
++    if header.file_type == FILE_TYPE_CI_KERNELS {
++        parsed.retain(|p| p.function.stage != FunctionStage::Other(TYPE_CI_KERNEL));
+     }
+     let (extended, _) = tags::read_list(file, at, file.len())?;
+     let mut linkage = linkage(file, &extended)?;
+--- a/crates/metal2vulkan-air/src/container/tests.rs
++++ b/crates/metal2vulkan-air/src/container/tests.rs
+@@ -593,14 +593,25 @@
+     b.version = (1, 2);
+     assert!(parse(&b.build()).is_ok());
+     let mut b = sample();
+-    b.file_type = 1;
++    b.file_type = 3;
+     match parse(&b.build()).unwrap_err() {
+         Error::Unsupported(Unsupported {
+-            feature: Feature::LibraryKind(1),
++            feature: Feature::LibraryKind(3),
+             ..
+         }) => {}
+         other => panic!("{other:?}"),
+     }
++    // A Core Image kernel library (`file_type` 1): Metal loads it and names none of its `TYPE` 5
++    // kernels (macOS 27.0.1, ci_stdlib.metallib); a function of another type stays listed.
++    let mut b = sample();
++    b.file_type = 1;
++    for f in &mut b.functions {
++        f.type_code = 5;
++    }
++    match parse(&b.build()).unwrap() {
++        Library::Metallib(m) => assert!(m.functions.is_empty(), "{:?}", m.functions),
++        other => panic!("{other:?}"),
++    }
+ }
+ 
+ #[test]

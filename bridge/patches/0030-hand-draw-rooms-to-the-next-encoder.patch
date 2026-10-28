@@ -1,0 +1,139 @@
+diff --git a/crates/metal2vulkan-runtime/src/binding.rs b/crates/metal2vulkan-runtime/src/binding.rs
+index 5caa3f2..a916162 100644
+--- a/crates/metal2vulkan-runtime/src/binding.rs
++++ b/crates/metal2vulkan-runtime/src/binding.rs
+@@ -910,6 +910,18 @@ pub(super) struct BindMemo {
+ }
+ 
+ impl BindMemo {
++    /// The memo with nothing kept but its vectors' room: what an ended encoder hands the next
++    /// (`render::DrawRooms`), holding no texture of its views.
++    pub(super) fn emptied(mut self) -> Self {
++        self.views.clear();
++        self.samplers.clear();
++        self.writes.clear();
++        self.holes.clear();
++        self.bound_samplers.clear();
++        self.roots.clear();
++        self
++    }
++
+     /// Keep the vectors of a [`Bound`] its consumer is done with for the next bind; samplers
+     /// where the consumer did not keep them.
+     pub(super) fn give_back(
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 81304a0..f7b18e6 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -373,6 +373,9 @@ pub(super) struct DeviceShared {
+     /// rebind's or a storage form's new `VkImage`, a detach's stand-in, a reattach): a view kept
+     /// by what it was made of (`binding::BindMemo`) is current while this holds.
+     pub(crate) views_epoch: AtomicU64,
++    /// The vectors ended render encoders' draws filled, emptied, for the next encoders' draws
++    /// (`render::DrawRooms`).
++    pub(crate) draw_rooms: Mutex<Vec<crate::render::DrawRooms>>,
+ }
+ 
+ impl DeviceShared {
+@@ -1234,6 +1237,7 @@ impl Device {
+             record_executions,
+             refuse_rebinds,
+             views_epoch: AtomicU64::new(0),
++            draw_rooms: Mutex::new(Vec::new()),
+             device_address,
+             upload_alignment,
+             memory: Mutex::new(memory),
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index a507bd2..ae505fa 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -1149,6 +1149,42 @@ struct LastRetained {
+     samplers: Vec<Arc<OwnedSampler>>,
+ }
+ 
++/// The vectors a render encoder's draws fill again draw after draw, emptied: an ended encoder
++/// gives them to its device, whose next encoder takes them, so its first draws allocate them no
++/// more than its later ones.
++#[derive(Default)]
++pub(crate) struct DrawRooms {
++    draw_commands: Option<DrawCommands>,
++    uses: Vec<Use<ResourceKey>>,
++    argument_samplers: Vec<SamplerState>,
++    vertex_buffers: Vec<(u32, vk::Buffer, u64, u64)>,
++    bind_memo: binding::BindMemo,
++}
++
++/// The most [`DrawRooms`] a device keeps: one per encoder encoding at once.
++const KEPT_DRAW_ROOMS: usize = 4;
++
++impl DrawRooms {
++    /// A kept one of `device`'s, or new ones.
++    fn take(device: &crate::device::Device) -> Self {
++        crate::device::lock(&device.shared().draw_rooms)
++            .pop()
++            .unwrap_or_default()
++    }
++
++    /// Keep them for `device`'s next encoder, emptied.
++    fn keep(mut self, device: &crate::device::Device) {
++        self.uses.clear();
++        self.argument_samplers.clear();
++        self.vertex_buffers.clear();
++        self.bind_memo = self.bind_memo.emptied();
++        let mut kept = crate::device::lock(&device.shared().draw_rooms);
++        if kept.len() < KEPT_DRAW_ROOMS {
++            kept.push(self);
++        }
++    }
++}
++
+ impl LastRetained {
+     /// Retain into `core` a draw's pipeline state, variant objects and made `VkPipeline`, each
+     /// unless it is the one the last draw retained.
+@@ -1318,6 +1354,7 @@ impl CommandBuffer {
+         render_pass::degrade_depth_clear(device, &layout);
+         let extended = ExtendedShadows::of(descriptor, &layout, rate_map.is_some());
+         let rerecord = reroute::keeps_whole(device) || extended.keeps_draws();
++        let rooms = DrawRooms::take(device);
+         Ok(RenderCommandEncoder {
+             core,
+             earlier: Vec::new(),
+@@ -1406,11 +1443,11 @@ impl CommandBuffer {
+             live: Arc::default(),
+             log,
+             quiet_bound_values: None,
+-            draw_commands: None,
+-            uses_room: Vec::new(),
+-            argument_samplers_room: Vec::new(),
+-            vertex_buffers_room: Vec::new(),
+-            bind_memo: binding::BindMemo::default(),
++            draw_commands: rooms.draw_commands,
++            uses_room: rooms.uses,
++            argument_samplers_room: rooms.argument_samplers,
++            vertex_buffers_room: rooms.vertex_buffers,
++            bind_memo: rooms.bind_memo,
+             last_retained: LastRetained::default(),
+         })
+     }
+@@ -3069,8 +3106,21 @@ impl RenderCommandEncoder {
+             extended,
+             reload_at,
+             log,
++            draw_commands,
++            uses_room,
++            argument_samplers_room,
++            vertex_buffers_room,
++            bind_memo,
+             ..
+         } = self;
++        DrawRooms {
++            draw_commands,
++            uses: uses_room,
++            argument_samplers: argument_samplers_room,
++            vertex_buffers: vertex_buffers_room,
++            bind_memo,
++        }
++        .keep(core.device());
+         earlier.push(current);
+         let mut instances = earlier;
+         // A color attachment's store action still `Unknown` stores nothing, as plain Metal's
