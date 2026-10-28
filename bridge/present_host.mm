@@ -26,7 +26,7 @@ static bool run(id<MTLDevice> device, uint32_t w, uint32_t h, size_t srcStride, 
     for (size_t i = 0; i < dstBytes; ++i) dst[i] = 0xa5;
     gpupresent::Presenter presenter(device, {dst, dstBytes, dstStride, w, h});
     if (!presenter.ready()) {std::printf("FAIL %s scanout import\n", name); return false;}
-    const gpupresent::Result r = presenter.present({src, srcBytes, srcStride, w, h});
+    const gpupresent::Result r = presenter.present({src, srcBytes, srcStride, w, h, 0, NGP_BGRX8888});
     if (r != gpupresent::kOk) {std::printf("FAIL %s present %d\n", name, (int)r); return false;}
     for (uint32_t y = 0; y < h; ++y) {
         if (memcmp(dst + y * dstStride, src + y * srcStride, (size_t)w * 4)) {std::printf("FAIL %s row %u differs\n", name, y); return false;}

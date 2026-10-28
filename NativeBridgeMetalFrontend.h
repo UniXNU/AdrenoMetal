@@ -28,5 +28,7 @@ bool native_bridge_metal_work_stats(uint64_t out[10]);
 // page faults, memset bandwidth, CommonCrypto SHA-256, then the first `pairs` vertex/fragment pairs of the given QuartzCore metallib made into
 // BGRA8 render states and drawn once each (pipeline_timing_host's draw=1 order). The results become the telemetry's Y rows; also returned.
 size_t native_bridge_metal_benchmark(id device, const char *metallib, unsigned pairs, char *out, size_t size);
+// Lets go of every held IOSurface import whose surface only the import still retains (also done at each command buffer's completion).
+void native_bridge_metal_trim_surface_imports(void);
 }
 #endif

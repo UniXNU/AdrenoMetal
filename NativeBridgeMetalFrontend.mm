@@ -144,7 +144,6 @@ static void (*gMissing)(const char *, const char *);
 
 // What this device has been asked and refused, for the plugin's status line (native_bridge_metal_status): commits, render/compute pipelines made,
 // refusals, and the last two refusals' texts. Counters only; nothing here changes a result.
-static constexpr uint64_t kWaitBoundMs=4000;
 static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gCompleted,gWaitTimeouts;
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
@@ -451,8 +450,15 @@ static void logTexture(const char *kind,MTLTextureDescriptor *d,IOSurfaceRef sur
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
 struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,surfaceWidth,surfaceHeight,rotation;bool framebufferOnly;};
 static SurfaceRefusal gSurfaceLastRefusal;
-// Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row.
-extern "C" volatile uint32_t native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate;
+// Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row. Weak here: the plugin's own definition wins, and a host
+// binary that links the frontend without the plugin (every check-*-host.py test) has zeroes instead of an undefined symbol.
+extern "C" {
+__attribute__((weak)) volatile uint32_t native_prime_compiling;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_done;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_total;
+__attribute__((weak)) volatile uint32_t native_prime_made;
+__attribute__((weak)) volatile uint32_t native_prime_rate;
+}
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
@@ -544,7 +550,29 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
  static dispatch_once_t once;
  static std::mutex lock;
  dispatch_once(&once,^{
-  void *library=dlopen("/System/Library/PrivateFrameworks/MTLCompiler.framework/MTLCompiler",RTLD_NOW);
+  static const char kFramework[]="/System/Library/PrivateFrameworks/MTLCompiler.framework";
+  // The top-level path, then the version the framework's own Current link names (macOS), then the highest version directory: iOS 27
+  // ships the framework with no top-level link and no Current (Versions/32023 and 32024 in the shared cache, each directory holding only
+  // its Info.plist on disk), and every version's library exports the same codegen service. Without one, every stitched library (Core
+  // Image's create_metal_dag, RenderBox's custom_blend) and every source compile was refused.
+  std::string path=std::string(kFramework)+"/MTLCompiler";
+  void *library=dlopen(path.c_str(),RTLD_NOW);
+  if(!library && !access((std::string(kFramework)+"/Versions/Current/MTLCompiler").c_str(),R_OK)) {
+   path=std::string(kFramework)+"/Versions/Current/MTLCompiler";
+   library=dlopen(path.c_str(),RTLD_NOW);
+  }
+  if(!library) {
+   unsigned long highest=0;
+   for(NSString *entry in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:[@(kFramework) stringByAppendingString:@"/Versions"] error:nil]) {
+    const unsigned long version=strtoul(entry.UTF8String,nullptr,10);
+    if(version>highest && [entry isEqualToString:[NSString stringWithFormat:@"%lu",version]])highest=version;
+   }
+   if(highest) {
+    path=std::string(kFramework)+"/Versions/"+std::to_string(highest)+"/MTLCompiler";
+    library=dlopen(path.c_str(),RTLD_NOW);
+   }
+  }
+  if(library && path!=std::string(kFramework)+"/MTLCompiler")NSLog(@"native-metal: Metal compiler loaded from %s",path.c_str());
   void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
   build=library?(void (*)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply))dlsym(library,"MTLCodeGenServiceBuildRequest"):nullptr;
   service=create && build?create("native-metal"):nullptr;
@@ -753,43 +781,68 @@ NB_RESOURCE_SPI
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
 // Core Animation makes a texture of each window surface at every frame and drops it when the frame completes, so the weak table
-// lost the import between frames and each frame imported every surface again (allocate, map, free). An import used in the last
-// second stays held (strongly, at most 64): the pages are the surface's own and the key includes identity, address and size.
+// lost the import between frames and each frame imported every surface again (allocate, map, free). As Metal keeps a surface's GPU
+// mapping for as long as the surface lives, an import stays held while anything else in this process still retains its surface (the
+// import's own retain is the only one left once the surface is gone), and everything held goes back when the system reports memory
+// pressure. No count or age limit: held imports whose surface is gone are let go at the next import, at every command buffer's
+// completion and on memory pressure (native_bridge_metal_trim_surface_imports).
 #include <map>
 #include <tuple>
-struct HeldImport {NBBuffer *buffer;uint64_t usedUs;};
-static std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport> gHeldImports;   // under gSurfaceImportLock
-static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer) {
- const uint64_t now=nowUs();gHeldImports[{identity,address,bytes}]={buffer,now};
- for(auto it=gHeldImports.begin();it!=gHeldImports.end();)it=now-it->second.usedUs>1000000?gHeldImports.erase(it):std::next(it);
- while(gHeldImports.size()>64) {
-  auto oldest=gHeldImports.begin();
-  for(auto it=gHeldImports.begin();it!=gHeldImports.end();++it)if(it->second.usedUs<oldest->second.usedUs)oldest=it;
-  gHeldImports.erase(oldest);
+struct HeldImport {NBBuffer *buffer;IOSurfaceRef surface;};
+// Under gSurfaceImportLock. Never destroyed: a completion thread may still trim it while the process exits.
+static auto &gHeldImports=*new std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport>;
+static NSUInteger gSurfaceImportsPruned=64;     // the table size at which dead associations are next pruned
+// Drops (into `gone`, released by the caller outside the lock) every held import whose surface only the import still retains, or every
+// one when `all`.
+static void pruneHeldImports(bool all,std::vector<NBBuffer *> &gone) {
+ for(auto it=gHeldImports.begin();it!=gHeldImports.end();) {
+  if(all || CFGetRetainCount(it->second.surface)<=1){gone.push_back(it->second.buffer);it=gHeldImports.erase(it);}
+  else ++it;
  }
+}
+static void trimHeldImports(bool all) {
+ std::vector<NBBuffer *> gone;
+ {std::lock_guard<std::mutex> lock(gSurfaceImportLock);pruneHeldImports(all,gone);}
+ gone.clear();   // the imports' last frontend references go here, outside the lock
+}
+extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(false);}
+static void watchImportPressure() {
+ static dispatch_once_t once;
+ dispatch_once(&once,^{
+  dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
+   DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+  if(!source)return;
+  dispatch_source_set_event_handler(source,^{trimHeldImports(true);});
+  dispatch_activate(source);
+ });
+}
+static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer,IOSurfaceRef surface,std::vector<NBBuffer *> &gone) {
+ pruneHeldImports(false,gone);
+ gHeldImports[{identity,address,bytes}]={buffer,surface};
 }
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
+ watchImportPressure();
+ std::vector<NBBuffer *> gone;   // declared before the lock: released after it
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer);return buffer;}
+ if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);return buffer;}
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
  gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
  if(key) {
-  // Bound metadata without retaining old frames. Evicting an association is
-  // harmless: its owners still retain the actual import until their own end.
-  if(gSurfaceImports.count>=256) {
+  // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
+  if(gSurfaceImports.count>=gSurfaceImportsPruned) {
    for(NSValue *old in gSurfaceImports.keyEnumerator.allObjects)
     if(![gSurfaceImports objectForKey:old])[gSurfaceImports removeObjectForKey:old];
-   if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
+   gSurfaceImportsPruned=MAX(gSurfaceImports.count*2,(NSUInteger)64);
   }
   [gSurfaceImports setObject:buffer forKey:key];
-  holdImport(value.identity,value.address,value.bytes,buffer);
+  holdImport(value.identity,value.address,value.bytes,buffer,surface,gone);
  }
  return buffer;
 }
@@ -1644,14 +1697,19 @@ static void encodeDrain() {
  t.idle.wait(lock,[&]{return t.done>=target;});
 }
 #define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
+// Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
+static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
  encodeDrain();   // every committed command buffer's uses recorded
  const uint64_t began=nowUs();
  NSArray *pending;@synchronized(gInFlight){pending=gInFlight.allObjects;}
  for(NBCommandBuffer *commandBuffer in pending) {
   int dependency=-1;
-  if([resource isKindOfClass:[NBBuffer class]])dependency=nmb_command_buffer_uses_buffer(commandBuffer.handle,[(NBBuffer *)resource handle]);
-  else if([resource isKindOfClass:[NBTexture class]])dependency=nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)resource handle]);
+  {
+   std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
+   if([resource isKindOfClass:[NBBuffer class]])dependency=nmb_command_buffer_uses_buffer(commandBuffer.handle,[(NBBuffer *)resource handle]);
+   else if([resource isKindOfClass:[NBTexture class]])dependency=nmb_command_buffer_uses_texture(commandBuffer.handle,[(NBTexture *)resource handle]);
+  }
   gResourceChecks++;
   // An unknown result retains the old conservative wait. False means no matching storage
   // (or GPU work already completed), not a fabricated completion for a pending dependency.
@@ -2156,7 +2214,10 @@ static void writeDrawStats() {
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
  if(![self textures:NB_OBJECTS(t) count:1])return;
- ENCODE([self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:"generateMipmapsForTexture"]);
+ // A refusal names the texture's pixel format, type and levels: what decides whether the runtime can filter it.
+ const std::string what=[NSString stringWithFormat:@"generateMipmapsForTexture: (pixel format %lu, type %lu, %lu levels)",
+                         (unsigned long)t.pixelFormat,(unsigned long)t.textureType,(unsigned long)t.mipmapLevelCount].UTF8String;
+ ENCODE([self check:nmb_blit_generate_mipmaps(self.handle,[(NBTexture *)t handle]) what:what.c_str()]);
 }
 - (void)synchronizeResource:(id<MTLResource>)r {(void)r;}
 @end
@@ -2364,7 +2425,10 @@ static char kUserDictionaryKey;
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
- if(self.committed && !self.submitted)return MTLCommandBufferStatusCommitted;
+ // The runtime submits on the committing thread: a commit that submits its own last batch runs the scheduled handlers before
+ // nmb_command_buffer_commit returns, and Metal's status reads Scheduled inside them (as its wait returns after them); the frontend's
+ // own `submitted` is only set after the call, so the runtime's status answers once scheduling has been delivered.
+ if(self.committed && !self.submitted && !_schedulingDelivered)return MTLCommandBufferStatusCommitted;
  return (MTLCommandBufferStatus)nmb_command_buffer_status(_handle);
 }
 - (NSError *)error {
@@ -2392,8 +2456,8 @@ static char kUserDictionaryKey;
 - (CFTimeInterval)kernelStartTime {return 0;}
 - (CFTimeInterval)kernelEndTime {return 0;}
 - (BOOL)commitAndWaitUntilSubmitted {[(id<MTLCommandBuffer>)self commit];[self waitUntilScheduled];return !self.failedLocally;}
-- (CFTimeInterval)GPUStartTime {return self.submitted?nmb_command_buffer_gpu_time(_handle,false):0;}
-- (CFTimeInterval)GPUEndTime {return self.submitted?nmb_command_buffer_gpu_time(_handle,true):0;}
+- (CFTimeInterval)GPUStartTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,false):0;}
+- (CFTimeInterval)GPUEndTime {return self.submitted && !self.failedLocally?nmb_command_buffer_gpu_time(_handle,true):0;}
 // An encoder whose runtime half `make` makes, on the encoding thread when that is on. A refused encoder is still an object: its calls
 // fail on the null handle and the buffer completes with an error. RenderBox caches the encoder's IMPs with methodForSelector:, and on
 // nil it called address 0 (i568: WidgetRenderer_Default crashed eight launches running, then hit its open cap and lost the device).
@@ -2537,6 +2601,16 @@ static char kUserDictionaryKey;
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
  @synchronized(gInFlight){[gInFlight removeObject:self];}
+ // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
+ trimHeldImports(false);
+ // A local refusal never reaches the runtime's completion: its runtime command buffer, which holds every resource its encoders
+ // recorded, goes now, as Metal releases a failed command buffer's resources once it completes with its error, however long the
+ // caller keeps the command buffer object. Every later answer of it is the frontend's (failedLocally).
+ if(self.failedLocally) {
+  std::lock_guard<std::mutex> guard(gRuntimeHandleLock);
+  NmbCommandBuffer *handle=_handle;_handle=nullptr;
+  nmb_command_buffer_release(handle);
+ }
  NSArray *completedHandlers;
  @synchronized(self){
   // A frontend refusal or a failed submission never scheduled. Unblock its waiter without inventing a scheduled event.
@@ -2618,18 +2692,14 @@ static char kUserDictionaryKey;
  if(!self.committed)return;
  encodeDrain();
  const uint64_t began=nowUs();
- // Bounded (kWaitBoundMs): a completion the bridge never delivers must not park the caller for good (the scanout worker would never call
- // COMPLETE_SWAP and the display's 5 s SwapWait fires). The bound is above a slow first-use pipeline compile; on timeout the command buffer
- // stays in flight and the caller sees a status that is not completed.
- if(!self.failedLocally && nmb_command_buffer_wait(_handle,kWaitBoundMs)!=0) {
+ // As Metal's waitUntilCompleted: until the command buffer completes, with an error when the GPU was restarted under it (the kernel's
+ // hangcheck ends a hang and the client whose work hung sees its device lost), never after a fixed time.
+ if(!self.failedLocally && nmb_command_buffer_wait(_handle,0)!=0) {
   gWaitTimeouts++;
-  NBLOG(@"native-metal: completion wait timed out after %d ms (status %llu)",(int)kWaitBoundMs,(unsigned long long)nmb_command_buffer_status(_handle));
+  NBLOG(@"native-metal: completion wait failed (status %llu)",(unsigned long long)nmb_command_buffer_status(_handle));
  }
  const uint32_t cpuStart=threadCpuUs();
- if(dispatch_group_wait(_handlers,dispatch_time(DISPATCH_TIME_NOW,(int64_t)kWaitBoundMs*1000*1000))!=0) {
-  gWaitTimeouts++;
-  NBLOG(@"native-metal: completion handlers timed out (the bridge did not deliver the completion)");
- }
+ dispatch_group_wait(_handlers,DISPATCH_TIME_FOREVER);
  {
   TraceRec rec={};rec.type=2;rec.t0=began;rec.t1=nowUs();rec.tid=threadIdLow();rec.a=(uint32_t)(uintptr_t)__builtin_return_address(0);
   rec.cpu0=cpuStart;rec.cpu1=threadCpuUs();traceNote(rec.tid);tracePush(rec);
@@ -3258,10 +3328,10 @@ static char dvmMemoryReleaseKey;
  // (Core Image's intermediate images, iconservicesagent, i-33765e1ad) gets a texture instead of nil, which it dereferenced. A placement
  // heap's texture aliases the memory at its offset; that one stays refused.
  if(!handle) {
-  NBLOG(@"native-metal: heap texture refused: %@",lastError());
+  NBLOG(@"native-metal: heap texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
   if(offset!=UINT64_MAX)return nil;
   handle=nmb_texture_new(gDevice,&descriptor);
-  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+  if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
  }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
@@ -3449,7 +3519,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)d {
  NmbTextureDescriptor descriptor;uint64_t answer[2]={0,0};
  if(textureDescriptor(d,&descriptor)&&!nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer))
-  NBLOG(@"native-metal: heap texture size refused: %@",lastError());
+  NBLOG(@"native-metal: heap texture size (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
  return (MTLSizeAndAlign){answer[0],answer[1]};
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
@@ -3518,7 +3588,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
- if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+ if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  return (id<MTLTexture>)texture;

@@ -1,0 +1,14 @@
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -1290,6 +1290,11 @@
+             }
+             size_and_align = metal;
+         }
++        // Metal's size is a multiple of its alignment, so a heap sized as the sum of its textures'
++        // sizes holds them in any order. Where the device's image needs a coarser alignment than
++        // Metal's model (Turnip: 4 KiB against Metal's 128 bytes), the size grows to a multiple of
++        // it too: otherwise each texture placed after one pads past what the heap was sized for.
++        size_and_align.size = size_and_align.size.next_multiple_of(size_and_align.align.max(1));
+         check_heap_base(size_and_align.align)?;
+         // The size answered is the optimized texture's where the driver keeps the layout.
+         self.degrade_optimized_layout(descriptor, &layout);

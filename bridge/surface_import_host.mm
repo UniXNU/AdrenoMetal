@@ -25,6 +25,12 @@ extern "C" NmbBuffer *tracked_surface_import(NmbDevice *d, void *p, uint64_t n, 
     if (buffer) {std::lock_guard<std::mutex> lock(handlesLock);handles.insert(buffer);imports++;}
     return buffer;
 }
+extern "C" NmbBuffer *tracked_surface_import_releasing(NmbDevice *d, void *p, uint64_t n, uint64_t options,
+                                                      void (*release)(void *, void *, uint64_t), void *context) {
+    NmbBuffer *buffer = nmb_buffer_new_no_copy_releasing(d,p,n,options,release,context);
+    if (buffer) {std::lock_guard<std::mutex> lock(handlesLock);handles.insert(buffer);imports++;}
+    return buffer;
+}
 extern "C" void tracked_buffer_release(NmbBuffer *buffer) {
     {std::lock_guard<std::mutex> lock(handlesLock);if(handles.erase(buffer))releases++;}
     nmb_buffer_release(buffer);
@@ -95,26 +101,33 @@ static bool aliases(id<MTLDevice> device,unsigned count,unsigned allocations,boo
             }
         for(IOSurfaceRef surface:surfaces)CFRelease(surface);
     }
+    // The surfaces are gone: their held imports go at the next trim (a completion, an import or memory pressure).
+    native_bridge_metal_trim_surface_imports();
     const unsigned made=imports.load()-before;
     const bool retired=drained(released+made);
-    // More than the metadata bound may evict live weak associations. The
-    // runtime must still share each live import and retire every real owner.
-    const bool reuse=allocations>256?(made>=allocations && made<=count):made==allocations;
+    // Every live surface is imported once, however many textures alias it.
+    const bool reuse=made==allocations;
     const uint64_t actualVk=vkImports?vkImports()-vkBefore:0;
     std::printf("aliases=%u surfaces=%u parallel=%d imports=%u releases=%u vk_imports=%llu gpu=%s retired=%s reuse=%s\n",
         count,allocations,parallel,made,releases.load()-released,(unsigned long long)actualVk,ok?"pass":"FAIL",retired?"pass":"FAIL",reuse?"pass":"FAIL");
     return ok && retired && reuse && (!vkImports || actualVk==allocations);
 }
 
+// As Metal keeps a surface's GPU mapping while the surface lives: textures made and dropped over a surface the caller still holds share
+// one import, kept; once the caller lets go of the surface, a trim releases it.
 static bool expires(id<MTLDevice> device) {
     const unsigned before=imports.load(),released=releases.load();IOSurfaceRef surface=makeSurface(0x35);if(!surface)return false;
     bool ok=true;
     for(unsigned i=0;i<2;++i) {
         @autoreleasepool {id<MTLTexture> texture=[device newTextureWithDescriptor:descriptor() iosurface:surface plane:0];if(!texture)ok=false;}
-        ok &= drained(released+i+1) && imports.load()==before+i+1;
+        native_bridge_metal_trim_surface_imports();
+        usleep(20000);
+        ok &= imports.load()==before+1 && releases.load()==released;
     }
     CFRelease(surface);
-    std::printf("expired owners imports=%u releases=%u result=%s\n",imports.load()-before,releases.load()-released,ok?"pass":"FAIL");
+    native_bridge_metal_trim_surface_imports();
+    ok &= drained(released+1);
+    std::printf("held owners imports=%u releases=%u result=%s\n",imports.load()-before,releases.load()-released,ok?"pass":"FAIL");
     return ok;
 }
 
@@ -145,7 +158,7 @@ static bool pending(id<MTLDevice> device) {
         if(dispatch_semaphore_wait(finished,dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC)))return false;
         if(command.status!=MTLCommandBufferStatusCompleted)ok=false;
         for(unsigned i=0;i<4096;++i)if(((const unsigned char *)output.contents)[i]!=0x79)ok=false;
-        // Completed commands must release the import even if still retained.
+        // The completion lets go of the held import: the caller dropped the surface before the GPU read it.
         ok &= drained(released+1);
     }
     std::printf("pending owners imports=%u releases=%u result=%s\n",imports.load()-before,releases.load()-released,ok?"pass":"FAIL");
@@ -168,6 +181,6 @@ int main(int argc,char **argv) {
         ok &= pending(device);
         ok &= aliases(device,514,257,false);
         if(!ok || imports.load()!=releases.load()){std::puts("FAIL: live IOSurface import reuse");return 1;}
-        std::puts("PASS: live IOSurface aliases reuse imports with real GPU bytes; distinct, parallel, expired and pending owners preserve lifetimes");
+        std::puts("PASS: live IOSurface aliases reuse one held import with real GPU bytes; held while the surface lives, released after it, pending work keeps it");
     }
 }
