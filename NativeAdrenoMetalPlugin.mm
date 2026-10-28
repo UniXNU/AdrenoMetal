@@ -185,6 +185,17 @@ static id clientDevice(unsigned port) {
         }
         if (!device && !lastError[0]) lastError = nmb_last_error();
     }
+    if (!device && !usable) {
+        setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
+        const char *path = candidates[0][0] ? candidates[0] : candidates[1][0] ? candidates[1] : "/var/mobile/tmp/m2v";
+        @try {
+            device = native_bridge_metal_open(turnip, path, registryID, nullptr);
+        } @catch (NSException *exception) {
+            device = nil;
+            lastError = "exception";
+        }
+        if (!device && !lastError[0]) lastError = nmb_last_error();
+    }
     if (!device) clientFailure(port, usable ? "no-device" : "no-cachedir", lastError);
     // The client's first problem, once, on the same text line, sent from the thread that hit it: WidgetRenderer crashed on a nil render
     // encoder with no reason anywhere readable (its own log lines need the plugin's format strings, which the device does not keep), and a
@@ -208,6 +219,11 @@ static id deviceForPort(unsigned port) {
         // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
         // runtime keeps within a texture's rows (bridge patch 0016).
+        if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
+            char line[128] = {};
+            if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
+            fclose(flags);
+        }
         setenv("TU_DEBUG", "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.

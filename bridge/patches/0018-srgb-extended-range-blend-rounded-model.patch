@@ -1,0 +1,38 @@
+diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
+index 0b004f2..ead0ad8 100644
+--- a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
++++ b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
+@@ -765,10 +765,16 @@ fn planned_for(
+     let narrow = narrow(eq);
+     // The rounded model holds for any blend into an `_sRGB` form, a mask of one color channel,
+     // and the color channels' blend color difference.
++    // An `_sRGB` form's blend the fast model does not hold (any but a narrow, unmasked one) takes
++    // the rounded model, Metal's own without fast math, measured for every `_sRGB` form (EV
++    // XRB-xrts-m4) and apart from its fast-math result only in roundings, rather than no pipeline:
++    // NanoUniverse's starfield (the Astronomy wallpaper, `BGRA10_XR_sRGB`) had none.
++    let math = if math == BlendMath::Fast && srgb && (!narrow || masked) {
++        BlendMath::Rounded
++    } else {
++        math
++    };
+     let fast = math == BlendMath::Fast;
+-    if fast && srgb && (!narrow || masked) {
+-        return Err(refused(ExtendedRangeBlend::SrgbForm));
+-    }
+     let opaque_ = !has_alpha;
+     let color = match colors {
+         0 => None,
+@@ -910,6 +916,13 @@ impl Blend {
+     /// Metal's model's: a `half4` one; a `float4` one under a blend whose color lanes take one term
+     /// alone, unmasked, rounded to `half` first; another is the gap it is.
+     pub fn takes(&self, output: Option<FloatFmt>) -> Result<(), Error> {
++        // The rounded model rounds a `float4` output to `half` first, as a `half4` one.
++        if self.math == BlendMath::Rounded {
++            return match output {
++                Some(FloatFmt::Half | FloatFmt::F32) => Ok(()),
++                _ => Err(refused(ExtendedRangeBlend::Output)),
++            };
++        }
+         match output {
+             Some(FloatFmt::Half) => Ok(()),
+             Some(FloatFmt::F32) if self.narrow && self.takes_float && !self.masked => Ok(()),

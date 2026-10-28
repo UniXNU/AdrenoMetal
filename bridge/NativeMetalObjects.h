@@ -95,6 +95,8 @@ uint64_t nmb_heap_max_available_size(const NmbHeap *, uint64_t alignment);
 uint64_t nmb_heap_set_purgeable_state(const NmbHeap *, uint64_t state);
 NmbBuffer *nmb_heap_new_buffer(const NmbHeap *, uint64_t length, uint64_t options, uint64_t offset);
 NmbTexture *nmb_heap_new_texture(const NmbHeap *, const struct NmbTextureDescriptor *, uint64_t offset);
+bool nmb_device_heap_texture_size_and_align(const NmbDevice *, const struct NmbTextureDescriptor *, uint64_t out[2]); /* size, align */
+bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, uint64_t options, uint64_t out[2]);
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);

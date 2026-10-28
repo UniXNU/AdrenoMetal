@@ -1,0 +1,42 @@
+diff --git a/crates/metal2vulkan-air/src/intrinsics/llvm.rs b/crates/metal2vulkan-air/src/intrinsics/llvm.rs
+index d784c6c..b6ca3f9 100644
+--- a/crates/metal2vulkan-air/src/intrinsics/llvm.rs
++++ b/crates/metal2vulkan-air/src/intrinsics/llvm.rs
+@@ -56,6 +56,8 @@ pub enum LlvmIntOp {
+     Bswap,
+     /// `llvm.ctpop`: the number of set bits.
+     Ctpop,
++    /// `llvm.bitreverse`: the bits in reverse order (what `reverse_bits` compiles to).
++    Bitreverse,
+     /// `llvm.uadd.sat`: unsigned saturating addition.
+     UAddSat,
+     /// `llvm.usub.sat`: unsigned saturating subtraction.
+@@ -340,6 +342,7 @@ pub(super) const BASES: &[(&str, Base)] = &[
+     ("fshr", Base::Int(LlvmIntOp::Fshr)),
+     ("bswap", Base::Int(LlvmIntOp::Bswap)),
+     ("ctpop", Base::Int(LlvmIntOp::Ctpop)),
++    ("bitreverse", Base::Int(LlvmIntOp::Bitreverse)),
+     ("uadd.sat", Base::Int(LlvmIntOp::UAddSat)),
+     ("usub.sat", Base::Int(LlvmIntOp::USubSat)),
+     ("sadd.sat", Base::Int(LlvmIntOp::SAddSat)),
+@@ -393,7 +396,7 @@ impl LlvmFloatOp {
+ impl LlvmIntOp {
+     fn arity(self) -> usize {
+         match self {
+-            LlvmIntOp::Bswap | LlvmIntOp::Ctpop => 1,
++            LlvmIntOp::Bswap | LlvmIntOp::Ctpop | LlvmIntOp::Bitreverse => 1,
+             LlvmIntOp::Fshl | LlvmIntOp::Fshr => 3,
+             _ => 2,
+         }
+diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
+index 54f371d..57d7eec 100644
+--- a/crates/metal2vulkan/src/lower/arith/mod.rs
++++ b/crates/metal2vulkan/src/lower/arith/mod.rs
+@@ -2415,6 +2415,7 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {
+             LlvmIntOp::Fshr => IntFn::Fshr,
+             LlvmIntOp::Bswap => IntFn::Bswap,
+             LlvmIntOp::Ctpop => IntFn::Popcount,
++            LlvmIntOp::Bitreverse => IntFn::ReverseBits,
+             LlvmIntOp::UAddSat => IntFn::AddSat(Sign::Unsigned),
+             LlvmIntOp::USubSat => IntFn::SubSat(Sign::Unsigned),
+             LlvmIntOp::SAddSat => IntFn::AddSat(Sign::Signed),

@@ -1,0 +1,45 @@
+diff --git a/crates/metal2vulkan-runtime/src/shader_cache/store.rs b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
+index 98e82e1..1c7eac7 100644
+--- a/crates/metal2vulkan-runtime/src/shader_cache/store.rs
++++ b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
+@@ -68,6 +68,11 @@ impl Directory {
+     /// Open `root` for `build` with a cap of `capacity` bytes: create it and the build's
+     /// directory (owner-only) and write and remove a probe file there. The error names the
+     /// directory that failed.
++    ///
++    /// With `METAL2VULKAN_SHADER_CACHE_OPTIONAL` in the environment a directory that cannot be
++    /// made or written opens anyway: a process that may write nowhere (a sandboxed one, as
++    /// WebKit's GPU process) still gets its device, and every read and write of the cache is a
++    /// miss, as after any later failure.
+     pub(crate) fn open(root: PathBuf, build: Hash256, capacity: u64) -> Result<Directory, Failed> {
+         let directory = Directory {
+             root,
+@@ -78,14 +83,20 @@ impl Directory {
+             let path = path.to_path_buf();
+             move |error| Failed { path, error }
+         };
+-        create_private_dir_all(&directory.root).map_err(failed(&directory.root))?;
+-        let build_dir = directory.build_dir();
+-        create_private_dir_all(&build_dir).map_err(failed(&build_dir))?;
+-        let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
+-        let written = new_private_file(&probe).and_then(|mut file| file.write_all(b"probe"));
+-        let removed = fs::remove_file(&probe);
+-        written.and(removed).map_err(failed(&directory.root))?;
+-        Ok(directory)
++        let made = (|| {
++            create_private_dir_all(&directory.root).map_err(failed(&directory.root))?;
++            let build_dir = directory.build_dir();
++            create_private_dir_all(&build_dir).map_err(failed(&build_dir))?;
++            let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
++            let written = new_private_file(&probe).and_then(|mut file| file.write_all(b"probe"));
++            let removed = fs::remove_file(&probe);
++            written.and(removed).map_err(failed(&directory.root))
++        })();
++        match made {
++            Err(_) if std::env::var_os("METAL2VULKAN_SHADER_CACHE_OPTIONAL").is_some() => Ok(directory),
++            Err(failed) => Err(failed),
++            Ok(()) => Ok(directory),
++        }
+     }
+ 
+     /// The directory the consumer named or the platform's default.

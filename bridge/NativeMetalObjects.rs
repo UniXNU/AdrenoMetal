@@ -891,6 +891,29 @@ pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const 
     })
 }
 
+/// `heapTextureSizeAndAlignWithDescriptor:`: the bytes the texture takes of a heap and the alignment of its offset, into `out[0]` and
+/// `out[1]`; false, with the reason, for a descriptor the runtime refuses.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_texture_size_and_align(device: *const NmbDevice, descriptor: *const NmbTextureDescriptor, out: *mut u64) -> bool {
+    guard(false, || {
+        let answer = get(device)?.0.heap_texture_size_and_align(&texture_descriptor(descriptor)?).map_err(e("heap texture size"))?;
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+        Ok(true)
+    })
+}
+
+/// `heapBufferSizeAndAlignWithLength:options:`, as `nmb_device_heap_texture_size_and_align` answers a texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_heap_buffer_size_and_align(device: *const NmbDevice, length: u64, options_word: u64, out: *mut u64) -> bool {
+    guard(false, || {
+        let answer = get(device)?.0.heap_buffer_size_and_align(length, options(options_word)?);
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2) };
+        (out[0], out[1]) = (answer.size, answer.align);
+        Ok(true)
+    })
+}
+
 // ---- textures ----
 
 #[repr(C)]

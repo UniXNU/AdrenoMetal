@@ -1,0 +1,116 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index de3df1e..a09c1ee 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -51,6 +51,13 @@ use std::sync::Mutex;
+ /// The size of a pooled block, at most the device's `maxMemoryAllocationSize`.
+ pub(super) const BLOCK_BYTES: u64 = 64 << 20;
+ 
++/// The first pooled block of a pool: later ones grow with the pool ([`Memory::next_block_bytes`]),
++/// doubling it up to [`BLOCK_BYTES`]. Where device memory is the system's own and every block is
++/// wired as it is made (a guest whose GPU imports its pages), a process with a few small resources
++/// otherwise held a 64 MiB block in each of its pools: 256-640 MiB each, 2 GiB in all at an iPadOS
++/// guest's home screen.
++pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
++
+ /// What memory a resource needs.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub(super) enum MemoryClass {
+@@ -328,6 +335,14 @@ impl<T> Pool<T> {
+         }
+     }
+ 
++    /// The bytes of its pooled blocks.
++    pub(super) fn pooled_bytes(&self) -> u64 {
++        (self.blocks.iter().flatten())
++            .filter(|block| !block.dedicated)
++            .map(|block| block.ranges.len())
++            .sum()
++    }
++
+     /// Whether a pooled block has room for `size` bytes at the largest alignment asked of the
+     /// pool so far.
+     pub(super) fn has_room(&self, size: u64) -> bool {
+@@ -821,6 +836,17 @@ impl Memory {
+             .add(size, dedicated, block, used)
+     }
+ 
++    /// The size of the next pooled block of `pool` for a placement of `size` bytes: as many bytes
++    /// as its pooled blocks have (the pool doubles), at least [`FIRST_BLOCK_BYTES`] and the
++    /// placement's next power of two, at most [`BLOCK_BYTES`] (or the device's largest
++    /// allocation).
++    fn next_block_bytes(&self, pool: (Holds, u32), size: u64) -> u64 {
++        let have = self.pool_ref(pool.0, pool.1).pooled_bytes();
++        (have.max(FIRST_BLOCK_BYTES).max(size.next_power_of_two()))
++            .min(self.block_bytes)
++            .max(size)
++    }
++
+     /// What making a block takes, copied out so that the block is made with the memory's lock
+     /// released ([`place`], [`keep_room`]).
+     fn maker(&self) -> BlockMaker {
+@@ -1374,10 +1400,10 @@ fn place(
+         return Err(Error::OutOfMemory(MemoryKind::Device));
+     }
+     let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
+-    let block_size = if dedicated { size } else { maker.block_bytes };
+     let mut failure = Error::OutOfMemory(MemoryKind::Device);
+     for type_index in candidates {
+         let pool = (holds, type_index);
++        let block_size = if dedicated { size } else { lock(memory).next_block_bytes(pool, size) };
+         if fit == Fit::Pooled {
+             if let Some(placement) =
+                 lock(memory).place_pooled(device, pool, size, align, addressed)?
+@@ -1411,27 +1437,26 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+         let Ok(kept) = memory.kept(device) else {
+             return;
+         };
+-        let room = memory.block_bytes / 2;
+-        let lacking: Vec<(Holds, u32)> = (kept.into_iter())
+-            .filter(|&(holds, type_index)| !memory.pool_ref(holds, type_index).has_room(room))
++        // Room for half of the pool's next block: a growing pool keeps room for what its blocks
++        // have held, rather than half of the largest block from its first encoding on.
++        let lacking: Vec<((Holds, u32), u64)> = (kept.into_iter())
++            .map(|pool| (pool, memory.next_block_bytes(pool, 1)))
++            .filter(|&((holds, type_index), bytes)| !memory.pool_ref(holds, type_index).has_room(bytes / 2))
+             .collect();
+         (lacking, memory.maker())
+     };
+-    for pool in lacking {
++    for (pool, bytes) in lacking {
+         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
+-        let Ok(block) = maker.make(device, pool.1, maker.block_bytes, addressed) else {
++        let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
+             continue;
+         };
+         let mut memory = lock(memory);
+-        if memory
+-            .pool_ref(pool.0, pool.1)
+-            .has_room(maker.block_bytes / 2)
+-        {
++        if memory.pool_ref(pool.0, pool.1).has_room(bytes / 2) {
+             drop(memory);
+             // SAFETY: nothing is placed in the block, which no command reads.
+             unsafe { block.release(device) };
+             continue;
+         }
+-        memory.add_block(pool, block, maker.block_bytes, false, 0);
++        memory.add_block(pool, block, bytes, false, 0);
+     }
+ }
+diff --git a/crates/metal2vulkan-runtime/src/range.rs b/crates/metal2vulkan-runtime/src/range.rs
+index 5c32bef..54855d5 100644
+--- a/crates/metal2vulkan-runtime/src/range.rs
++++ b/crates/metal2vulkan-runtime/src/range.rs
+@@ -111,6 +111,11 @@ impl RangeAllocator {
+         self.free.insert(start, size);
+     }
+ 
++    /// The bytes of `[base, end)`.
++    pub(super) fn len(&self) -> u64 {
++        self.end - self.base
++    }
++
+     /// Whether nothing is allocated.
+     pub(super) fn is_empty(&self) -> bool {
+         self.free.len() == 1 && self.free.get(&self.base) == Some(&(self.end - self.base))
