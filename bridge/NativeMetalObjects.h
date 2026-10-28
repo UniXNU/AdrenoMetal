@@ -159,6 +159,12 @@ struct NmbRenderPipelineDescriptor {
         uint64_t tessellates, max_factor, partition_mode, factor_format, factor_step_function, output_winding, control_point_index_type,
             factor_scale_enabled;
     } tessellation;
+    /* vertexLinkedFunctions / fragmentLinkedFunctions .functions and .privateFunctions: visible functions each stage calls (RenderBox's
+     * custom_blend fragment functions call theirs this way). Zero counts: none. */
+    NmbFunction *const *vertex_linked; uint64_t vertex_linked_count;
+    NmbFunction *const *vertex_private_linked; uint64_t vertex_private_linked_count;
+    NmbFunction *const *fragment_linked; uint64_t fragment_linked_count;
+    NmbFunction *const *fragment_private_linked; uint64_t fragment_private_linked_count;
 };
 NmbRenderPipeline *nmb_render_pipeline_new(NmbDevice *, const struct NmbRenderPipelineDescriptor *);
 /* Descriptor binaryArchives and MTLPipelineOption bits. NULL options means defaults.

@@ -1475,6 +1475,14 @@ pub struct NmbRenderPipelineDescriptor {
     pub attributes: [NmbVertexAttribute; 31],
     pub layouts: [NmbVertexLayout; 31],
     pub tessellation: NmbTessellation,
+    pub vertex_linked: *const *mut NmbFunction,
+    pub vertex_linked_count: u64,
+    pub vertex_private_linked: *const *mut NmbFunction,
+    pub vertex_private_linked_count: u64,
+    pub fragment_linked: *const *mut NmbFunction,
+    pub fragment_linked_count: u64,
+    pub fragment_private_linked: *const *mut NmbFunction,
+    pub fragment_private_linked_count: u64,
 }
 
 /// A post-tessellation vertex function's state; `tessellates` 0 leaves the descriptor's tessellation unset.
@@ -1541,9 +1549,20 @@ pub unsafe extern "C" fn nmb_render_pipeline_new_with_options(device: *mut NmbDe
 
 fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<RenderPipelineDescriptor, String> {
         let d = get(descriptor)?;
-        let mut out = RenderPipelineDescriptor::new(StageSource::Function(get(d.vertex)?.0.function_descriptor()));
+        // Each stage's linked functions ride on its function descriptor, as the compute pipeline's do (compute_descriptor).
+        let stage_linked = |functions, count, private, private_count| -> Result<LinkedFunctions, String> {
+            let mut linked = LinkedFunctions::new();
+            linked.functions = linked_list(functions, count)?;
+            linked.private_functions = linked_list(private, private_count)?;
+            Ok(linked)
+        };
+        let vertex = get(d.vertex)?.0.function_descriptor()
+            .with_linked(stage_linked(d.vertex_linked, d.vertex_linked_count, d.vertex_private_linked, d.vertex_private_linked_count)?);
+        let mut out = RenderPipelineDescriptor::new(StageSource::Function(vertex));
         if !d.fragment.is_null() {
-            out.fragment = Some(StageSource::Function(get(d.fragment)?.0.function_descriptor()));
+            let fragment = get(d.fragment)?.0.function_descriptor().with_linked(stage_linked(
+                d.fragment_linked, d.fragment_linked_count, d.fragment_private_linked, d.fragment_private_linked_count)?);
+            out.fragment = Some(StageSource::Function(fragment));
         }
         for (slot, c) in out.color_attachments.iter_mut().zip(d.colors.iter()) {
             if c.format == 0 {

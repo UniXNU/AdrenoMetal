@@ -368,13 +368,29 @@ static char gLastProblems[2][200];
 static char gFirstProblem[200];
 // Called once with the first problem, on the thread that hit it: a polling reader missed WidgetRenderer's, which crashed within its first second.
 void (*native_bridge_metal_problem_hook)(const char *);
+// Shader priming's thread: its refusals (a vertex function primed without the vertex descriptor its app gives it) are counted, not
+// reported, so the first problem and the last ones stay the clients' own.
+static thread_local bool tQuietProblems;
+extern "C" void native_bridge_metal_quiet_problems(bool quiet) {tQuietProblems=quiet;}
+// Notes every process makes and that change nothing it draws: they must not stand in the one line a client's failure is reported on.
+static bool harmlessProblem(NSString *what) {
+ for(NSString *prefix in @[@"native-metal: no device answer",@"native-metal: setGPUPriority",@"native-metal: setBackgroundGPUPriority",
+                           @"native-metal: binary archive refused",@"native-metal: texture layouts are"])
+  if([what hasPrefix:prefix])return true;
+ return false;
+}
 static void noteProblem(NSString *what) {
  gProblems++;
+ if(tQuietProblems)return;
  std::lock_guard<std::mutex> lock(gProblemLock);
- // A device answer the runtime lacks is reported at creation in every process and is harmless: the first problem is the next one.
- if(!gFirstProblem[0] && ![what hasPrefix:@"native-metal: no device answer"]) {
-  strlcpy(gFirstProblem,what.UTF8String?:"?",sizeof gFirstProblem);
-  if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
+ // The client's line shows its latest real problem (a later failure is what ends a process; the first one was often a harmless note).
+ if(!harmlessProblem(what)) {
+  char line[sizeof gFirstProblem];
+  strlcpy(line,what.UTF8String?:"?",sizeof line);
+  if(strcmp(line,gFirstProblem)) {
+   memcpy(gFirstProblem,line,sizeof line);
+   if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
+  }
  }
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
@@ -639,7 +655,15 @@ static NSMethodSignature *missingSignature(id self,SEL selector) {
  noteProblem([NSString stringWithFormat:@"missing %s (answered nil)",key.c_str()]);
  return [NSMethodSignature signatureWithObjCTypes:"@@:"];
 }
-static void answerMissing(NSInvocation *invocation) {void *zero=nullptr;[invocation setReturnValue:&zero];}
+// The objects declare their Metal protocols, so a selector they lack can come with the protocol's own signature: a void method takes
+// no return value (setting one traps in NSInvocation, SpringBoard crashed at launch) and a struct or double is answered with zeroes
+// of its own size.
+static void answerMissing(NSInvocation *invocation) {
+ const NSUInteger length=invocation.methodSignature.methodReturnLength;
+ if(!length)return;
+ alignas(16) unsigned char zero[256]={};
+ if(length<=sizeof zero)[invocation setReturnValue:zero];
+}
 
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
@@ -651,6 +675,8 @@ static void answerMissing(NSInvocation *invocation) {void *zero=nullptr;[invocat
  return signature?signature:missingSignature(self,selector);
 }
 - (void)forwardInvocation:(NSInvocation *)invocation {answerMissing(invocation);}
+// SPI that attributes a resource's memory to another process (iPadOS 27 QuartzCore sends it for every buffer and texture). Nothing to attribute.
+- (void)setResponsibleProcess:(int)pid {(void)pid;}
 @end
 
 // ---- resources ----
@@ -2812,11 +2838,31 @@ static void journalRenderPipeline(MTLRenderPipelineDescriptor *d,uint64_t began,
  journal(line);
 }
 // A render pipeline descriptor in the bridge's form; false, with the error, for a function of another device.
-static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NmbRenderPipelineDescriptor *p,NSError **error) {
+// A render descriptor with the storage its linked-function arrays point into (it outlives every call that reads the descriptor).
+struct NBRenderDescriptor : NmbRenderPipelineDescriptor {std::vector<NmbFunction *> linked[4];};
+static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFunction *> &out);
+static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *p,NSError **error) {
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
   if(error)*error=nbError(@"foreign function");return false;
  }
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
+ // Each stage's visible functions (MTLRenderPipelineDescriptor vertexLinkedFunctions/fragmentLinkedFunctions): RenderBox's fragment
+ // functions call custom_blend through them; without them the runtime refused the pipeline (MissingInput LinkedFunction) and the render
+ // server aborted in CA::OGL::MetalContext::create_pipeline_state.
+ MTLLinkedFunctions *stages[2]={d.vertexLinkedFunctions,d.fragmentLinkedFunctions};
+ for(unsigned stage=0;stage<2;++stage) {
+  MTLLinkedFunctions *linked=stages[stage];
+  if(linked.binaryFunctions.count || linked.groups.count) {
+   if(error)*error=nbError(@"render binary/grouped linked functions are not implemented");return false;
+  }
+  if(!linkedHandles(linked.functions,p->linked[stage*2]) || !linkedHandles(linked.privateFunctions,p->linked[stage*2+1])) {
+   if(error)*error=nbError(@"foreign linked function");return false;
+  }
+ }
+ p->vertex_linked=p->linked[0].data();p->vertex_linked_count=p->linked[0].size();
+ p->vertex_private_linked=p->linked[1].data();p->vertex_private_linked_count=p->linked[1].size();
+ p->fragment_linked=p->linked[2].data();p->fragment_linked_count=p->linked[2].size();
+ p->fragment_private_linked=p->linked[3].data();p->fragment_private_linked_count=p->linked[3].size();
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];
   p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
@@ -3208,7 +3254,15 @@ static char dvmMemoryReleaseKey;
 - (id<MTLTexture>)textureWithDescriptor:(MTLTextureDescriptor *)d offset:(uint64_t)offset {
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_heap_new_texture(_handle,&descriptor,offset);
- if(!handle){NBLOG(@"native-metal: heap texture refused: %@",lastError());return nil;}
+ // An automatic heap promises its textures no shared memory, only a place: one the heap cannot take is made on its own, so the caller
+ // (Core Image's intermediate images, iconservicesagent, i-33765e1ad) gets a texture instead of nil, which it dereferenced. A placement
+ // heap's texture aliases the memory at its offset; that one stays refused.
+ if(!handle) {
+  NBLOG(@"native-metal: heap texture refused: %@",lastError());
+  if(offset!=UINT64_MAX)return nil;
+  handle=nmb_texture_new(gDevice,&descriptor);
+  if(!handle){NBLOG(@"native-metal: texture refused: %@",lastError());return nil;}
+ }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
@@ -3278,7 +3332,7 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
 - (void)dealloc {nmb_binary_archive_release(_handle);}
 - (NSUInteger)options {return 0;}
 - (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
- auto *p=new NmbRenderPipelineDescriptor();
+ auto *p=new NBRenderDescriptor();
  const bool ok=renderDescriptor(d,p,error) && nmb_binary_archive_add_render(_handle,p);delete p;
  if(!ok)return failWith<BOOL>(error,@"archive render pipeline",NO);
  if(error)*error=nil;return YES;
@@ -3318,6 +3372,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 // A texture over a buffer starts where a linear texture may: the texel-buffer alignment the runtime answers for the linear one.
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
+}
+// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
+// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
+ return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
 }
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
@@ -3370,6 +3429,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbEvent *handle=nmb_event_new(gDevice,true);if(!handle)return nil;
  NBSharedEvent *event=[NBSharedEvent new];event.handle=handle;return (id<MTLSharedEvent>)event;
 }
+// The options only choose Apple's event storage; the event is the same.
+- (id<MTLSharedEvent>)newSharedEventWithOptions:(NSUInteger)options {(void)options;return [(id<MTLDevice>)self newSharedEvent];}
 - (id<MTLFence>)newFence {
  NmbFence *handle=nmb_fence_new(gDevice);if(!handle)return nil;
  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
@@ -3635,13 +3696,24 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
+// iPadOS 27's QuartzCore builds its backdrop compute pipelines (Liquid Glass luma, backdrop capture) with this short form: unanswered, the
+// render server got nil and aborted with "Metal failed to build compute pipeline" on the first backdrop (a respring).
+- (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
+ return [(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
+}
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
+                            completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler {
+ NSError *error=nil;MTLComputePipelineReflection *reflection=nil;
+ id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
+ handler(state,reflection,error);
+}
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
  return [(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
 }
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
                                                         reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- auto *p=new NmbRenderPipelineDescriptor();
+ auto *p=new NBRenderDescriptor();
  if(!renderDescriptor(d,p,error)) {
   static std::atomic<int> told{0};
   if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline descriptor refused (vertex %@, fragment %@): %@",d.vertexFunction.name,
