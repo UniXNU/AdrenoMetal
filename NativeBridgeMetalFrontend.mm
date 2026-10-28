@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <sys/mman.h>
 #include <CommonCrypto/CommonDigest.h>
@@ -309,16 +310,29 @@ static void journal(const std::string &line) {
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
 
+// A selector this file lacks (iPadOS 27's QuartzCore sends setResponsibleTaskIDs:count: to every command buffer, which 17 never did): answered
+// once as a no-op returning nil/0, and noted once, instead of the NSInvalidArgumentException that ended the render server. respondsToSelector:
+// still answers NO, so a caller that asks first keeps its own fallback.
+static NSMethodSignature *missingSignature(id self,SEL selector) {
+ static std::mutex lock;static std::unordered_set<std::string> seen;
+ std::string key=std::string(class_getName(object_getClass(self)))+" "+sel_getName(selector);
+ {std::lock_guard<std::mutex> hold(lock);if(!seen.insert(key).second)return [NSMethodSignature signatureWithObjCTypes:"@@:"];}
+ if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
+ noteProblem([NSString stringWithFormat:@"missing %s (answered nil)",key.c_str()]);
+ return [NSMethodSignature signatureWithObjCTypes:"@@:"];
+}
+static void answerMissing(NSInvocation *invocation) {void *zero=nullptr;[invocation setReturnValue:&zero];}
+
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 @end
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
-- (void)doesNotRecognizeSelector:(SEL)selector {
- if(gMissing)gMissing(class_getName(object_getClass(self)),sel_getName(selector));
- noteProblem([NSString stringWithFormat:@"missing %s %s",class_getName(object_getClass(self)),sel_getName(selector)]);
- [super doesNotRecognizeSelector:selector];
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ NSMethodSignature *signature=[super methodSignatureForSelector:selector];
+ return signature?signature:missingSignature(self,selector);
 }
+- (void)forwardInvocation:(NSInvocation *)invocation {answerMissing(invocation);}
 @end
 
 // ---- resources ----
@@ -480,8 +494,17 @@ NB_RESOURCE_SPI
 // owners keep the mapping live through this phase. Maintain each exact CPU
 // range once; no address identity or decision is carried into another phase
 // or command, and distinct/partially overlapping ranges retain their calls.
+// iPadOS 27's sys_dcache_flush is a barrier alone (dsb ish; ret): the call did no maintenance, while finding each surface's base address
+// (IOSurfaceGetBaseAddress maps it into the task the first time) and sorting the ranges cost CPU on every commit and completion. The
+// kernel keeps imports right without it: read-only ones are mapped coherent, GPU-written ones are cleaned and invalidated when mapped and
+// unmapped, and write-combined surfaces hold no line at all.
+#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && __IPHONE_OS_VERSION_MIN_REQUIRED >= 270000
+static constexpr bool kSurfaceFlush=false;
+#else
+static constexpr bool kSurfaceFlush=true;
+#endif
 static void flushSurfaces(NSMutableSet *surfaces) {
- if(!surfaces.count)return;
+ if(!kSurfaceFlush || !surfaces.count)return;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
  for(NBTexture *texture in surfaces)if(texture.surface)
@@ -528,12 +551,16 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 // ---- libraries, functions, states ----
 @interface NBLibrary : NBObject
 @property(nonatomic) NmbLibrary *handle;
+- (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
+                                    error:(NSError **)error;
 @end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
+@property(nonatomic,strong) NBLibrary *library;      // where it came from, and the values it was specialized with (nil: none), for
+@property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // the zero-rest rebuild of a refused pipeline
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
@@ -576,6 +603,13 @@ static std::string quartzCoreCallers();
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
+ return [self nb_newFunctionWithName:name constantValues:values zeroRest:NO error:error];
+}
+// zeroRest: every constant the function declares that values leaves out is zero (nmb_function_new_specialized_zero_rest); only for the
+// retry of a pipeline the runtime refused because such a constant had no value.
+- (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
+                                    error:(NSError **)error {
+ if(!values)values=[MTLFunctionConstantValues new];
  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
   if(error)*error=nbError(@"unqualified function constant values");return nil;
  }
@@ -599,7 +633,8 @@ static std::string quartzCoreCallers();
   for(uint64_t i=0;i<c.length;i++){snprintf(head,sizeof head,"%02x",((const uint8_t *)c.bytes)[i]);text+=head;}
  }
  const uint64_t functionBegan=nowUs();
- NmbFunction *handle=nmb_function_new_specialized(_handle,name.UTF8String,constants.data(),(uint32_t)constants.size());gTimeFunction.add(functionBegan);
+ NmbFunction *handle=(zeroRest?nmb_function_new_specialized_zero_rest:nmb_function_new_specialized)(_handle,name.UTF8String,constants.data(),
+     (uint32_t)constants.size());gTimeFunction.add(functionBegan);
  // One S line per specialization (int-155: every QuartzCore pipeline was made on its draw, and a refused generic function would leave its
  // generic pipeline unmade without a word): the function, its constants, the time, the refusal and QuartzCore's callers.
  if(!gJournalPath.empty()) {
@@ -612,7 +647,7 @@ static std::string quartzCoreCallers();
   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- function.constantsText=text;if(error)*error=nil;return (id<MTLFunction>)function;
+ function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
  NSError *error=nil;id<MTLFunction> function=[self newFunctionWithName:name constantValues:values error:&error];
@@ -640,7 +675,7 @@ static std::string quartzCoreCallers();
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
- return (id<MTLFunction>)function;
+ function.library=self;return (id<MTLFunction>)function;
 }
 // Shader priming (PrimeShaders.h): the function with each of its function constants set to zero, or nil.
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
@@ -1025,6 +1060,8 @@ static bool onRenderServerThread() {
 }
 extern "C" void NBWaitInFlight(uint64_t beforeUs);
 @implementation NBCommandBuffer
+// iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
+- (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
  if(self){createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
@@ -1488,6 +1525,16 @@ static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFun
  return true;
 }
 
+// A refused pipeline's function again with every constant it declares and was not given set to zero (nil: not the reason, or no
+// library). Counted in gZeroRest.
+static unsigned gZeroRest;
+static NBFunction *zeroRestFunction(NBFunction *f) {
+ NSString *why=lastError();
+ if(!f.library || ![why containsString:@"FunctionConstant"])return nil;
+ NBFunction *rebuilt=(NBFunction *)[f.library nb_newFunctionWithName:f.name constantValues:f.constantValues zeroRest:YES error:nil];
+ if(rebuilt)gZeroRest++;
+ return rebuilt;
+}
 // The handles `p` points at live in `linked` and `privateLinked`, which outlive its use.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,std::vector<NmbFunction *> &linkedStore,
                               std::vector<NmbFunction *> &privateStore,NSError **error) {
@@ -1584,11 +1631,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))NBLOG(@"native-metal: maxThreadsPerThreadgroup: %@",lastError());
  return MTLSizeMake(s[0],s[1],s[2]);
 }
-- (void)doesNotRecognizeSelector:(SEL)selector {
- if(gMissing)gMissing("NativeBridgeMetalDevice",sel_getName(selector));
- noteProblem([NSString stringWithFormat:@"missing device %s",sel_getName(selector)]);
- [super doesNotRecognizeSelector:selector];
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
+ NSMethodSignature *signature=[super methodSignatureForSelector:selector];
+ return signature?signature:missingSignature(self,selector);
 }
+- (void)forwardInvocation:(NSInvocation *)invocation {answerMissing(invocation);}
 - (id<MTLEvent>)newEvent {
  NmbEvent *handle=nmb_event_new(gDevice,false);if(!handle)return nil;
  NBEvent *event=[NBEvent new];event.handle=handle;return (id<MTLEvent>)event;
@@ -1710,8 +1757,14 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
- NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);gTimePipeline.add(pipelineBegan);
- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);
+ if(!handle)if(NBFunction *rebuilt=zeroRestFunction((NBFunction *)function))handle=nmb_compute_pipeline_new_with_options(gDevice,rebuilt.handle,&creation);
+ gTimePipeline.add(pipelineBegan);
+ if(!handle) {
+  NBFunction *f=(NBFunction *)function;
+  noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
+  return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ }
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
@@ -1723,8 +1776,18 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();
- NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);gTimePipeline.add(pipelineBegan);
- if(!handle)return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ NmbComputePipeline *handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);
+ // Metal builds a kernel that reads a constant nobody set; the runtime refuses it: once more with those constants zero.
+ if(!handle) {
+  NBFunction *rebuilt=zeroRestFunction((NBFunction *)d.computeFunction);
+  if(rebuilt){p.function=rebuilt.handle;handle=nmb_compute_pipeline_new_with_descriptor(gDevice,&p,&creation);}
+ }
+ gTimePipeline.add(pipelineBegan);
+ if(!handle) {
+  NBFunction *f=(NBFunction *)d.computeFunction;
+  noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
+  return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
+ }
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;state.label=d.label;gPipelines++;
  if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
@@ -1858,8 +1921,13 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(getenv("NMB_DEVICE_BASE_NSOBJECT"))base=[NSObject class];
 #endif
 #if TARGET_OS_IPHONE
- // The target's base class ABI (iPadOS 17.7.11): the dynamic subclass adds no instance variables.
+ // The target's base class ABI (iPadOS 17.7.11, 536 bytes): the dynamic subclass adds no instance variables and reads none of the base's,
+ // so only 17's size is held to; the arm64e build (iPadOS 27, whose _MTLDevice is larger) needs the class to exist.
+#if defined(__arm64e__)
+ if(!base){NBLOG(@"native-metal: no _MTLDevice");return nil;}
+#else
  if(!base || class_getInstanceSize(base)!=536){NBLOG(@"native-metal: unexpected _MTLDevice ABI");return nil;}
+#endif
 #endif
  if(!base)base=[NSObject class];
  Class cls=objc_allocateClassPair(base,"NativeBridgeMetalDevice",0);if(!cls)return nil;

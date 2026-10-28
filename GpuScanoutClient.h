@@ -10,7 +10,6 @@
 #include <stdint.h>
 #include <unistd.h>
 #include "GpuScanoutPresenter.h"
-#include "../NativeMobileDisplay/NativeGOPWire.h"
 
 extern "C" void NBWaitInFlight(uint64_t beforeUs) __attribute__((weak_import));
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) __attribute__((weak_import));
@@ -92,7 +91,7 @@ public:
         if (NBWaitInFlight) NBWaitInFlight(offeredUs);
         const uint64_t began = mach_absolute_time();
         const gpupresent::Result r = presenter_->present({(const void *)(uintptr_t)swap.address, (size_t)((swap.bytes + page - 1) & ~(page - 1)),
-                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved});
+                                                          (size_t)swap.stride, swap.width, swap.height, swap.reserved, swap.format});
         {
             static mach_timebase_info_data_t base;
             if (!base.denom) mach_timebase_info(&base);
@@ -100,7 +99,7 @@ public:
             stats_->totalMs += stats_->lastMs;
         }
         stats_->lastResult = (int)r;
-        if (r == gpupresent::kOk && stats_->verified < 4) verify(swap);
+        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
         note(0x6731);   // the GPU copy returned
         const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};

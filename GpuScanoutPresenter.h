@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 // GPU presentation: the GPU copies a finished BGRA frame (the compositor's IOSurface pages) into the firmware scanout memory. Both are
 // imported without a copy (newBufferWithBytesNoCopy: pinned by the kernel and mapped into the GPU's 4 KiB context), the copy is a blit on
-// the GPU's queue, and the call returns after the GPU retired it. No CPU touches a pixel; there is no staging copy and no software fallback
+// the GPU's queue, and the call returns after the GPU retired it. A half-float frame (RGBA 16F, what iPadOS 27's render server draws
+// once a Metal device renders) is converted by a compute kernel (shaders/scanout_convert.ll) through the display driver's own table of
+// codes (NativeHalfCodes.h), so the bytes match its CPU path. No CPU touches a pixel; there is no staging copy and no software fallback
 // here. Used through the public Metal API, on any device (the native frontend on the tablet, the Mac's device for the host check).
 #pragma once
 #import <Metal/Metal.h>
@@ -9,6 +11,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <atomic>
+#include "../GopFramebuffer/NativeGOPWire.h"
+#include "../GopFramebuffer/NativeHalfCodes.h"
+
+// The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
+extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
+extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
 
 namespace gpupresent {
 
@@ -28,6 +36,7 @@ struct Frame {
     size_t stride;
     uint32_t width, height;
     uint32_t mapping; // the kernel's id for this mapping of the surface (0: none, imported for this frame only)
+    uint32_t format;  // NGP_BGRX8888, NGP_RGBA16F_LINEAR or NGP_RGBA16F_ENCODED
 };
 
 enum Result { kOk = 0, kBadFrame, kBadScanout, kNoResource, kGpuFailed };
@@ -43,6 +52,8 @@ public:
     // One frame: encodes the GPU copy, commits, waits for the GPU. Rows are copied as whole rows of width*4 bytes.
     Result present(const Frame &frame) {
         if (!ready()) return kBadScanout;
+        if (frame.format == NGP_RGBA16F_LINEAR || frame.format == NGP_RGBA16F_ENCODED) return convert(frame);
+        if (frame.format != NGP_BGRX8888) return kBadFrame;
         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
@@ -78,6 +89,57 @@ public:
         [commands waitUntilCompleted];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
+    // A half-float frame: one thread per pixel, 16 x 8 threads a group (the kernel skips threads past the edges).
+    Result convert(const Frame &frame) {
+        const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 8;
+        if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
+            frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row || (frame.stride & 3) ||
+            (scanout_.stride & 3) || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
+        const bool encoded = frame.format == NGP_RGBA16F_ENCODED;
+        if (!convertPipeline() || !table(encoded)) return kNoResource;
+        id<MTLBuffer> source = sourceFor(frame);
+        if (!source) return kNoResource;
+        id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
+        if (!encoder) return kNoResource;
+        const uint32_t params[4] = {frame.width, frame.height, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+        [encoder setComputePipelineState:convert_];
+        [encoder setBuffer:source offset:0 atIndex:0];
+        [encoder setBuffer:target_ offset:0 atIndex:1];
+        [encoder setBuffer:tables_[encoded] offset:0 atIndex:2];
+        [encoder setBytes:params length:sizeof params atIndex:3];
+        [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (frame.height + 7) / 8, 1)
+                threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+        [encoder endEncoding];
+        [commands commit];
+        [commands waitUntilCompleted];
+        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+    }
+    // Made once; a failure is not retried (every later half-float frame then goes back to the display driver's own path).
+    bool convertPipeline() {
+        if (convert_ || convertFailed_) return convert_ != nil;
+        convertFailed_ = true;
+        if (!nmb_scanout_convert_air || !native_bridge_metal_library_with_air) return false;
+        size_t length = 0;
+        const void *air = nmb_scanout_convert_air(&length);
+        id<MTLLibrary> library = air && length ? native_bridge_metal_library_with_air(air, length) : nil;
+        id<MTLFunction> function = [library newFunctionWithName:@"scanout_convert"];
+        NSError *error = nil;
+        convert_ = function ? [device_ newComputePipelineStateWithFunction:function error:&error] : nil;
+        if (convert_ && convert_.maxTotalThreadsPerThreadgroup < 128) convert_ = nil;
+        convertFailed_ = convert_ == nil;
+        return convert_ != nil;
+    }
+    // The 8-bit code of every 16-bit half pattern, as 32-bit words (65536 of them, 256 KiB).
+    id<MTLBuffer> table(bool encoded) {
+        if (tables_[encoded]) return tables_[encoded];
+        id<MTLBuffer> buffer = [device_ newBufferWithLength:65536 * sizeof(uint32_t) options:MTLResourceStorageModeShared];
+        if (!buffer) return nil;
+        uint32_t *codes = (uint32_t *)buffer.contents;
+        for (uint32_t bits = 0; bits < 65536; ++bits) codes[bits] = native_half::code((uint16_t)bits, encoded);
+        tables_[encoded] = buffer;
+        return buffer;
+    }
 private:
     // The compositor cycles through a few surfaces and the kernel keeps each one's mapping under one id, so the GPU import (pinning and
     // mapping the pages, milliseconds per frame otherwise) is made once per surface. The kernel keeps more mappings (6) than kSources, so
@@ -107,6 +169,9 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
+    id<MTLComputePipelineState> convert_ = nil;
+    bool convertFailed_ = false;
+    id<MTLBuffer> tables_[2] = {nil, nil};
     Source sources_[kSources] = {};
     uint64_t uses_ = 0;
 };

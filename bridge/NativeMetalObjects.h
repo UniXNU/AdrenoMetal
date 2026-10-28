@@ -30,6 +30,8 @@ typedef struct NmbFence NmbFence;
 const char *nmb_last_error(void);
 /* The bridge's embedded AIR fixtures: the runtime's own runtime_examples and kernel_function_constant_gate_fold. */
 const void *nmb_fixture_air(size_t *length);
+// The GPU scanout's half-float conversion kernel as AIR bitcode (GpuScanoutPresenter.h).
+const void *nmb_scanout_convert_air(size_t *length);
 const void *nmb_function_constant_air(size_t *length);
 
 /* loader: a library exporting vkGetInstanceProcAddr (Turnip on the tablet). cache: a writable directory for translated shaders. */
@@ -122,6 +124,8 @@ struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; u
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 // The library's function with every function constant it declares set to zero (shader priming), or null.
 NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+/* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
+NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);

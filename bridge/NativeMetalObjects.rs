@@ -113,6 +113,20 @@ pub extern "C" fn nmb_last_error() -> *const c_char {
     })
 }
 
+/// The GPU scanout's half-float conversion kernel (shaders/scanout_convert.ll), assembled to AIR at build time.
+static SCANOUT_CONVERT_AIR: &[u8] = include_bytes!(env!("NMB_SCANOUT_AIR"));
+
+/// # Safety
+/// `length` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_scanout_convert_air(length: *mut usize) -> *const c_void {
+    // SAFETY: the caller's contract.
+    if let Some(length) = unsafe { length.as_mut() } {
+        *length = SCANOUT_CONVERT_AIR.len();
+    }
+    SCANOUT_CONVERT_AIR.as_ptr() as *const c_void
+}
+
 /// The runtime's kernel_function_constant_gate_fold fixture, assembled to AIR at build time.
 static FUNCTION_CONSTANT_AIR: &[u8] = include_bytes!(env!("NMB_FC_AIR"));
 
@@ -1017,6 +1031,25 @@ pub struct NmbConstant {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, name: *const c_char, constants: *const NmbConstant,
                                                       count: u32) -> *mut NmbFunction {
+    // SAFETY: the caller's contract.
+    unsafe { specialized(library, name, constants, count, false) }
+}
+
+/// The same with every declared constant the caller did not give a value set to zero (false for a bool). Metal accepts a function
+/// whose code reads a constant nobody set; the translator needs a value (`NeedsInput(FunctionConstant)`), and zero is what such a
+/// read yields there. The frontend retries a pipeline with this variant only after the specialized one was refused for that reason.
+///
+/// # Safety
+/// As for `nmb_function_new_specialized`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_specialized_zero_rest(library: *mut NmbLibrary, name: *const c_char,
+                                                                constants: *const NmbConstant, count: u32) -> *mut NmbFunction {
+    // SAFETY: the caller's contract.
+    unsafe { specialized(library, name, constants, count, true) }
+}
+
+unsafe fn specialized(library: *mut NmbLibrary, name: *const c_char, constants: *const NmbConstant, count: u32,
+                      zero_rest: bool) -> *mut NmbFunction {
     guard(std::ptr::null_mut(), || {
         if name.is_null() || (constants.is_null() && count > 0) {
             return Err("null function name or constants".into());
@@ -1038,6 +1071,20 @@ pub unsafe extern "C" fn nmb_function_new_specialized(library: *mut NmbLibrary, 
                 // SAFETY: the caller's contract.
                 let key = unsafe { CStr::from_ptr(c.name) }.to_str().map_err(e("constant name"))?;
                 values.by_name.insert(key.to_string(), value);
+            }
+        }
+        if zero_rest {
+            let generic = get(library)?.0.new_function_with_name(name).map_err(e("function"))?;
+            for (key, constant) in generic.function_constants_dictionary().map_err(e("function constants"))? {
+                if values.by_name.contains_key(&key) || values.by_index.contains_key(&constant.index()) {
+                    continue;
+                }
+                let ty = constant.data_type();
+                let bytes = constant_bytes(ty.as_raw());
+                if bytes == 0 {
+                    return Err(format!("function constant {key} of type {}", ty.as_raw()));
+                }
+                values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, vec![0; bytes]));
             }
         }
         let function = get(library)?.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;

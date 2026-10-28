@@ -5,11 +5,14 @@
 // Published (the image carries the file NativeAdrenoMetal.publish beside the bundle): backboardd, the one process that owns the GPU, returns the native
 // Metal frontend's device (the metal2vulkan runtime on Turnip, on the Adreno 740), which the original discovery registers; the CARenderServer then
 // renders the system UI through it, and the display driver's frames are written to the scanout by the GPU (GpuScanoutClient.h). Another process
-// gets its own native device (its own driver connection, GPU address window and shader cache) when its name is listed in the file
-// NativeAdrenoMetal.clients beside the bundle ("*" lists every process); an unlisted one returns nil and keeps the software renderer.
+// gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
+// own GPU plugin.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
 #include <dlfcn.h>
+#if __has_feature(ptrauth_calls)
+#include <ptrauth.h>
+#endif
 #include <unistd.h>
 #include <pwd.h>
 #include <mach/mach.h>
@@ -109,6 +112,10 @@ static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
     gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
 }
 static void reportDisplayState(Gpu &gpu) {
+#if defined(__arm64e__)
+    (void)gpu;
+    return;   // the addresses above are the 21H461 cache's; the arm64e (iPadOS 27) build must not read or write them
+#endif
     ++gReports;
     static DisplaySample before;
     static bool changed;
@@ -136,27 +143,7 @@ static void reportDisplayState(Gpu &gpu) {
         markSample(gpu, now, 0xA000);
     } @catch (NSException *) {}
 }
-// Whether NativeAdrenoMetal.clients names this process (names separated by blanks, commas or new lines; "*" names every process; a
-// name that ends in "*" names every process whose name starts with it, so "com.apple.WebKit.*" covers the WebContent, Networking
-// and GPU service processes).
-static bool listedClient() {
-    char path[1024];
-    if (!requestedPath("NativeAdrenoMetal.clients", path, sizeof path)) return false;
-    FILE *file = fopen(path, "r");
-    if (!file) return false;
-    char text[1024] = {};
-    const size_t length = fread(text, 1, sizeof text - 1, file);
-    fclose(file);
-    text[length] = 0;
-    const char *self = getprogname();
-    for (char *save = nullptr, *name = strtok_r(text, " ,\t\r\n", &save); name; name = strtok_r(nullptr, " ,\t\r\n", &save)) {
-        if (!strcmp(name, "*") || !strcmp(name, self)) return true;
-        const size_t nameLength = strlen(name);
-        if (nameLength && name[nameLength - 1] == '*' && !strncmp(name, self, nameLength - 1)) return true;
-    }
-    return false;
-}
-// A listed process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
+// Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
@@ -169,7 +156,6 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
     }
 }
 static id clientDevice(unsigned port) {
-    if (!listedClient()) return nil;
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
     uint64_t registryID = 0;
@@ -264,6 +250,19 @@ static id deviceForPort(unsigned port) {
         }
         // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+#if defined(__arm64e__)
+        // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
+        // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
+        // 8-bit BGRA, the headroom is held at 1: the render server's headroom override (CA::WindowServer::Display::edr_headroom reads it
+        // first when nonzero; 24A446 QuartzCore __DATA_DIRTY 0x1e7021014, CARenderServerStart at 0x1846dce88 for the cache slide) and its
+        // environment spelling for an option table read after this.
+        setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
+        if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
+            const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
+            const float one = 1.0f;
+            gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
+        }
+#endif
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
         setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
