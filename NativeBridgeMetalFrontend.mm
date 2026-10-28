@@ -543,6 +543,10 @@ static void shaderCacheWrite(NSString *path,NSData *metallib,NSString *warnings)
  if(![file writeToFile:temporary atomically:NO] || rename(temporary.fileSystemRepresentation,path.fileSystemRepresentation))
   unlink(temporary.fileSystemRepresentation);
 }
+// For refusal texts: the compiler version loaded ("top", "Current", the version directory's number, "none") and stitched libraries made
+// and refused.
+static char gCompilerLoaded[16]="untried";
+static std::atomic<uint32_t> gStitchMade,gStitchFailed;
 static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,NSString **warnings,NSString **failure) {
  static void *service;
  static void (*build)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply);
@@ -573,6 +577,9 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
    }
   }
   if(library && path!=std::string(kFramework)+"/MTLCompiler")NSLog(@"native-metal: Metal compiler loaded from %s",path.c_str());
+  const size_t versions=path.find("/Versions/");
+  strlcpy(gCompilerLoaded,!library?"none":versions==std::string::npos?"top":path.substr(versions+10,path.rfind('/')-versions-10).c_str(),
+          sizeof gCompilerLoaded);
   void *(*create)(const char *)=library?(void *(*)(const char *))dlsym(library,"MTLCodeGenServiceCreate"):nullptr;
   build=library?(void (*)(void *,void *,uint32_t,const void *,size_t,NBCodeGenReply))dlsym(library,"MTLCodeGenServiceBuildRequest"):nullptr;
   service=create && build?create("native-metal"):nullptr;
@@ -3328,7 +3335,15 @@ static char dvmMemoryReleaseKey;
  // (Core Image's intermediate images, iconservicesagent, i-33765e1ad) gets a texture instead of nil, which it dereferenced. A placement
  // heap's texture aliases the memory at its offset; that one stays refused.
  if(!handle) {
-  NBLOG(@"native-metal: heap texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
+  // The tail (what a client's problem row keeps) is the arithmetic: the texture's answered size and alignment against the heap's size,
+  // used size and room at that alignment.
+  NSString *why=lastError();
+  uint64_t answer[2]={0,0};
+  (void)nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer);
+  NBLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
+        (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
+        (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
+        (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
   if(offset!=UINT64_MAX)return nil;
   handle=nmb_texture_new(gDevice,&descriptor);
   if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
@@ -3697,11 +3712,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NSString *warnings=nil,*failure=nil;
  NSData *metallib=codeGenRequest(14,request,&warnings,&failure);
  if(!metallib) {
+  gStitchFailed++;
   NBLOG(@"native-metal: stitched library: %@",[failure substringToIndex:MIN(failure.length,(NSUInteger)300)]);
   noteProblem([@"stitched library: " stringByAppendingString:[failure substringToIndex:MIN(failure.length,(NSUInteger)120)]]);
   if(error)*error=[NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey:failure}];
   return nil;
  }
+ gStitchMade++;
  dispatch_data_t data=dispatch_data_create(metallib.bytes,metallib.length,nullptr,^{(void)metallib;});
  return [(id<MTLDevice>)self newLibraryWithData:data error:error];
 }
@@ -3798,7 +3815,16 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
- if(!handle)return failWith<id<MTLRenderPipelineState>>(error,@"render pipeline",nil);
+ if(!handle) {
+  // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
+  // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
+  NSString *why=[NSString stringWithFormat:@"%@ | frag %@ linked %lu stitched %u/%u compiler %s",lastError(),d.fragmentFunction.name,
+      (unsigned long)d.fragmentLinkedFunctions.functions.count,gStitchMade.load(),gStitchMade.load()+gStitchFailed.load(),gCompilerLoaded];
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline refused: %@",why);else noteProblem([@"render pipeline: " stringByAppendingString:why]);
+  if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);
+  return nil;
+ }
  NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
  if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
  return (id<MTLRenderPipelineState>)state;
