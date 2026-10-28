@@ -1154,7 +1154,7 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @end
 @implementation NBFunction
-- (void)dealloc {nmb_function_release(_handle);}
+- (void)dealloc {if(_handle)nmb_function_release(_handle);}
 // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
 // object, its name and a serial no other function in the process has.
 - (const void *)bitCodeHash {
@@ -1170,8 +1170,8 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
  }
 }
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
-- (MTLPatchType)patchType {return (MTLPatchType)nmb_function_patch_type(_handle);}
-- (NSInteger)patchControlPointCount {return (NSInteger)nmb_function_patch_control_point_count(_handle);}
+- (MTLPatchType)patchType {return _handle?(MTLPatchType)nmb_function_patch_type(_handle):MTLPatchTypeNone;}
+- (NSInteger)patchControlPointCount {return _handle?(NSInteger)nmb_function_patch_control_point_count(_handle):0;}
 @end
 // The target's own accessors of MTLFunctionConstantValues (as the offline frontend reads them); their ABI is checked before any call.
 @interface MTLFunctionConstantValues (NBOriginalConstantAccess)
@@ -1207,6 +1207,13 @@ static uint64_t constantBytes(uint64_t type) {
  }
 }
 static std::string quartzCoreCallers();
+// A Core Image kernel library (metallib file_type 1: ci_stdlib, ci_filters, ci_raw, ci_stdlib_h) lists its kernels as TYPE 5 entries over
+// one shared module. Metal names none of them (functionNames is empty) yet answers newFunctionWithName: and
+// newFunctionWithName:constantValues:error: with a function of functionType 4 (Apple's Metal on macOS 26.5.1 with its own ci_stdlib.metallib:
+// _add, _srcOver). Core Image's DAG path takes its precompiled kernels so (CI::MetalDAGHelper::get_precompiled_kernel) and stitches them;
+// without them create_metal_dag ended in a null program and iconservicesagent crashed in create_program_and_arguments. Such a function has
+// no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
+static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -1216,6 +1223,7 @@ static std::string quartzCoreCallers();
 // retry of a pipeline the runtime refused because such a constant had no value.
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error {
+ if(NBFunction *kernel=ciKernelFunction(self,name)){if(error)*error=nil;return (id<MTLFunction>)kernel;}
  if(!values)values=[MTLFunctionConstantValues new];
  if(!name || !values || !methodABI(values,@selector(newIndexedConstantArray),"@16@0:8") || !methodABI(values,@selector(newNamedConstantArray),"@16@0:8")) {
   if(error)*error=nbError(@"unqualified function constant values");return nil;
@@ -1279,6 +1287,7 @@ static std::string quartzCoreCallers();
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
+ if(NBFunction *kernel=ciKernelFunction(self,name)){gTimeFunction.add(functionBegan);return (id<MTLFunction>)kernel;}
  NmbFunction *handle=name?nmb_function_new(_handle,name.UTF8String):nullptr;gTimeFunction.add(functionBegan);
  if(!handle) {
   static std::atomic<int> told{0};
@@ -1324,6 +1333,35 @@ static NSData *functionBitcode(NBFunction *function) {
   if(name==wanted) {
    if(!sized || !placed || offset>bitcodeSize || bytes>bitcodeSize-offset)return nil;
    return [NSData dataWithBytes:file+bitcodeAt+offset length:(NSUInteger)bytes];
+  }
+  at=end;
+ }
+ return nil;
+}
+static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
+ const uint8_t *file=library.bytes;const size_t length=library.length;const char *wanted=name.UTF8String;
+ if(!file || !wanted || length<88 || memcmp(file,"MTLB",4) || file[10]!=1)return nil;
+ uint64_t listAt;memcpy(&listAt,file+24,8);
+ if(listAt>length-4)return nil;
+ uint32_t count;memcpy(&count,file+listAt,4);
+ size_t at=listAt+4;
+ for(uint32_t i=0;i<count;i++) {
+  uint32_t size;if(at>length-4)return nil;memcpy(&size,file+at,4);
+  if(size<8 || size>length-at)return nil;
+  const size_t end=at+size;
+  std::string entry;int type=-1;
+  for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
+   if(t+6>end)return nil;
+   uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
+   if(n>end-(t+6))return nil;
+   if(!memcmp(file+t,"NAME",4))entry.assign((const char *)v,strnlen((const char *)v,n));
+   else if(!memcmp(file+t,"TYPE",4) && n>=1)type=v[0];
+   t+=6+n;
+  }
+  if(entry==wanted) {
+   if(type!=5)return nil;
+   NBFunction *function=[NBFunction new];function.name=name;function.functionType=(MTLFunctionType)4;function.library=library;
+   return function;
   }
   at=end;
  }
@@ -2942,6 +2980,9 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
  if(![(id)d.vertexFunction isKindOfClass:[NBFunction class]] || (d.fragmentFunction && ![(id)d.fragmentFunction isKindOfClass:[NBFunction class]])) {
   if(error)*error=nbError(@"foreign function");return false;
  }
+ if(![(NBFunction *)d.vertexFunction handle] || (d.fragmentFunction && ![(NBFunction *)d.fragmentFunction handle])) {
+  if(error)*error=nbError(@"a Core Image kernel function is only stitched");return false;
+ }
  p->vertex=[(NBFunction *)d.vertexFunction handle];p->fragment=d.fragmentFunction?[(NBFunction *)d.fragmentFunction handle]:nullptr;
  // Each stage's visible functions (MTLRenderPipelineDescriptor vertexLinkedFunctions/fragmentLinkedFunctions): RenderBox's fragment
  // functions call custom_blend through them; without them the runtime refused the pipeline (MissingInput LinkedFunction) and the render
@@ -3385,7 +3426,7 @@ static char dvmMemoryReleaseKey;
 // Creation and archive population must use the same complete supported descriptor.
 // The handles of a linked-function list, false for one the frontend did not make.
 static bool linkedHandles(NSArray<id<MTLFunction>> *functions,std::vector<NmbFunction *> &out) {
- for(id<MTLFunction> f in functions){if(![(id)f isKindOfClass:[NBFunction class]])return false;out.push_back([(NBFunction *)f handle]);}
+ for(id<MTLFunction> f in functions){if(![(id)f isKindOfClass:[NBFunction class]] || ![(NBFunction *)f handle])return false;out.push_back([(NBFunction *)f handle]);}
  return true;
 }
 
@@ -3402,7 +3443,7 @@ static NBFunction *zeroRestFunction(NBFunction *f) {
 // The handles `p` points at live in `linked` and `privateLinked`, which outlive its use.
 static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipelineDescriptor *p,std::vector<NmbFunction *> &linkedStore,
                               std::vector<NmbFunction *> &privateStore,NSError **error) {
- if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign compute function");return false;}
+ if(!d || ![(id)d.computeFunction isKindOfClass:[NBFunction class]] || ![(NBFunction *)d.computeFunction handle]){if(error)*error=nbError(@"foreign compute function");return false;}
  // Metal may materialize empty stage/linked descriptors on access. Preserve the
  // default meaning while refusing state this frontend cannot yet represent.
  MTLStageInputOutputDescriptor *stage=d.stageInputDescriptor;
@@ -3758,7 +3799,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLComputePipelineState>)newComputePipelineStateWithFunction:(id<MTLFunction>)function options:(MTLPipelineOption)options
                                                          reflection:(MTLAutoreleasedComputePipelineReflection *)reflection error:(NSError **)error {
  if(reflection)*reflection=nil;
- if(![(id)function isKindOfClass:[NBFunction class]]){if(error)*error=nbError(@"foreign function");return nil;}
+ if(![(id)function isKindOfClass:[NBFunction class]] || ![(NBFunction *)function handle]){if(error)*error=nbError(@"foreign function");return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,nullptr,0};
  const uint64_t pipelineBegan=nowUs();
  NmbComputePipeline *handle=nmb_compute_pipeline_new_with_options(gDevice,[(NBFunction *)function handle],&creation);
