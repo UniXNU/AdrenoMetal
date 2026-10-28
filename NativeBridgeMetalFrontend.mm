@@ -726,6 +726,22 @@ NB_RESOURCE_SPI
 // caller-owned no-copy buffers do not enter this cache.
 static NSMapTable<NSValue *,NBBuffer *> *gSurfaceImports;
 static std::mutex gSurfaceImportLock;
+// Core Animation makes a texture of each window surface at every frame and drops it when the frame completes, so the weak table
+// lost the import between frames and each frame imported every surface again (allocate, map, free). An import used in the last
+// second stays held (strongly, at most 64): the pages are the surface's own and the key includes identity, address and size.
+#include <map>
+#include <tuple>
+struct HeldImport {NBBuffer *buffer;uint64_t usedUs;};
+static std::map<std::tuple<uint64_t,uint64_t,uint64_t>,HeldImport> gHeldImports;   // under gSurfaceImportLock
+static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffer *buffer) {
+ const uint64_t now=nowUs();gHeldImports[{identity,address,bytes}]={buffer,now};
+ for(auto it=gHeldImports.begin();it!=gHeldImports.end();)it=now-it->second.usedUs>1000000?gHeldImports.erase(it):std::next(it);
+ while(gHeldImports.size()>64) {
+  auto oldest=gHeldImports.begin();
+  for(auto it=gHeldImports.begin();it!=gHeldImports.end();++it)if(it->second.usedUs<oldest->second.usedUs)oldest=it;
+  gHeldImports.erase(oldest);
+ }
+}
 static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
@@ -733,7 +749,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
  std::lock_guard<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer)return buffer;
+ if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer);return buffer;}
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
@@ -747,6 +763,7 @@ static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
    if(gSurfaceImports.count>=256)[gSurfaceImports removeObjectForKey:gSurfaceImports.keyEnumerator.nextObject];
   }
   [gSurfaceImports setObject:buffer forKey:key];
+  holdImport(value.identity,value.address,value.bytes,buffer);
  }
  return buffer;
 }
@@ -1027,10 +1044,25 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
 @property(nonatomic,strong) NBLibrary *library;      // where it came from (stitching reads its bitcode), and the values it was
+@property(nonatomic,strong) NSData *bitCodeHashData;
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @end
 @implementation NBFunction
 - (void)dealloc {nmb_function_release(_handle);}
+// _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
+// object, its name and a serial no other function in the process has.
+- (const void *)bitCodeHash {
+ @synchronized(self) {
+  if(!_bitCodeHashData) {
+   static std::atomic<uint64_t> serial;
+   NSData *text=[[NSString stringWithFormat:@"%@#%llu",_name,(unsigned long long)++serial] dataUsingEncoding:NSUTF8StringEncoding];
+   NSMutableData *digest=[NSMutableData dataWithLength:CC_SHA256_DIGEST_LENGTH];
+   CC_SHA256(text.bytes,(CC_LONG)text.length,(unsigned char *)digest.mutableBytes);
+   _bitCodeHashData=digest;
+  }
+  return _bitCodeHashData.bytes;
+ }
+}
 - (MTLFunctionOptions)options {return MTLFunctionOptionNone;}
 - (MTLPatchType)patchType {return (MTLPatchType)nmb_function_patch_type(_handle);}
 - (NSInteger)patchControlPointCount {return (NSInteger)nmb_function_patch_control_point_count(_handle);}
@@ -2268,6 +2300,15 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
 }
 
 @implementation NBCommandBuffer
+// IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
+static char kUserDictionaryKey;
+- (id)userDictionary {
+ @synchronized(self) {
+  NSMutableDictionary *dictionary=objc_getAssociatedObject(self,&kUserDictionaryKey);
+  if(!dictionary){dictionary=[NSMutableDictionary dictionary];objc_setAssociatedObject(self,&kUserDictionaryKey,dictionary,OBJC_ASSOCIATION_RETAIN_NONATOMIC);}
+  return dictionary;
+ }
+}
 // iPadOS 27: QuartzCore names the tasks a command buffer works for (GPU time attribution), on every buffer; there is no such accounting here.
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
@@ -3271,6 +3312,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @end
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
+// MPSCore reads the GPU core count of every Apple GPU family (no count: no MPS device, and its image cache is nil); the Adreno's
+// shader processors count as eight cores, which only sizes MPS's kernel choices.
+- (NSUInteger)gpuCoreCount {return 8;}
+// A texture over a buffer starts where a linear texture may: the texel-buffer alignment the runtime answers for the linear one.
+- (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
+ return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
+}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
@@ -3762,6 +3810,15 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  // The original registration (_MTLAddDevice) asserts that a plugin's device conforms to Metal's private device protocol as well; the target's own
  // drivers get it from their IOGPU base class. Conformance only answers conformsToProtocol:, the methods are still looked up one by one.
  if(Protocol *spi=objc_getProtocol("MTLDeviceSPI"))class_addProtocol(cls,spi);
+{// Clients check the object protocols (MPSCommandBufferImageCache's init returns nil for a command buffer that is not an MTLCommandBuffer).
+  static const char *const conformances[][2]={
+   {"NBBuffer","MTLBuffer"},{"NBTexture","MTLTexture"},{"NBLibrary","MTLLibrary"},{"NBFunction","MTLFunction"},
+   {"NBComputePipeline","MTLComputePipelineState"},{"NBRenderPipeline","MTLRenderPipelineState"},{"NBSampler","MTLSamplerState"},
+   {"NBDepthStencil","MTLDepthStencilState"},{"NBEvent","MTLEvent"},{"NBSharedEvent","MTLSharedEvent"},{"NBFence","MTLFence"},
+   {"NBQueue","MTLCommandQueue"},{"NBCommandBuffer","MTLCommandBuffer"},{"NBEncoder","MTLCommandEncoder"},
+   {"NBComputeEncoder","MTLComputeCommandEncoder"},{"NBRenderEncoder","MTLRenderCommandEncoder"},{"NBBlitEncoder","MTLBlitCommandEncoder"},
+   {"NBHeap","MTLHeap"},{"NBBinaryArchive","MTLBinaryArchive"}};
+  for(const auto &c:conformances){Class k=objc_getClass(c[0]);Protocol *pr=objc_getProtocol(c[1]);if(k&&pr)class_addProtocol(k,pr);}}
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
  return gDeviceObject;
