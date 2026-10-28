@@ -150,8 +150,15 @@ static void reportDisplayState(Gpu &gpu) {
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
+        // The row holds 63 characters: the common prefix goes, and a long reason keeps its start (what was refused) and its end (why).
+        if (!detail) detail = "";
+        if (!strncmp(detail, "native-metal: ", 14)) detail += 14;
+        char shown[48];
+        const size_t length = strlen(detail);
+        if (length <= 46) strlcpy(shown, detail, sizeof shown);
+        else snprintf(shown, sizeof shown, "%.18s~%s", detail, detail + length - 27);
         char text[64];
-        snprintf(text, sizeof text, "%.14s %.46s", step, detail ? detail : "");
+        snprintf(text, sizeof text, "%.14s %s", step, shown);
         streamText(*gpu, text);
     }
 }
