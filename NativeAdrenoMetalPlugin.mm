@@ -295,29 +295,35 @@ static id deviceForPort(unsigned port) {
         // one before it. i84edf75a1 wrote only the stored values (marks 6E01, 6E02) and the framebuffer stayed RGhA: an option read after
         // the plugin loaded put the threshold back to 0. CADefaultsGetFloat takes the environment first (getenv, atof), then the defaults:
         // a threshold of 1e30 is above any headroom.
+        // id02fe1633 read back 0x6E19 in one process: CA_ALLOW_EDR_MIRRORING set and the threshold not raised (a process whose options
+        // were read after the write). The mirroring option is held off the same two ways (bool option 156 at _ca_debug_options
+        // 0x1e702116c + 156; init_debug stores value != 0).
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
         setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
+        setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
             const float one = 1.0f, never = 1e30f;
             gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
-            // What framebuffer_pixel_format reads, once the desktop has started: 0x6E10 | 1 headroom override 1, 2 threshold above 1,
-            // 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156). A framebuffer still
-            // RGhA with 0x6E13 is the display's own flag.
+            const uint8_t off = 0;
+            gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+            // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
+            // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
+            // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156). A framebuffer still RGhA with 0x6E23 is the display's own flag.
             static uintptr_t gSlide;
             gSlide = slide;
             pthread_t reader;
-            pthread_create(&reader, nullptr, [](void *arg) -> void * {
+            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
                 sleep(30);
                 const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
                 const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
                 const uint8_t force = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 128 + gSlide);
                 const uint8_t mirroring = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 156 + gSlide);
-                static_cast<Gpu *>(arg)->mark(0x6E10 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0));
+                static_cast<Gpu *>(arg)->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0));
                 return nullptr;
-            }, gpu);
-            pthread_detach(reader);
+            }, gpu) == 0)
+                pthread_detach(reader);
         }
 #endif
         // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
