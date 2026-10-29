@@ -183,6 +183,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
         // shadow image every pass.
         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
+        // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
+        // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
+        options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
@@ -342,6 +346,34 @@ pub struct NmbShaderCacheStats {
     pub driver_truncated: u64,
     pub driver_mismatched: u64,
     pub driver_unchanged: u64,
+}
+
+/// The caller's read-only source of shader-cache entries behind the cache directory: `read(path, out, length)` gives the entry at
+/// `path` (relative to the directory) in a buffer from malloc (the bridge frees it) and returns true, or returns false.
+type FallbackRead = unsafe extern "C" fn(*const c_char, *mut *mut u8, *mut usize) -> bool;
+static FALLBACK_READ: std::sync::OnceLock<FallbackRead> = std::sync::OnceLock::new();
+
+fn fallback_read(path: &str, out: &mut Vec<u8>) -> bool {
+    let (Some(read), Ok(path)) = (FALLBACK_READ.get(), std::ffi::CString::new(path)) else { return false };
+    let (mut data, mut length) = (std::ptr::null_mut::<u8>(), 0usize);
+    // SAFETY: the caller's contract: on true, `data` holds `length` bytes from malloc, which are freed here.
+    unsafe {
+        if !read(path.as_ptr(), &mut data, &mut length) || data.is_null() {
+            return false;
+        }
+        out.extend_from_slice(std::slice::from_raw_parts(data, length));
+        libc::free(data.cast());
+    }
+    true
+}
+
+/// Set the read-only source behind every shader-cache directory, before the device opens; false where one was set already.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_set_shader_cache_fallback(read: Option<FallbackRead>) -> bool {
+    match read {
+        Some(read) => FALLBACK_READ.set(read).is_ok() && metal2vulkan_runtime::set_shader_cache_fallback(fallback_read),
+        None => false,
+    }
 }
 
 #[unsafe(no_mangle)]

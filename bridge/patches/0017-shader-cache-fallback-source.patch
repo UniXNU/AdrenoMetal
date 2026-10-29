@@ -1,0 +1,68 @@
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index ae78ee38..6cd9d58d 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -336,7 +336,7 @@ pub use render_values::{
+ pub use resource::{ObjectId, ResourceRef};
+ pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
+ pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
+-pub use shader_cache::{
++pub use shader_cache::{set_shader_cache_fallback, ShaderCacheFallback, 
+     ShaderCacheOptions, ShaderCacheStatistics, DEFAULT_CAPACITY, DEFAULT_MEMORY_CAPACITY,
+ };
+ pub use sparse::device::SparseFeatures;
+diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
+index a9da76d1..143b665d 100644
+--- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
++++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
+@@ -70,6 +70,7 @@ pub(crate) use creation::VariantStages;
+ pub(crate) mod driver;
+ mod held;
+ pub(super) mod store;
++pub use store::{set_fallback as set_shader_cache_fallback, Fallback as ShaderCacheFallback};
+ pub(super) mod worker;
+ 
+ use super::error::{invalid, Error, Problem, ShaderCacheError};
+diff --git a/crates/metal2vulkan-runtime/src/shader_cache/store.rs b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
+index 38742f62..0f6fc951 100644
+--- a/crates/metal2vulkan-runtime/src/shader_cache/store.rs
++++ b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
+@@ -569,7 +569,14 @@ impl Store {
+         timed(&self.counters.read_nanos, || {
+             let file = match fs::File::open(path) {
+                 Ok(file) => file,
+-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Found::Absent,
++                Err(error) if error.kind() == io::ErrorKind::NotFound => {
++                    // An entry the directory lacks, from the read-only source behind it (`set_fallback`), as a queued
++                    // write's bytes are: no file to refresh.
++                    return match fallback_read(self.directory.root(), path) {
++                        Some(bytes) => Found::Queued(bytes),
++                        None => Found::Absent,
++                    };
++                }
+                 Err(_) => return Found::Failed,
+             };
+             let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+@@ -885,3 +892,22 @@ fn new_private_file(path: &Path) -> io::Result<fs::File> {
+     }
+     options.open(path)
+ }
++
++/// A read-only source of entries behind every cache directory: given an entry's path relative to its directory's root, its bytes,
++/// or false. A process whose entries were made ahead (on another machine, for the same driver and runtime) reads them from there
++/// without copying them into the directory; what it makes itself still goes to the directory. Set once, before any device opens.
++pub type Fallback = fn(&str, &mut Vec<u8>) -> bool;
++static FALLBACK: std::sync::OnceLock<Fallback> = std::sync::OnceLock::new();
++
++/// Set the read-only source behind every cache directory ([`Fallback`]); false where one was set already.
++pub fn set_fallback(source: Fallback) -> bool {
++    FALLBACK.set(source).is_ok()
++}
++
++/// The fallback's bytes of the entry at `path` under `root`.
++fn fallback_read(root: &Path, path: &Path) -> Option<Vec<u8>> {
++    let source = FALLBACK.get()?;
++    let relative = path.strip_prefix(root).ok()?.to_str()?;
++    let mut bytes = Vec::new();
++    source(relative, &mut bytes).then_some(bytes)
++}

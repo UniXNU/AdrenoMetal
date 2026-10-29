@@ -15,12 +15,14 @@
 #endif
 #include <unistd.h>
 #include <pwd.h>
+#include <fts.h>
 #include <mach/mach.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
+#include "CacheImport.h"
 #include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
@@ -147,6 +149,16 @@ static void reportDisplayState(Gpu &gpu) {
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
 // "<step> <detail>", through the marker stream (a connection is not needed). The Gpu object is made only on this path.
+// Deletes every "*.import" file under `root`: the copying import of an earlier image wrote each file beside its place and renamed it only
+// once the whole pack was read; a boot that ended first left them all there.
+static void removeHalfImported(const char *root) {
+    char *paths[] = {const_cast<char *>(root), nullptr};
+    FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
+    if (!fts) return;
+    while (FTSENT *e = fts_read(fts))
+        if (e->fts_info == FTS_F && e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
+    fts_close(fts);
+}
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
@@ -315,6 +327,30 @@ static id deviceForPort(unsigned port) {
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
+            // The pipeline caches compiled ahead on the host, read on demand from the userdata import region behind this directory
+            // (CacheImport.h), and the files an earlier image's copying import left half written there (int 590aaee2), which hold memory
+            // of the RAM Data disk.
+            {
+                static bool once;
+                if (!once) {
+                    once = true;
+                    removeHalfImported(candidates[i]);
+                    if (cacheimport::open(*gpu)) {
+                        nmb_set_shader_cache_fallback(cacheimport::read);
+                        uint8_t *done = nullptr;
+                        size_t length = 0;
+                        if (cacheimport::read("prime-done", &done, &length)) {
+                            const std::string text(reinterpret_cast<const char *>(done), length);
+                            free(done);
+                            for (size_t at = 0, end; at < text.size(); at = end + 1) {
+                                end = text.find('\n', at);
+                                if (end == std::string::npos) end = text.size();
+                                if (end > at) prime::extraDone().insert(text.substr(at, end - at));
+                            }
+                        }
+                    }
+                }
+            }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
             if (char pack[1024]; requestedPath("NativeAdrenoMetal.m2vpack", pack, sizeof pack)) {
@@ -420,17 +456,12 @@ static id deviceForPort(unsigned port) {
         // The translator recurses deeply on large functions: give it the stack of a main thread.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        // First the pipeline caches compiled ahead on the host, from the import region (CacheExport.h importRegion), which also lists
-        // every library they cover as primed: priming then compiles only what they left out. The runtime looks its entries up as it
-        // needs them, so the render server draws meanwhile.
-        pthread_create(&primer, &attributes, [](void *arg) -> void * {
-            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
-            cacheexport::importRegion(*static_cast<Gpu *>(arg), gCacheDirectory);
+        pthread_create(&primer, &attributes, [](void *) -> void * {
             char list[1024];
             prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
                        requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
             return nullptr;
-        }, gpu);
+        }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;

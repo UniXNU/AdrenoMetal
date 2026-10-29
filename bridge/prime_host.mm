@@ -9,6 +9,7 @@
 #include "../PrimeShaders.h"
 #include "../NativeBridgeMetalFrontend.h"
 #include "NativeMetalObjects.h"
+#include "../CacheImport.h"
 #include <fstream>
 
 static void onMissing(const char *, const char *) {}
@@ -37,6 +38,11 @@ static std::string fileUuid(const char *path) {
 int main(int argc, char **argv) {
     @autoreleasepool {
         if (argc != 7 && argc != 9) return 2;
+        // NMB_IMPORT_PAYLOAD: the import region's bytes (make-pipeline-import.py --payload) behind the cache directory, read on demand as
+        // the tablet's plugin reads the region (CacheImport.h): a consumer run over an empty directory then compiles nothing it covers.
+        if (const char *payload = getenv("NMB_IMPORT_PAYLOAD")) {
+            if (!cacheimport::openFile(payload) || !nmb_set_shader_cache_fallback(cacheimport::read)) {std::printf("FAIL import payload\n"); return 1;}
+        }
         id<MTLDevice> device = native_bridge_metal_open(argv[1], argv[2], 0x6e6d70, onMissing);
         if (!device) {std::printf("FAIL device\n"); return 1;}
         native_bridge_metal_quiet_problems(true);
@@ -68,8 +74,12 @@ int main(int argc, char **argv) {
             still = now == last ? still + 1 : 0;
             last = now;
         }
-        std::printf("PASS: primed %u libraries (%u absent) made=%u writes=%llu driver_saves=%llu build=%s\n", primed, absent,
-                    (unsigned)native_prime_made, (unsigned long long)stats.writes, (unsigned long long)stats.driver_saves, build.c_str());
+        std::printf("PASS: primed %u libraries (%u absent) made=%u writes=%llu driver_saves=%llu hits=%llu misses=%llu driver_hits=%llu "
+                    "driver_misses=%llu import=%llu/%llu/%llu build=%s\n", primed, absent, (unsigned)native_prime_made,
+                    (unsigned long long)stats.writes, (unsigned long long)stats.driver_saves, (unsigned long long)stats.hits,
+                    (unsigned long long)stats.misses, (unsigned long long)stats.driver_hits, (unsigned long long)stats.driver_misses,
+                    (unsigned long long)cacheimport::native_cache_import_stats[0], (unsigned long long)cacheimport::native_cache_import_stats[2],
+                    (unsigned long long)cacheimport::native_cache_import_stats[3], build.c_str());
         return 0;
     }
 }

@@ -265,66 +265,6 @@ static int importStream(PackReader &r, const std::string &directory) {
 }
 
 #ifndef CACHEEXPORT_FORMAT_ONLY
-// Import region: the pipeline caches compiled ahead on the host (scripts/make-pipeline-cache.py), written to the read-only part of the
-// userdata reserve (UniXNU-sheng scripts/make-pipeline-import.py) and read through the GPU driver (method 0x7101, 4096 bytes a call).
-// Block 0: "SHNGIMP1", u32 version 1, u32 0, u64 pack bytes, 32 bytes id (the pack's SHA-256); the pack (SHEXP001) from block 1. Its files
-// go into this process's cache directory as importPack's do; import-id there then names the pack, and a later boot that finds the same id
-// reads nothing more. Markers 0x63nn: 00 started, 01 imported (then 0x64nn: files written in thousands, saturated), 02 already imported,
-// f0 no connection, f1 no selector, f2 no region (or empty), f3 the pack was refused.
-constexpr uint32_t kImportMethod = 0x7101, kImportBlock = 4096;
-static int importRegion(Gpu &marker, std::string root) {
-    while (root.size() > 1 && root.back() == '/') root.pop_back();
-    marker.mark(0x6300);
-    Gpu link;
-    link.call = marker.call; link.openFn = marker.openFn; link.closeFn = marker.closeFn; link.port = marker.port;
-    if (!link.openFn || link.openFn(link.port, mach_task_self(), 0x4148, &link.conn) != 0 || !link.conn) {marker.mark(0x63f0); return -1;}
-    struct Closer {Gpu &g; ~Closer() {if (g.closeFn && g.conn) g.closeFn(g.conn);}} closer{link};
-    if (!link.probe()) {marker.mark(0x63f1); return -1;}
-    uint64_t region = 0;
-    std::vector<uint8_t> block(kImportBlock);
-    auto readAt = [&](uint64_t offset, void *out) {return link.method(kImportMethod, &offset, sizeof offset, out, kImportBlock) == 0;};
-    if (link.method(kImportMethod, &region, sizeof region, &region, sizeof region) != 0 || region < 2 * kImportBlock ||
-        !readAt(0, block.data()) || memcmp(block.data(), "SHNGIMP1", 8)) {marker.mark(0x63f2); return 0;}
-    uint32_t version = 0;
-    uint64_t bytes = 0;
-    memcpy(&version, block.data() + 8, 4);
-    memcpy(&bytes, block.data() + 16, 8);
-    if (version != 1 || bytes < 16 || bytes > region - kImportBlock) {marker.mark(0x63f2); return 0;}
-    char id[65];
-    for (int k = 0; k < 32; ++k) snprintf(id + 2 * k, 3, "%02x", block[24 + k]);
-    const std::string idPath = root + "/import-id";
-    if (FILE *f = fopen(idPath.c_str(), "r")) {
-        char seen[65] = {};
-        const bool same = fread(seen, 1, 64, f) == 64 && !memcmp(seen, id, 64);
-        fclose(f);
-        if (same) {marker.mark(0x6302); return 0;}
-    }
-    // The pack's bytes in order, a block per call from block 1.
-    uint64_t next = kImportBlock;
-    size_t used = kImportBlock;
-    auto read = [&](void *out, size_t n) {
-        uint8_t *to = static_cast<uint8_t *>(out);
-        while (n) {
-            if (used == kImportBlock) {
-                if (!readAt(next, block.data())) return false;
-                next += kImportBlock;
-                used = 0;
-            }
-            const size_t k = n < kImportBlock - used ? n : kImportBlock - used;
-            memcpy(to, block.data() + used, k);
-            used += k; to += k; n -= k;
-        }
-        return true;
-    };
-    PackReader r;
-    const int written = r.startWith(read, bytes) ? importStream(r, root) : -1;
-    if (written < 0) {marker.mark(0x63f3); return -1;}
-    if (FILE *f = fopen(idPath.c_str(), "w")) {fwrite(id, 1, 64, f); fclose(f);}
-    marker.mark(0x6301);
-    marker.mark(0x6400 | (uint32_t)(written / 1000 > 0xff ? 0xff : written / 1000));
-    return written;
-}
-
 // Markers 0x69xx: 00 started, 01 connection, 02 an export went out (then 0x6Bnn: its size in MiB, saturated), f0 no connection,
 // f1 no selector, f2 a file changed or vanished while it was read, f3 a piece refused, f4 the new files exceed one export.
 static void run(Gpu &marker, std::string root) {
