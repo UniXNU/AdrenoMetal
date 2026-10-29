@@ -20,6 +20,7 @@
 #include <atomic>
 #include <mutex>
 #include <pthread.h>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -1217,6 +1218,7 @@ static std::string quartzCoreCallers();
 // without them create_metal_dag ended in a null program and iconservicesagent crashed in create_program_and_arguments. Such a function has
 // no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
 static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
+static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
 @implementation NBLibrary
 - (void)dealloc {nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -1288,6 +1290,19 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
  }
  return names;
 }
+// _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. iPadOS 27's Core
+// Image collects the precompiled kernels' names so (DAGPrecompiledKernels: [CIKernelLibrary externFunctionNames] of ci_stdlib and
+// ci_filters) and links a kernel into its DAG only when its name is there or in a stitchable library; without the answer (nil, an unknown
+// selector) create_metal_dag gave a null program and iconservicesagent crashed in create_program_and_arguments. Apple's Metal on macOS
+// 26.5.1 answers 228 names for its ci_stdlib and 612 for ci_filters, none for a stitchable library.
+- (NSArray<NSString *> *)externFunctionNames {
+ NSMutableArray<NSString *> *names=[NSMutableArray array];
+ forEachLibraryEntry(self,[&](const std::string &entry,int type) {
+  if(type==5 && !entry.empty())if(NSString *name=@(entry.c_str()))[names addObject:name];
+  return true;
+ });
+ return names;
+}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name {
  const uint64_t functionBegan=nowUs();
  if(NBFunction *kernel=ciKernelFunction(self,name)){gTimeFunction.add(functionBegan);return (id<MTLFunction>)kernel;}
@@ -1341,34 +1356,44 @@ static NSData *functionBitcode(NBFunction *function) {
  }
  return nil;
 }
-static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
- const uint8_t *file=library.bytes;const size_t length=library.length;const char *wanted=name.UTF8String;
- if(!file || !wanted || length<88 || memcmp(file,"MTLB",4) || file[10]!=1)return nil;
+// Each entry of a metallib's function list, in file order, as its name and TYPE (-1: none); false for a list that is not well formed.
+static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit) {
+ const uint8_t *file=library.bytes;const size_t length=library.length;
+ if(!file || length<88 || memcmp(file,"MTLB",4))return false;
  uint64_t listAt;memcpy(&listAt,file+24,8);
- if(listAt>length-4)return nil;
+ if(listAt>length-4)return false;
  uint32_t count;memcpy(&count,file+listAt,4);
  size_t at=listAt+4;
  for(uint32_t i=0;i<count;i++) {
-  uint32_t size;if(at>length-4)return nil;memcpy(&size,file+at,4);
-  if(size<8 || size>length-at)return nil;
+  uint32_t size;if(at>length-4)return false;memcpy(&size,file+at,4);
+  if(size<8 || size>length-at)return false;
   const size_t end=at+size;
   std::string entry;int type=-1;
   for(size_t t=at+4;t+4<=end && memcmp(file+t,"ENDT",4);) {
-   if(t+6>end)return nil;
+   if(t+6>end)return false;
    uint16_t n;memcpy(&n,file+t+4,2);const uint8_t *v=file+t+6;
-   if(n>end-(t+6))return nil;
+   if(n>end-(t+6))return false;
    if(!memcmp(file+t,"NAME",4))entry.assign((const char *)v,strnlen((const char *)v,n));
    else if(!memcmp(file+t,"TYPE",4) && n>=1)type=v[0];
    t+=6+n;
   }
-  if(entry==wanted) {
-   if(type!=5)return nil;
-   NBFunction *function=[NBFunction new];function.name=name;function.functionType=(MTLFunctionType)4;function.library=library;
-   return function;
-  }
+  if(!visit(entry,type))return true;
   at=end;
  }
- return nil;
+ return true;
+}
+static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
+ const uint8_t *file=library.bytes;const char *wanted=name.UTF8String;
+ if(!file || !wanted || library.length<88 || file[10]!=1)return nil;
+ NBFunction *found=nil;
+ forEachLibraryEntry(library,[&](const std::string &entry,int type) {
+  if(entry!=wanted)return true;
+  if(type==5) {
+   found=[NBFunction new];found.name=name;found.functionType=(MTLFunctionType)4;found.library=library;
+  }
+  return false;
+ });
+ return found;
 }
 @interface NBComputePipeline : NBObject
 @property(nonatomic) NmbComputePipeline *handle;

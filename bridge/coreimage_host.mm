@@ -28,6 +28,11 @@ int main(int argc, char **argv) {
             std::printf("KERNELS library %s names %lu _add %s type %lu\n", kernels ? "yes" : "no", (unsigned long)kernels.functionNames.count,
                         add ? "yes" : "no", (unsigned long)add.functionType);
             if (!add) {std::printf("FAIL kernel by name\n"); return 1;}
+            // iPadOS 27's Core Image links a kernel only when its name is among the library's externFunctionNames (its TYPE 5 entries;
+            // Apple's Metal answers 228 for macOS 26.5.1's ci_stdlib).
+            NSArray *externs = [(id)kernels respondsToSelector:@selector(externFunctionNames)] ? [(id)kernels performSelector:@selector(externFunctionNames)] : nil;
+            std::printf("EXTERNS %lu\n", (unsigned long)[externs count]);
+            if (![externs containsObject:@"_add"]) {std::printf("FAIL extern function names\n"); return 1;}
             // As Apple's Metal answers (macOS 26.5.1): no names, the kernel by name, function type 4.
             if (kernels.functionNames.count || add.functionType != 4) {std::printf("FAIL kernel library answers\n"); return 1;}
         }
