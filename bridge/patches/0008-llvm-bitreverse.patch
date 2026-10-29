@@ -29,7 +29,7 @@ index d784c6c5..b6ca3f98 100644
              _ => 2,
          }
 diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
-index feab97c7..1e5f8863 100644
+index 1d87c11e..196c6430 100644
 --- a/crates/metal2vulkan/src/lower/arith/mod.rs
 +++ b/crates/metal2vulkan/src/lower/arith/mod.rs
 @@ -1746,6 +1746,7 @@ fn llvm_math(op: &LlvmIntrinsic) -> Result<Fun, Error> {

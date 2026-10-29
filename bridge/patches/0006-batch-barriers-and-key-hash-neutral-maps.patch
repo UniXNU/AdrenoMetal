@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-index 6ab175dd..0cce8207 100644
+index 3e0887d8..7b18eb69 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-@@ -648,11 +648,8 @@ impl CommandBufferShared {
+@@ -636,11 +636,8 @@ impl CommandBufferShared {
              barriers.first().is_some_and(Option::is_some) || !held_moves.transitions(0).is_empty();
          if entry.is_some() {
              started = true;
@@ -16,7 +16,7 @@ index 6ab175dd..0cce8207 100644
              let stamps = Stamps {
                  start: start_stamp.filter(|_| !encoder_behind),
                  after: entry_barrier.is_some(),
-@@ -661,14 +658,11 @@ impl CommandBufferShared {
+@@ -649,14 +646,11 @@ impl CommandBufferShared {
              if stamps.start.is_some() {
                  start_stamp = None;
              }
@@ -34,7 +34,7 @@ index 6ab175dd..0cce8207 100644
              let moves = held_moves.transitions(offset);
              if !globals.is_empty() || start_stamp.is_some() || !moves.is_empty() {
                  started |= offset == 0;
-@@ -678,7 +672,7 @@ impl CommandBufferShared {
+@@ -666,7 +660,7 @@ impl CommandBufferShared {
                      end: None,
                  };
                  let kept = &mut scheduler.kept;
@@ -43,7 +43,7 @@ index 6ab175dd..0cce8207 100644
              }
              work.extend(&state.recorded[start + offset].raws);
          }
-@@ -1429,3 +1423,15 @@ impl Stamps {
+@@ -1424,3 +1418,15 @@ impl Stamps {
          })
      }
  }

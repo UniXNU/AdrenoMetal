@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index a47d32ea..784315fb 100644
+index fce02139..053cafe9 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 @@ -1503,6 +1503,31 @@ impl Device {
@@ -65,7 +65,7 @@ index a47d32ea..784315fb 100644
          } {
              scheduler.stop();
 diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
-index e953806b..29671308 100644
+index 144a6e59..919f5c9e 100644
 --- a/crates/metal2vulkan-runtime/src/device/prime.rs
 +++ b/crates/metal2vulkan-runtime/src/device/prime.rs
 @@ -82,9 +82,11 @@ use crate::gpu_time::Calibration;

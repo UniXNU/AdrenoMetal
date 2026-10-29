@@ -1,0 +1,21 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index b77aaa48..f33c13af 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -1861,6 +1861,16 @@ impl Device {
+                 metal_layout = tiles;
+             }
+         }
++        // An answer of the device's own (no Metal answer modelled, or one the texture is past)
++        // is the image's size in the driver's units, which need not be a multiple of the image's
++        // alignment (Turnip's 4 KiB). Metal's sizes are multiples of their alignment, so a heap
++        // sized as the sum of its textures' answers holds them in any order; with the device's
++        // size each texture placed after another pads past what the heap was sized for, and the
++        // last one finds no room (iPadOS 27's iconservicesagent: `heap texture: OutOfMemory(Heap)`).
++        // A shadow in Metal's tiles takes Metal's answer.
++        if (metal_answer.is_none() || past_metal.is_some()) && image.route != AliasRoute::Tiled {
++            size_and_align.size = size_and_align.size.next_multiple_of(size_and_align.align.max(1));
++        }
+         // Only a texture an image of binds into the heap's own memory is held to the heap's base,
+         // and the routes decide that (`holds_heap_base`).
+         check_heap_base(image.route, size_and_align.align)?;

@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
-index 33c67576..55c119e6 100644
+index 618f1a48..3df6a593 100644
 --- a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
 +++ b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
 @@ -990,10 +990,16 @@ fn planned_for(
@@ -22,7 +22,7 @@ index 33c67576..55c119e6 100644
      let opaque_ = !has_alpha;
      let color = match colors {
          0 => None,
-@@ -1518,6 +1524,13 @@ impl Blend {
+@@ -1519,6 +1525,13 @@ impl Blend {
      /// Metal's model's: a `half4` one; a `float4` one under a blend whose color lanes take one term
      /// alone, unmasked, rounded to `half` first; another is the gap it is.
      pub fn takes(&self, output: Option<FloatFmt>) -> Result<(), Error> {
