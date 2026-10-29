@@ -4232,11 +4232,23 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
-  // Who allocated the device memory (4 MiB or more at once): the six call stacks with the most bytes, as MiB, allocations and return
+  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
+  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
+  {
+   uint64_t rm[8]={};
+   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+   static void (*modeStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats"):nullptr;
+   if(modeStats) {
+    modeStats(rm);
+    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
+     (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
+   }
+  }
+  // Who allocated the device memory (4 MiB or more at once): the three call stacks with the most bytes, as MiB, allocations and return
   // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
   {
-   uint64_t sites[6*12]={};
-   const size_t n=nmb_allocation_sites(sites,6);
+   uint64_t sites[3*12]={};
+   const size_t n=nmb_allocation_sites(sites,3);
    for(size_t i=0;i<n;++i) {
     const uint64_t *site=sites+i*12;
     char frames[10][12]={};
