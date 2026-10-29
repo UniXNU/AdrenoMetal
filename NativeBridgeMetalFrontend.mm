@@ -120,8 +120,6 @@ static void abortProbe(int signal, siginfo_t *si, void *context) {
 }
 // NATIVE_METAL_TIMING=1: the telemetry table (where the CPU side's time went: pipelines, libraries, compiles and the shader cache)
 // written to standard error every 20 s (an app the system ends at the end of a test never reaches atexit).
-// The plugin's on-demand region reads (CacheImport.h). Weak here: the plugin's own definition wins, and a host build reads zeros.
-extern "C" {__attribute__((weak)) volatile uint64_t native_cache_import_stats[4]; __attribute__((weak)) char native_cache_import_first_miss[160];}
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size);
 static void *reportTiming(void *) {
  static char table[6144];
@@ -4289,12 +4287,6 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
      frames[3],frames[4]);
     row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
    }
-  }
-  // The pipeline caches compiled ahead on the host, read on demand from the userdata import region (the plugin's CacheImport.h).
-  if((native_cache_import_stats[0]||native_cache_import_stats[2]||native_cache_import_stats[3])) {
-   row("CI hit%llu KiB%llu miss%llu fail%llu",(unsigned long long)native_cache_import_stats[0],(unsigned long long)(native_cache_import_stats[1]>>10),
-    (unsigned long long)native_cache_import_stats[2],(unsigned long long)native_cache_import_stats[3]);
-   if(native_cache_import_first_miss[0])row("CIm %.86s",native_cache_import_first_miss+(strlen(native_cache_import_first_miss)>86?strlen(native_cache_import_first_miss)-86:0));
   }
   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}

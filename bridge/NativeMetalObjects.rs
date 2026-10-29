@@ -407,34 +407,6 @@ pub struct NmbShaderCacheStats {
     pub driver_unchanged: u64,
 }
 
-/// The caller's read-only source of shader-cache entries behind the cache directory: `read(path, out, length)` gives the entry at
-/// `path` (relative to the directory) in a buffer from malloc (the bridge frees it) and returns true, or returns false.
-type FallbackRead = unsafe extern "C" fn(*const c_char, *mut *mut u8, *mut usize) -> bool;
-static FALLBACK_READ: std::sync::OnceLock<FallbackRead> = std::sync::OnceLock::new();
-
-fn fallback_read(path: &str, out: &mut Vec<u8>) -> bool {
-    let (Some(read), Ok(path)) = (FALLBACK_READ.get(), std::ffi::CString::new(path)) else { return false };
-    let (mut data, mut length) = (std::ptr::null_mut::<u8>(), 0usize);
-    // SAFETY: the caller's contract: on true, `data` holds `length` bytes from malloc, which are freed here.
-    unsafe {
-        if !read(path.as_ptr(), &mut data, &mut length) || data.is_null() {
-            return false;
-        }
-        out.extend_from_slice(std::slice::from_raw_parts(data, length));
-        libc::free(data.cast());
-    }
-    true
-}
-
-/// Set the read-only source behind every shader-cache directory, before the device opens; false where one was set already.
-#[unsafe(no_mangle)]
-pub extern "C" fn nmb_set_shader_cache_fallback(read: Option<FallbackRead>) -> bool {
-    match read {
-        Some(read) => FALLBACK_READ.set(read).is_ok() && metal2vulkan_runtime::set_shader_cache_fallback(fallback_read),
-        None => false,
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_shader_cache_stats(device: *const NmbDevice, out: *mut NmbShaderCacheStats) -> bool {
     guard(false, || {

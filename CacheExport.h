@@ -145,7 +145,7 @@ struct PackReader {
     using InflateFn = int (*)(z_streamp, int);
     using EndFn = int (*)(z_streamp);
     FILE *in = nullptr;
-    // Where the compressed bytes come from: the pack file, or the import region (importRegion).
+    // Where the compressed bytes come from (the pack file).
     std::function<bool(void *, size_t)> source;
     z_stream z = {};
     InflateFn inflateFn = nullptr;

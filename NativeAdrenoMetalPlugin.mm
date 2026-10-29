@@ -22,7 +22,6 @@
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
-#include "CacheImport.h"
 #include "ExceptionDiag.h"
 
 @interface _MTLDevice : NSObject
@@ -288,20 +287,37 @@ static id deviceForPort(unsigned port) {
 #if defined(__arm64e__)
         // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
         // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
-        // 8-bit BGRA, the headroom is held at 1: the render server's headroom override (CA::WindowServer::Display::edr_headroom reads it
-        // first when nonzero; 24A446 QuartzCore __DATA_DIRTY 0x1e7021014, CARenderServerStart at 0x1846dce88 for the cache slide) and its
-        // environment spelling for an option table read after this.
+        // 8-bit BGRA, the headroom is held at 1. IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838, asked on every update) takes
+        // RGhA when the headroom (Display::edr_headroom, CA_DISPLAY_EDR_HEADROOM first when nonzero) is above CA_FP16_MIN_HEADROOM and
+        // the panel's own above 8, or when CA_FORCE_FP16_FRAMEBUFFER, CA_ALLOW_EDR_MIRRORING or the display's own flag says so. Both
+        // options are QuartzCore's float options: init_debug reads them from the environment into debug_values (index 21 at
+        // __DATA_DIRTY 0x1e7021014, index 81 at 0x1e7021104), so they are set in the environment for a read after this and written for
+        // one before it. i84edf75a1 wrote only the stored values (marks 6E01, 6E02) and the framebuffer stayed RGhA: an option read after
+        // the plugin loaded put the threshold back to 0. CADefaultsGetFloat takes the environment first (getenv, atof), then the defaults:
+        // a threshold of 1e30 is above any headroom.
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
+        setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
-            const float one = 1.0f;
+            const float one = 1.0f, never = 1e30f;
             gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
-            // The override alone left the framebuffer RGhA (i14aef633e: four 48388 KiB swap surfaces, mark 6E01 written):
-            // IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838) takes RGhA when the headroom is above its FP16 threshold
-            // (__DATA_DIRTY 0x1e7021104, 0 unless set) and the panel's own headroom above 8, so a headroom of 1 still passes. The
-            // threshold is held at the largest float: no headroom reaches it.
-            const float never = __FLT_MAX__;
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
+            // What framebuffer_pixel_format reads, once the desktop has started: 0x6E10 | 1 headroom override 1, 2 threshold above 1,
+            // 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156). A framebuffer still
+            // RGhA with 0x6E13 is the display's own flag.
+            static uintptr_t gSlide;
+            gSlide = slide;
+            pthread_t reader;
+            pthread_create(&reader, nullptr, [](void *arg) -> void * {
+                sleep(30);
+                const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
+                const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
+                const uint8_t force = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 128 + gSlide);
+                const uint8_t mirroring = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 156 + gSlide);
+                static_cast<Gpu *>(arg)->mark(0x6E10 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0));
+                return nullptr;
+            }, gpu);
+            pthread_detach(reader);
         }
 #endif
         // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
@@ -333,29 +349,10 @@ static id deviceForPort(unsigned port) {
             strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
-            // The pipeline caches compiled ahead on the host, read on demand from the userdata import region behind this directory
-            // (CacheImport.h), and the files an earlier image's copying import left half written there (int 590aaee2), which hold memory
-            // of the RAM Data disk.
+            // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
-                if (!once) {
-                    once = true;
-                    removeHalfImported(candidates[i]);
-                    if (cacheimport::open(*gpu)) {
-                        nmb_set_shader_cache_fallback(cacheimport::read);
-                        uint8_t *done = nullptr;
-                        size_t length = 0;
-                        if (cacheimport::read("prime-done", &done, &length)) {
-                            const std::string text(reinterpret_cast<const char *>(done), length);
-                            free(done);
-                            for (size_t at = 0, end; at < text.size(); at = end + 1) {
-                                end = text.find('\n', at);
-                                if (end == std::string::npos) end = text.size();
-                                if (end > at) prime::extraDone().insert(text.substr(at, end - at));
-                            }
-                        }
-                    }
-                }
+                if (!once) {once = true; removeHalfImported(candidates[i]);}
             }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
@@ -460,11 +457,9 @@ static id deviceForPort(unsigned port) {
         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.
-        // Not with sheng-gpu-prime=0 (cacheimport::gPrimingOff): pipelines are then compiled only as processes ask for them.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        if (!cacheimport::gPrimingOff)
-            pthread_create(&primer, &attributes, [](void *) -> void * {
+        pthread_create(&primer, &attributes, [](void *) -> void * {
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
                            requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());

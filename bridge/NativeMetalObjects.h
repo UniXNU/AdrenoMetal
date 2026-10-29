@@ -62,9 +62,6 @@ struct NmbShaderCacheStats {
     uint64_t driver_loads, driver_hits, driver_misses, driver_saves, driver_truncated, driver_mismatched, driver_unchanged;
 };
 bool nmb_device_shader_cache_stats(const NmbDevice *, struct NmbShaderCacheStats *);
-/* The read-only source of shader-cache entries behind every cache directory, set before the device opens: read(path relative to the
- * directory, out, length) puts the entry in a malloc'd buffer the bridge frees and returns true, or returns false. */
-bool nmb_set_shader_cache_fallback(bool (*read)(const char *path, uint8_t **out, size_t *length));
 size_t nmb_last_warning(char *out, size_t size);
 bool nmb_device_max_threads_per_threadgroup(const NmbDevice *, uint64_t out[3]);
 /* Device queries the runtime answers by Metal selector: Apple's private counts and flags where the device has an answer of its own,

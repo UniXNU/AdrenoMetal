@@ -70,7 +70,7 @@ index 1d760a06..bbb1fb47 100644
  ///
  /// # Safety
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 6cd9d58d..041567d2 100644
+index ae78ee38..400f6882 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
 @@ -336,6 +336,7 @@ pub use render_values::{
@@ -78,7 +78,7 @@ index 6cd9d58d..041567d2 100644
  pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
  pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
 +pub use creation::{allocation_sites, AllocationSite};
- pub use shader_cache::{set_shader_cache_fallback, ShaderCacheFallback, 
+ pub use shader_cache::{
      ShaderCacheOptions, ShaderCacheStatistics, DEFAULT_CAPACITY, DEFAULT_MEMORY_CAPACITY,
  };
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
