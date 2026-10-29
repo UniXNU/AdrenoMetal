@@ -1,0 +1,105 @@
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+index 1d760a06..bbb1fb47 100644
+--- a/crates/metal2vulkan-runtime/src/creation.rs
++++ b/crates/metal2vulkan-runtime/src/creation.rs
+@@ -109,10 +109,66 @@ pub(crate) unsafe fn allocate_memory(
+     info: &vk::MemoryAllocateInfo<'_>,
+ ) -> VkResult<vk::DeviceMemory> {
+     vk_made(VkMaking::Memory, Location::caller());
++    note_allocation_site(info.allocation_size);
+     // SAFETY: the caller's.
+     unsafe { device.allocate_memory(info, None) }
+ }
+ 
++/// The call stacks that allocated device memory of at least [`SITE_BYTES`], by the bytes they
++/// allocated: what a process's GPU memory went to, without a debugger on the device. A stack is
++/// its first [`SITE_FRAMES`] return addresses past this function's; at most [`SITE_COUNT`]
++/// stacks are kept, a new one past them counted under the last.
++const SITE_BYTES: u64 = 4 << 20;
++const SITE_FRAMES: usize = 10;
++const SITE_COUNT: usize = 32;
++static SITES: std::sync::Mutex<Vec<AllocationSite>> = std::sync::Mutex::new(Vec::new());
++
++/// One call stack's allocations ([`allocation_sites`]).
++#[derive(Clone, Copy, Debug, Default)]
++pub struct AllocationSite {
++    /// Bytes allocated so far.
++    pub bytes: u64,
++    /// Allocations so far.
++    pub count: u64,
++    /// Return addresses, innermost first; 0 past the stack's end.
++    pub frames: [usize; SITE_FRAMES],
++}
++
++fn note_allocation_site(bytes: u64) {
++    if bytes < SITE_BYTES {
++        return;
++    }
++    let mut raw = [std::ptr::null_mut::<libc::c_void>(); SITE_FRAMES + 2];
++    // SAFETY: `raw` holds the count passed.
++    #[cfg(target_vendor = "apple")]
++    let depth = unsafe { libc::backtrace(raw.as_mut_ptr(), raw.len() as libc::c_int) }.max(0) as usize;
++    #[cfg(not(target_vendor = "apple"))]
++    let depth = 0usize;
++    let mut frames = [0usize; SITE_FRAMES];
++    for (frame, address) in frames.iter_mut().zip(raw.iter().take(depth).skip(2)) {
++        // The pointer authentication bits of a return address (arm64e) are not part of it.
++        *frame = (*address as usize) & ((1usize << 47) - 1);
++    }
++    let Ok(mut sites) = SITES.lock() else { return };
++    let at = match sites.iter().position(|site| site.frames == frames) {
++        Some(at) => at,
++        None if sites.len() < SITE_COUNT => {
++            sites.push(AllocationSite { frames, ..Default::default() });
++            sites.len() - 1
++        }
++        None => sites.len() - 1,
++    };
++    sites[at].bytes += bytes;
++    sites[at].count += 1;
++}
++
++/// The call stacks that allocated device memory of 4 MiB or more, most bytes first.
++pub fn allocation_sites() -> Vec<AllocationSite> {
++    let mut sites = SITES.lock().map(|sites| sites.clone()).unwrap_or_default();
++    sites.sort_by(|a, b| b.bytes.cmp(&a.bytes));
++    sites
++}
++
+ /// `image` bound to `memory` at `offset`.
+ ///
+ /// # Safety
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 6cd9d58d..041567d2 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -336,6 +336,7 @@ pub use render_values::{
+ pub use resource::{ObjectId, ResourceRef};
+ pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
+ pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
++pub use creation::{allocation_sites, AllocationSite};
+ pub use shader_cache::{set_shader_cache_fallback, ShaderCacheFallback, 
+     ShaderCacheOptions, ShaderCacheStatistics, DEFAULT_CAPACITY, DEFAULT_MEMORY_CAPACITY,
+ };
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index cf468a3a..7283fc8c 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -3259,12 +3259,15 @@ pub struct WorkCounts {
+     pub pooled_memory_blocks_freed: u64,
+     /// Its live dedicated blocks: a placement larger than half a block, or one placed apart.
+     pub dedicated_memory_blocks_live: u64,
+-    /// Bytes of its live pooled blocks with a placement, of those the bytes placed, of its
+-    /// empty kept pooled blocks, of its dedicated blocks, and of its host imports.
++    /// Bytes of its live pooled blocks with a placement.
+     pub pooled_memory_bytes_live: u64,
++    /// Of those, the bytes placed.
+     pub pooled_memory_bytes_used: u64,
++    /// Bytes of its empty kept pooled blocks.
+     pub empty_memory_bytes_live: u64,
++    /// Bytes of its live dedicated blocks.
+     pub dedicated_memory_bytes_live: u64,
++    /// Bytes of its live host imports.
+     pub imported_memory_bytes_live: u64,
+     /// Every block its allocator freed so far, by what made it go (`MemoryFrees`): one
+     /// `vkFreeMemory` each, and the allocator's whole share of

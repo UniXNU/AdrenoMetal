@@ -367,6 +367,27 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
+/// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_allocation_sites(out: *mut u64, max: usize) -> usize {
+    if out.is_null() {
+        return 0;
+    }
+    let sites = metal2vulkan_runtime::allocation_sites();
+    let count = sites.len().min(max);
+    // SAFETY: the caller's `max` records of twelve words.
+    let out = unsafe { std::slice::from_raw_parts_mut(out, count * 12) };
+    for (record, site) in out.chunks_mut(12).zip(&sites) {
+        record[0] = site.bytes;
+        record[1] = site.count;
+        for (word, frame) in record[2..].iter_mut().zip(site.frames) {
+            *word = frame as u64;
+        }
+    }
+    count
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {

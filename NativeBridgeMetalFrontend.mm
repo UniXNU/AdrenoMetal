@@ -4232,6 +4232,27 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
+  // Who allocated the device memory (4 MiB or more at once): the six call stacks with the most bytes, as MiB, allocations and return
+  // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
+  {
+   uint64_t sites[6*12]={};
+   const size_t n=nmb_allocation_sites(sites,6);
+   for(size_t i=0;i<n;++i) {
+    const uint64_t *site=sites+i*12;
+    char frames[10][12]={};
+    for(unsigned f=0;f<10 && site[2+f];++f) {
+     Dl_info info={};
+     const bool found=dladdr((const void *)site[2+f],&info) && info.dli_fbase;
+     static Dl_info self={};static bool selfFound=dladdr((const void *)&nmb_allocation_sites,&self);
+     const bool mine=found && selfFound && info.dli_fbase==self.dli_fbase;
+     snprintf(frames[f],sizeof frames[f],"%c%llx",mine?'+':'*',
+      (unsigned long long)(found?site[2+f]-(uint64_t)info.dli_fbase:site[2+f]));
+    }
+    row("MA%zu %lluM n%llu %s %s %s %s %s",i,(unsigned long long)(site[0]>>20),(unsigned long long)site[1],frames[0],frames[1],frames[2],
+     frames[3],frames[4]);
+    row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
+   }
+  }
   // The pipeline caches compiled ahead on the host, read on demand from the userdata import region (the plugin's CacheImport.h).
   if((native_cache_import_stats[0]||native_cache_import_stats[2]||native_cache_import_stats[3])) {
    row("CI hit%llu KiB%llu miss%llu fail%llu",(unsigned long long)native_cache_import_stats[0],(unsigned long long)(native_cache_import_stats[1]>>10),

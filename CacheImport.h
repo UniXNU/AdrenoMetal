@@ -38,6 +38,8 @@ static bool (*gRegionBlock)(uint64_t offset, uint8_t *out) = [](uint64_t offset,
     return gLink.method(kMethod, &offset, sizeof offset, out, kBlock) == 0;
 };
 static FILE *gFile;
+// The kernel refused the region with kIOReturnNotPermitted (boot argument sheng-gpu-prime=0): no import, and no priming either.
+static bool gPrimingOff;
 
 static bool readBlock(uint64_t offset, uint8_t *out) {
     if (offset == gCachedBlock) {memcpy(out, gCached, kBlock); return true;}
@@ -102,14 +104,16 @@ static bool readIndex(uint64_t region, Gpu *marker);
 
 // Opens the region and reads its index; false (nothing installed) without a region or with one that does not check.
 // Markers 0x63nn: 00 started, 01 index ready (then 0x64nn: entries in thousands, saturated), f0 no connection, f1 no selector,
-// f2 no region (or not this layout), f3 the index does not match its digest.
+// f2 no region (or not this layout), f3 the index does not match its digest, f4 priming is off (sheng-gpu-prime=0).
 static bool open(Gpu &marker) {
     marker.mark(0x6300);
     gLink.call = marker.call; gLink.openFn = marker.openFn; gLink.closeFn = marker.closeFn; gLink.port = marker.port;
     if (!gLink.openFn || gLink.openFn(gLink.port, mach_task_self(), 0x4148, &gLink.conn) != 0 || !gLink.conn) {marker.mark(0x63f0); return false;}
     if (!gLink.probe()) {marker.mark(0x63f1); return false;}
     uint64_t region = 0;
-    if (gLink.method(kMethod, &region, sizeof region, &region, sizeof region) != 0) {marker.mark(0x63f2); return false;}
+    const int answer = gLink.method(kMethod, &region, sizeof region, &region, sizeof region);
+    if (answer == (int)0xe00002e2) {gPrimingOff = true; marker.mark(0x63f4); return false;}   // kIOReturnNotPermitted
+    if (answer != 0) {marker.mark(0x63f2); return false;}
     return readIndex(region, &marker);
 }
 static bool readIndex(uint64_t region, Gpu *gpu) {

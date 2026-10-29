@@ -454,14 +454,16 @@ static id deviceForPort(unsigned port) {
         // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
         // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
         // The translator recurses deeply on large functions: give it the stack of a main thread.
+        // Not with sheng-gpu-prime=0 (cacheimport::gPrimingOff): pipelines are then compiled only as processes ask for them.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        pthread_create(&primer, &attributes, [](void *) -> void * {
-            char list[1024];
-            prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
-                       requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
-            return nullptr;
-        }, nullptr);
+        if (!cacheimport::gPrimingOff)
+            pthread_create(&primer, &attributes, [](void *) -> void * {
+                char list[1024];
+                prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
+                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
+                return nullptr;
+            }, nullptr);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;
