@@ -4208,6 +4208,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
+  // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
+  uint64_t pc[10]={};
+  if(nmb_device_pass_counts(gDevice,pc))
+   row("PS ins %llu inl %llu | bar %llu tile %llu ml %llu pend %llu | sti %llu %lluM cp %llu/%llu",(unsigned long long)pc[0],
+    (unsigned long long)pc[1],(unsigned long long)pc[2],(unsigned long long)pc[3],(unsigned long long)pc[4],(unsigned long long)pc[5],
+    (unsigned long long)pc[6],(unsigned long long)(pc[7]>>20),(unsigned long long)pc[8],(unsigned long long)pc[9]);
   // The pipeline caches compiled ahead on the host, read on demand from the userdata import region (the plugin's CacheImport.h).
   if((native_cache_import_stats[0]||native_cache_import_stats[2]||native_cache_import_stats[3])) {
    row("CI hit%llu KiB%llu miss%llu fail%llu",(unsigned long long)native_cache_import_stats[0],(unsigned long long)(native_cache_import_stats[1]>>10),

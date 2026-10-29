@@ -329,6 +329,25 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
+/// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
+/// made and their bytes, and stand-in copies made and those made at draws.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.render_passes_begun_instances, w.inline_passes_split, w.instance_splits_barrier,
+                              w.instance_splits_tile_memory, w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline,
+                              w.stand_ins_made, w.stand_in_bytes, w.stand_in_copies_made, w.stand_in_copies_made_at_draws]);
+        Ok(true)
+    })
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {
