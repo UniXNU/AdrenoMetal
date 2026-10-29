@@ -1122,8 +1122,30 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
+// Textures over host pages whose rows or offset are not whole 64-byte steps, which no linear image of this GPU lays out (fd6_layout: a
+// linear pitch of 64 bytes): the runtime keeps them as shadows and copies their bytes in. Count, bytes, and the largest one's size and
+// caller, for the telemetry's TB row.
+static std::mutex gUnalignedLock;
+static uint64_t gUnalignedCount,gUnalignedBytes,gUnalignedLargest,gUnalignedCaller;
+static uint32_t gUnalignedSize[3];
+static char gUnalignedImage[24];
+static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,const void *caller) {
+ if(!(row%64) && !(offset%64))return;
+ const uint64_t bytes=(uint64_t)row*d.height*(d.depth?d.depth:1);
+ std::lock_guard<std::mutex> lock(gUnalignedLock);
+ gUnalignedCount++;gUnalignedBytes+=bytes;
+ if(bytes<=gUnalignedLargest)return;
+ gUnalignedLargest=bytes;gUnalignedSize[0]=(uint32_t)d.width;gUnalignedSize[1]=(uint32_t)d.height;gUnalignedSize[2]=(uint32_t)row;
+ Dl_info info={};
+ if(dladdr(caller,&info) && info.dli_fbase) {
+  gUnalignedCaller=(uint64_t)caller-(uint64_t)info.dli_fbase;
+  const char *name=info.dli_fname?strrchr(info.dli_fname,'/'):nullptr;
+  strlcpy(gUnalignedImage,name?name+1:(info.dli_fname?info.dli_fname:"?"),sizeof gUnalignedImage);
+ } else {gUnalignedCaller=(uint64_t)caller;gUnalignedImage[0]=0;}
+}
 @implementation NBBuffer (Textures)
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d offset:(NSUInteger)offset bytesPerRow:(NSUInteger)row {
+ if(self.wrapped)noteUnalignedTexture(d,offset,row,__builtin_return_address(0));
  NBTexture *texture=textureOnBuffer(self,d,offset,row,false);
  if(gLogTextures && self.wrapped)logTexture("no-copy",d,nullptr,0,self.wrapped,offset,row,texture!=nil);
  return (id<MTLTexture>)texture;
@@ -4233,6 +4255,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
+  {
+   std::lock_guard<std::mutex> lock(gUnalignedLock);
+   if(gUnalignedCount)
+    row("TB n%llu %lluM big %ux%u row%u %.20s+%llx",(unsigned long long)gUnalignedCount,(unsigned long long)(gUnalignedBytes>>20),
+     gUnalignedSize[0],gUnalignedSize[1],gUnalignedSize[2],gUnalignedImage,(unsigned long long)gUnalignedCaller);
+  }
   // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
   // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
   uint64_t pc[10]={};
