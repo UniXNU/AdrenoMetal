@@ -1,0 +1,69 @@
+diff --git a/crates/metal2vulkan-runtime/src/rebind.rs b/crates/metal2vulkan-runtime/src/rebind.rs
+index 3fe37827..17fbf6d6 100644
+--- a/crates/metal2vulkan-runtime/src/rebind.rs
++++ b/crates/metal2vulkan-runtime/src/rebind.rs
+@@ -96,6 +96,8 @@ pub enum RebindProblem {
+     /// attachments' bytes from its open), or one committed whose commands the runtime records
+     /// only once earlier work completed: commit or drop it first.
+     EncodedUses,
++    /// The device refuses every rebind (`Device::refuse_rebinds`).
++    Refused,
+ }
+ 
+ /// The device's buffers over host pages, by their hazard-tracking key, with the command buffers
+@@ -103,6 +105,9 @@ pub enum RebindProblem {
+ #[derive(Default)]
+ pub(super) struct Rebinds {
+     live: AtomicUsize,
++    /// The device refuses every rebind (`Device::refuse_rebinds`): its encoders log no call and
++    /// hold no buffer over host pages, as though it had none.
++    refused: std::sync::atomic::AtomicBool,
+     buffers: Mutex<KeyMap<ResourceKey, Entry>>,
+     /// How many of them are detached (`detach.rs`): else no command names a detached one.
+     detached: AtomicUsize,
+@@ -210,7 +215,7 @@ impl Rebinds {
+ 
+     /// Whether the device has a buffer over host pages: else no use names one.
+     pub(super) fn any(&self) -> bool {
+-        self.live.load(Ordering::Relaxed) > 0
++        self.live.load(Ordering::Relaxed) > 0 && !self.refused.load(Ordering::Relaxed)
+     }
+ 
+     /// Note the buffer of `key` over host pages, `cell` its hold on them.
+@@ -935,6 +940,9 @@ impl Buffer {
+         keep_alive: Option<KeepAlive>,
+     ) -> Result<(), Error> {
+         const CALL: &str = "rebind_bytes_no_copy";
++        if self.device().shared().rebinds.refused.load(Ordering::Relaxed) {
++            return Err(invalid(CALL, Problem::Rebind(RebindProblem::Refused)));
++        }
+         let Some(cell) = self.host_cell() else {
+             return Err(invalid(CALL, Problem::Rebind(RebindProblem::NotHostMemory)));
+         };
+@@ -987,6 +995,9 @@ impl Heap {
+         keep_alive: Option<KeepAlive>,
+     ) -> Result<(), Error> {
+         const CALL: &str = "rebind_bytes_no_copy";
++        if self.device().shared().rebinds.refused.load(Ordering::Relaxed) {
++            return Err(invalid(CALL, Problem::Rebind(RebindProblem::Refused)));
++        }
+         let Some((own, cell)) = self
+             .bytes()
+             .and_then(|own| own.host_cell().map(|cell| (own, cell)))
+@@ -1016,3 +1027,16 @@ impl Device {
+         self.shared().rebinds.pending(key)
+     }
+ }
++
++impl Device {
++    /// Refuse every `rebind_bytes_no_copy` of the device's buffers and heaps from now on
++    /// (`Invalid`, [`RebindProblem::Refused`]), for a consumer that never moves the pages of what
++    /// it made with `new_buffer_with_bytes_no_copy` or `new_heap_with_bytes_no_copy`, and never
++    /// detaches them: the encoders then log no call to encode again at a rebind and hold no buffer
++    /// over host pages, which only a rebind or a detach reads, so a draw pays for neither. Call
++    /// before any buffer over host pages is made. No Metal counterpart.
++    #[doc(hidden)]
++    pub fn refuse_rebinds(&self) {
++        self.shared().rebinds.refused.store(true, Ordering::Relaxed);
++    }
++}

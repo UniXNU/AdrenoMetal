@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-air/src/canon/sccp.rs b/crates/metal2vulkan-air/src/canon/sccp.rs
-index e47e683..f89e2fc 100644
+index e47e6833..f89e2fc1 100644
 --- a/crates/metal2vulkan-air/src/canon/sccp.rs
 +++ b/crates/metal2vulkan-air/src/canon/sccp.rs
 @@ -995,6 +995,30 @@ impl<'b> Solver<'b> {

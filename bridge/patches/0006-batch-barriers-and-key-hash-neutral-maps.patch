@@ -1,0 +1,101 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 6ab175dd..0cce8207 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -648,11 +648,8 @@ impl CommandBufferShared {
+             barriers.first().is_some_and(Option::is_some) || !held_moves.transitions(0).is_empty();
+         if entry.is_some() {
+             started = true;
+-            let globals: Vec<Barrier> = completed_barrier
+-                .take()
+-                .into_iter()
+-                .chain(entry_barrier)
+-                .collect();
++            let (pair, count) = barrier_pair(completed_barrier.take(), entry_barrier);
++            let globals = &pair[..count];
+             let stamps = Stamps {
+                 start: start_stamp.filter(|_| !encoder_behind),
+                 after: entry_barrier.is_some(),
+@@ -661,14 +658,11 @@ impl CommandBufferShared {
+             if stamps.start.is_some() {
+                 start_stamp = None;
+             }
+-            work.push(self.record_barriers(&mut state, &globals, &entries, stamps)?);
++            work.push(self.record_barriers(&mut state, globals, &entries, stamps)?);
+         }
+         for (offset, barrier) in barriers.iter().enumerate() {
+-            let globals: Vec<Barrier> = completed_barrier
+-                .take()
+-                .into_iter()
+-                .chain(*barrier)
+-                .collect();
++            let (pair, count) = barrier_pair(completed_barrier.take(), *barrier);
++            let globals = &pair[..count];
+             let moves = held_moves.transitions(offset);
+             if !globals.is_empty() || start_stamp.is_some() || !moves.is_empty() {
+                 started |= offset == 0;
+@@ -678,7 +672,7 @@ impl CommandBufferShared {
+                     end: None,
+                 };
+                 let kept = &mut scheduler.kept;
+-                work.push(self.barrier_buffer(&mut state, kept, at, &globals, moves, stamps)?);
++                work.push(self.barrier_buffer(&mut state, kept, at, globals, moves, stamps)?);
+             }
+             work.extend(&state.recorded[start + offset].raws);
+         }
+@@ -1429,3 +1423,15 @@ impl Stamps {
+         })
+     }
+ }
++
++/// `lead` then `barrier`, those of them there are, as the first `.1` of the array: the globals
++/// of a barrier between a batch's encoders, which takes no allocation.
++fn barrier_pair(lead: Option<Barrier>, barrier: Option<Barrier>) -> ([Barrier; 2], usize) {
++    let mut pair = [Barrier::default(); 2];
++    let mut count = 0;
++    for b in lead.into_iter().chain(barrier) {
++        pair[count] = b;
++        count += 1;
++    }
++    (pair, count)
++}
+diff --git a/crates/metal2vulkan-runtime/src/neutral.rs b/crates/metal2vulkan-runtime/src/neutral.rs
+index c75c19f6..947f1008 100644
+--- a/crates/metal2vulkan-runtime/src/neutral.rs
++++ b/crates/metal2vulkan-runtime/src/neutral.rs
+@@ -37,7 +37,7 @@ use metal2vulkan::bind::NeutralResource;
+ use metal2vulkan::device::FormatUsage;
+ use metal2vulkan::vk::Format;
+ use std::any::Any;
+-use std::collections::HashMap;
++use super::key_hash::KeyMap;
+ use std::sync::{Arc, Mutex, Weak};
+ 
+ /// One neutral image, its view and its memory.
+@@ -99,9 +99,9 @@ impl Filled for NeutralZeros {
+ /// A device's neutral images, texel buffers, zero buffers and samplers, made at first use.
+ #[derive(Default)]
+ pub(super) struct Neutrals {
+-    images: HashMap<NeutralResource, Arc<NeutralImage>>,
++    images: KeyMap<NeutralResource, Arc<NeutralImage>>,
+     /// By format and whether the view is a storage texel buffer's.
+-    texels: HashMap<(Format, bool), Arc<NeutralTexels>>,
++    texels: KeyMap<(Format, bool), Arc<NeutralTexels>>,
+     /// By their length in bytes, which the plan asks for (`zero_buffer_bytes`, fixed for the
+     /// device): the read-only zero buffers, and how many the device has made.
+     ///
+@@ -113,12 +113,12 @@ pub(super) struct Neutrals {
+     /// allocate-and-zero a draw. Zeros of a length the device's own limits fix cannot have
+     /// changed since the device was made, so the device makes each length once and keeps it, as
+     /// it keeps its neutral images, texel buffers and samplers.
+-    zeros: HashMap<u64, Arc<NeutralZeros>>,
++    zeros: KeyMap<u64, Arc<NeutralZeros>>,
+     /// How many zero buffers the device has made, for the check that draws share one
+     /// (`tests::neutral_zeros_shared`).
+     zeros_made: u64,
+     /// By whether depth comparison is enabled.
+-    samplers: HashMap<bool, vk::Sampler>,
++    samplers: KeyMap<bool, vk::Sampler>,
+ }
+ 
+ impl Neutrals {

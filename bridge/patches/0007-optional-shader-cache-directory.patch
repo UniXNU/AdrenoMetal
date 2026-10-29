@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/store.rs b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
-index 98e82e1..1c7eac7 100644
+index 815dd990..38742f62 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/store.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
-@@ -68,6 +68,11 @@ impl Directory {
+@@ -81,6 +81,11 @@ impl Directory {
      /// Open `root` for `build` with a cap of `capacity` bytes: create it and the build's
      /// directory (owner-only) and write and remove a probe file there. The error names the
      /// directory that failed.
@@ -14,7 +14,7 @@ index 98e82e1..1c7eac7 100644
      pub(crate) fn open(root: PathBuf, build: Hash256, capacity: u64) -> Result<Directory, Failed> {
          let directory = Directory {
              root,
-@@ -78,14 +83,20 @@ impl Directory {
+@@ -91,14 +96,20 @@ impl Directory {
              let path = path.to_path_buf();
              move |error| Failed { path, error }
          };

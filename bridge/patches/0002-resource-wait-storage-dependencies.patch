@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/used_resources.rs b/crates/metal2vulkan-runtime/src/used_resources.rs
-index 7521345..03001a8 100644
+index 61f56de6..54e1551f 100644
 --- a/crates/metal2vulkan-runtime/src/used_resources.rs
 +++ b/crates/metal2vulkan-runtime/src/used_resources.rs
-@@ -58,6 +58,62 @@ pub struct UsedResources {
+@@ -59,6 +59,62 @@ pub struct UsedResources {
      pub heaps: Vec<Heap>,
  }
  

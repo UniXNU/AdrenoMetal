@@ -17,7 +17,7 @@ pub mod objects;
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
-    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction, MetalLevel,
+    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction,
     Origin, PipelineOptions, RenderPassDescriptor, ResourceOptions, Size, StoreAction, TextureDescriptor,
 };
 use std::ffi::{c_char, c_void, CStr};
@@ -88,8 +88,6 @@ fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
 fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
     let mut options = DeviceOptions::default();
     options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-    // No macOS release names this host; answer as the newest measured Metal.
-    options.metal_level = Some(MetalLevel::NEWEST);
     options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
     Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
 }

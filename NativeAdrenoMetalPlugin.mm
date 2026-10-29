@@ -420,12 +420,17 @@ static id deviceForPort(unsigned port) {
         // The translator recurses deeply on large functions: give it the stack of a main thread.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        pthread_create(&primer, &attributes, [](void *) -> void * {
+        // First the pipeline caches compiled ahead on the host, from the import region (CacheExport.h importRegion), which also lists
+        // every library they cover as primed: priming then compiles only what they left out. The runtime looks its entries up as it
+        // needs them, so the render server draws meanwhile.
+        pthread_create(&primer, &attributes, [](void *arg) -> void * {
+            pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+            cacheexport::importRegion(*static_cast<Gpu *>(arg), gCacheDirectory);
             char list[1024];
             prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
                        requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
             return nullptr;
-        }, nullptr);
+        }, gpu);
         pthread_attr_destroy(&attributes);
         gpu->mark(0x6803);
         return device;

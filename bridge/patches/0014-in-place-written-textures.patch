@@ -1,0 +1,110 @@
+diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
+index 86f42373..d287774a 100644
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -251,6 +251,10 @@ pub(crate) fn in_place(
+     if policy == HostPageTexturePolicy::Shadow {
+         return Err(ShadowCause::Exact);
+     }
++    // Trusting the driver for every usage (`HostPageTexturePolicy::InPlaceWrites`): no check.
++    if policy == HostPageTexturePolicy::InPlaceWrites {
++        return Ok(());
++    }
+     if usage.contains(TextureUsage::RENDER_TARGET) {
+         return Err(ShadowCause::RenderTarget);
+     }
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index 034be29f..ab2551eb 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -947,6 +947,26 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(),
+     ))
+ }
+ 
++/// Whether a render pass that keeps a texture `width` texels wide over `layout`'s texels in tile
++/// memory stores it back within the bytes an image over them may hold, in a buffer of
++/// `buffer_length` bytes: a tile store reaching the texture's right or bottom edge writes whole
++/// 16x4-texel blocks, so up to 15 texels past a row's last and 3 rows past its last row. Every
++/// row's block must end within its pitch, and the last block within the buffer; one slice only.
++pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
++    const TILE: (u64, u64) = (16, 4);
++    if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
++        return false;
++    }
++    let block_row = width.next_multiple_of(TILE.0) * (layout.row_bytes / width);
++    let last_row = layout.rows.next_multiple_of(TILE.1) - 1;
++    layout.row_pitch >= block_row
++        && layout
++            .offset
++            .saturating_add(layout.row_pitch.saturating_mul(last_row))
++            .saturating_add(block_row)
++            <= buffer_length
++}
++
+ /// Whether a linear image over `layout`'s texels, whose subresources take `size` bytes each from
+ /// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels:
+ /// the texels lie with no byte between them ([`holding`]), and its last subresource ends at their
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 18bf0dde..2e786f6c 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -84,7 +84,7 @@ use super::image_plan::{
+ use super::in_place::{self, PagesClass, Refusal, ShadowCause, Verdict};
+ use super::key_hash::KeyMap;
+ use super::linear_plan::{
+-    aliases, check_linear_limits, holding, linear_lack, LinearImage, LinearLack,
++    aliases, check_linear_limits, holding, linear_lack, tile_store_fits, LinearImage, LinearLack,
+ };
+ use super::memory::{MemoryClass, Placement};
+ use super::nan_clear;
+@@ -2258,7 +2258,30 @@ impl Device {
+             None => {
+                 // Whether an image may hold the texels: none where their rows (or slices) lie
+                 // with the buffer's bytes between them (`linear_plan::holding`), and else why.
+-                let holds = holding(&texels.layout, usage);
++                let mut holds = holding(&texels.layout, usage);
++                // Rows that lie apart alias the buffer's bytes, written too, under
++                // `HostPageTexturePolicy::InPlaceWrites`: the bytes between them are no texel's,
++                // and a program that pads its framebuffers (a window server's) keeps nothing
++                // there. A written texture's tile stores must stay within its rows
++                // (`linear_plan::tile_store_fits`). Rows that share bytes stay refused.
++                let policy = self.compile_device().policy().host_page_textures;
++                let writes = usage.intersects(
++                    TextureUsage::RENDER_TARGET
++                        | TextureUsage::SHADER_WRITE
++                        | TextureUsage::SHADER_ATOMIC,
++                );
++                if holds.is_err()
++                    && policy == HostPageTexturePolicy::InPlaceWrites
++                    && texels.layout.shared_bytes() == 0
++                    && (!writes
++                        || tile_store_fits(
++                            &texels.layout,
++                            u64::from(layout.extent[0]),
++                            texels.buffer.length(),
++                        ))
++                {
++                    holds = Ok(());
++                }
+                 // The usage the texture lacks, as for a texture of its own: plain Metal writes a
+                 // texture over a buffer made without `ShaderWrite` and reads one made without
+                 // `ShaderRead`. A linear image aliasing the buffer's memory takes it where one
+diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
+index be5bec3d..6687452e 100644
+--- a/crates/metal2vulkan/src/device/policy.rs
++++ b/crates/metal2vulkan/src/device/policy.rs
+@@ -271,6 +271,14 @@ pub enum HostPageTexturePolicy {
+     /// texels into before each use and merge back after each write, whose copies touch the
+     /// texels alone.
+     Shadow,
++    /// [`InPlace`](Self::InPlace) for every usage, a texture that renders or writes too, with no
++    /// check run and no verdict waited for, trusting the driver to touch no byte beside the
++    /// texels: a window server's surfaces, which it renders into each frame, are otherwise copied
++    /// into a shadow before each pass and merged back after it. A padded texture over a buffer of
++    /// the runtime's own memory aliases its bytes too, a written one where its tile stores stay
++    /// within its rows (`linear_plan::tile_store_fits`), where the device lays it out at the
++    /// buffer's row pitch.
++    InPlaceWrites,
+ }
+ 
+ /// How a chain of `half` additions, subtractions and products rounds on a device without

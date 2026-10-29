@@ -1,0 +1,32 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 2e786f6c..b1b02b30 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2221,6 +2221,27 @@ impl Device {
+                         true => HostPageTexturePolicy::InPlace,
+                         false => self.compile_device().policy().host_page_textures,
+                     };
++                    // A written texture in place under `InPlaceWrites` whose tile stores would
++                    // reach past its rows or its buffer (`linear_plan::tile_store_fits`) is a
++                    // shadow instead.
++                    let writes = usage.intersects(
++                        TextureUsage::RENDER_TARGET
++                            | TextureUsage::SHADER_WRITE
++                            | TextureUsage::SHADER_ATOMIC,
++                    );
++                    let policy = match policy {
++                        HostPageTexturePolicy::InPlaceWrites
++                            if writes
++                                && !tile_store_fits(
++                                    &texels.layout,
++                                    u64::from(layout.extent[0]),
++                                    texels.buffer.length(),
++                                ) =>
++                        {
++                            HostPageTexturePolicy::Shadow
++                        }
++                        policy => policy,
++                    };
+                     let verdict = |class| match checking {
+                         true => Verdict::Passed,
+                         false => self.in_place_verdict(class),

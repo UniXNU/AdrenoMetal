@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan/src/reflection/function.rs b/crates/metal2vulkan/src/reflection/function.rs
-index e62075c..812f372 100644
+index cb1d1a91..c8ad1973 100644
 --- a/crates/metal2vulkan/src/reflection/function.rs
 +++ b/crates/metal2vulkan/src/reflection/function.rs
 @@ -224,9 +224,12 @@ pub(crate) fn metallib_properties(

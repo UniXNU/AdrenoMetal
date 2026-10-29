@@ -1,28 +1,28 @@
 diff --git a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
-index 0b004f2..ead0ad8 100644
+index 33c67576..55c119e6 100644
 --- a/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
 +++ b/crates/metal2vulkan/src/lower/arith/extended_range/blend.rs
-@@ -765,10 +765,16 @@ fn planned_for(
-     let narrow = narrow(eq);
+@@ -990,10 +990,16 @@ fn planned_for(
      // The rounded model holds for any blend into an `_sRGB` form, a mask of one color channel,
-     // and the color channels' blend color difference.
+     // and the color channels' blend color difference; the fast models for `BGRA10_XR_sRGB`'s
+     // narrow blends alone.
 +    // An `_sRGB` form's blend the fast model does not hold (any but a narrow, unmasked one) takes
-+    // the rounded model, Metal's own without fast math, measured for every `_sRGB` form (EV
-+    // XRB-xrts-m4) and apart from its fast-math result only in roundings, rather than no pipeline:
-+    // NanoUniverse's starfield (the Astronomy wallpaper, `BGRA10_XR_sRGB`) had none.
-+    let math = if math == BlendMath::Fast && srgb && (!narrow || masked) {
++    // the rounded model, Metal's own without fast math, measured for every `_sRGB` form and apart
++    // from its fast-math result only in roundings, rather than no pipeline: NanoUniverse's
++    // starfield (the Astronomy wallpaper, `BGRA10_XR_sRGB`) had none.
++    let math = if math == BlendMath::Fast && narrow_only && (!narrow || masked) {
 +        BlendMath::Rounded
 +    } else {
 +        math
 +    };
      let fast = math == BlendMath::Fast;
--    if fast && srgb && (!narrow || masked) {
+-    if fast && narrow_only && (!narrow || masked) {
 -        return Err(refused(ExtendedRangeBlend::SrgbForm));
 -    }
      let opaque_ = !has_alpha;
      let color = match colors {
          0 => None,
-@@ -910,6 +916,13 @@ impl Blend {
+@@ -1518,6 +1524,13 @@ impl Blend {
      /// Metal's model's: a `half4` one; a `float4` one under a blend whose color lanes take one term
      /// alone, unmasked, rounded to `half` first; another is the gap it is.
      pub fn takes(&self, output: Option<FloatFmt>) -> Result<(), Error> {

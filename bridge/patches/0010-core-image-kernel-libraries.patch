@@ -1,6 +1,8 @@
+diff --git a/crates/metal2vulkan-air/src/container/mtlb.rs b/crates/metal2vulkan-air/src/container/mtlb.rs
+index d4c8e2bd..f8add976 100644
 --- a/crates/metal2vulkan-air/src/container/mtlb.rs
 +++ b/crates/metal2vulkan-air/src/container/mtlb.rs
-@@ -41,6 +41,13 @@
+@@ -41,6 +41,13 @@ const SUPPORTED_MAJOR: [u16; 2] = [1, 2];
  const FILE_TYPE_EXECUTABLE: u8 = 0;
  /// `file_type` of a dynamic library (`MTLLibraryTypeDynamic`).
  const FILE_TYPE_DYNAMIC: u8 = 2;
@@ -14,7 +16,7 @@
  
  /// A metallib's library type (`MTLLibraryType`), from its header's `file_type`.
  #[non_exhaustive]
-@@ -248,7 +255,10 @@
+@@ -248,7 +255,10 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
              6,
          ));
      }
@@ -26,21 +28,23 @@
          return Err(InputError::new(
              InputErrorKind::Unsupported(Feature::LibraryKind(header.file_type)),
              Location::container(10),
-@@ -317,6 +327,11 @@
-     }
+@@ -318,6 +328,11 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Metallib<'_>, Error> {
      if at != entries_end {
          return Err(container_error(ContainerError::BadOffset, 32));
-+    }
+     }
 +    // A Core Image kernel library lists its kernels over one shared module; Metal names none of
 +    // them, so neither does the library here.
 +    if header.file_type == FILE_TYPE_CI_KERNELS {
 +        parsed.retain(|p| p.function.stage != FunctionStage::Other(TYPE_CI_KERNEL));
-     }
++    }
      let (extended, _) = tags::read_list(file, at, file.len())?;
      let mut linkage = linkage(file, &extended)?;
+     if header.file_type == FILE_TYPE_DYNAMIC {
+diff --git a/crates/metal2vulkan-air/src/container/tests.rs b/crates/metal2vulkan-air/src/container/tests.rs
+index 81e4e5af..b7c10b5f 100644
 --- a/crates/metal2vulkan-air/src/container/tests.rs
 +++ b/crates/metal2vulkan-air/src/container/tests.rs
-@@ -593,14 +593,25 @@
+@@ -593,14 +593,25 @@ fn unsupported_versions_and_library_kinds() {
      b.version = (1, 2);
      assert!(parse(&b.build()).is_ok());
      let mut b = sample();
