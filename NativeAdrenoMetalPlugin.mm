@@ -296,6 +296,12 @@ static id deviceForPort(unsigned port) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
             const float one = 1.0f;
             gpu->mark(writeTask(0x1e7021014 + slide, &one, sizeof one) ? 0x6E01 : 0x6EF1);
+            // The override alone left the framebuffer RGhA (i14aef633e: four 48388 KiB swap surfaces, mark 6E01 written):
+            // IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838) takes RGhA when the headroom is above its FP16 threshold
+            // (__DATA_DIRTY 0x1e7021104, 0 unless set) and the panel's own headroom above 8, so a headroom of 1 still passes. The
+            // threshold is held at the largest float: no headroom reaches it.
+            const float never = __FLT_MAX__;
+            gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
         }
 #endif
         // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
