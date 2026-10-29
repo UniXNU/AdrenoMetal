@@ -46,6 +46,7 @@
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
 static NmbDevice *gDevice;
+static std::string gLoaderPath;   // the Turnip library the runtime loaded (its own handle is local to it)
 static id gDeviceObject;
 
 // DEBUG (the guest's memory corruption, 2026-10-26): with NATIVE_METAL_ABORT_PROBE=1 in its environment, a process that aborts
@@ -4012,6 +4013,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  gDevice=nmb_device_open(loader,cache);
+ if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
@@ -4215,6 +4217,21 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("PS ins %llu inl %llu | bar %llu tile %llu ml %llu pend %llu | sti %llu %lluM cp %llu/%llu",(unsigned long long)pc[0],
     (unsigned long long)pc[1],(unsigned long long)pc[2],(unsigned long long)pc[3],(unsigned long long)pc[4],(unsigned long long)pc[5],
     (unsigned long long)pc[6],(unsigned long long)(pc[7]>>20),(unsigned long long)pc[8],(unsigned long long)pc[9]);
+  // Where this process's GPU memory is (MiB): the runtime's pooled blocks (placed in them), empty kept blocks, dedicated blocks, host
+  // imports, allocated so far; then Turnip's cache of freed BOs now and at most (tu_darwin_bo_cache_stats). The kernel's [gpu objects]
+  // row has the process's own BOs: what is neither the runtime's nor the cache's is Turnip's own (command streams, shaders).
+  uint64_t mc[10]={};
+  if(nmb_device_memory_counts(gDevice,mc)) {
+   uint64_t bc[8]={};
+   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+   static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
+   if(cacheStats)cacheStats(bc);
+   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
+    (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
+    (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
+    (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
+    (unsigned long long)bc[2],(unsigned long long)bc[3]);
+  }
   // The pipeline caches compiled ahead on the host, read on demand from the userdata import region (the plugin's CacheImport.h).
   if((native_cache_import_stats[0]||native_cache_import_stats[2]||native_cache_import_stats[3])) {
    row("CI hit%llu KiB%llu miss%llu fail%llu",(unsigned long long)native_cache_import_stats[0],(unsigned long long)(native_cache_import_stats[1]>>10),

@@ -48,6 +48,9 @@ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
+// Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
+// blocks live; GPU pool blocks made and released.
+bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
 // No-copy ranges checked, and those whose pages had changed since a buffer was last made over them (reported to the runtime as remapped).
 bool nmb_no_copy_remaps(uint64_t out[2]);
 /* Artifact lookups and driver pipeline records are separate cache layers. */

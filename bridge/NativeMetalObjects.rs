@@ -348,6 +348,25 @@ pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64
     })
 }
 
+/// Where the runtime's device memory is, into the caller's ten words: bytes of its pooled blocks with a placement and of those the
+/// bytes placed, of its empty kept pooled blocks, of its dedicated blocks (GPU pools, large resources) and of its host imports; then
+/// the bytes it allocated so far, its live pooled and dedicated block counts, and the GPU pool blocks made and released.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's ten words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 10) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.pooled_memory_bytes_live, w.pooled_memory_bytes_used, w.empty_memory_bytes_live,
+                              w.dedicated_memory_bytes_live, w.imported_memory_bytes_live, w.device_memory_allocated,
+                              w.memory_blocks_live, w.dedicated_memory_blocks_live, w.gpu_pool_blocks_made, w.gpu_pool_blocks_released]);
+        Ok(true)
+    })
+}
+
 /// Separate artifact and driver-record counters, mirroring the C ABI.
 #[repr(C)]
 pub struct NmbShaderCacheStats {

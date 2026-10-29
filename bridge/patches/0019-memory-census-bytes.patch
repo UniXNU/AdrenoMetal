@@ -1,0 +1,72 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 8200c10d..1f882747 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -624,13 +624,18 @@ impl<T> Pool<T> {
+     /// imports, whatever else they are.
+     fn count_into(&self, census: &mut Census, imported: impl Fn(&T) -> bool) {
+         for block in self.blocks.iter().flatten() {
+-            let count = match (imported(&block.payload), block.dedicated) {
+-                (true, _) => &mut census.imported,
+-                (false, true) => &mut census.dedicated,
+-                (false, false) if block.ranges.is_empty() => &mut census.empty,
+-                (false, false) => &mut census.pooled,
++            let bytes = block.ranges.len();
++            let (count, total) = match (imported(&block.payload), block.dedicated) {
++                (true, _) => (&mut census.imported, &mut census.imported_bytes),
++                (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
++                (false, false) if block.ranges.is_empty() => (&mut census.empty, &mut census.empty_bytes),
++                (false, false) => {
++                    census.pooled_used_bytes += block.ranges.used();
++                    (&mut census.pooled, &mut census.pooled_bytes)
++                }
+             };
+             *count += 1;
++            *total += bytes;
+         }
+     }
+ }
+@@ -681,6 +686,13 @@ pub(super) struct Census {
+     pub(super) dedicated: u64,
+     /// The caller's host memory imported ([`Memory::import_host`]), a block each.
+     pub(super) imported: u64,
++    /// The bytes of those blocks: pooled ones, the bytes placed in them, empty kept ones,
++    /// dedicated ones and imports.
++    pub(super) pooled_bytes: u64,
++    pub(super) pooled_used_bytes: u64,
++    pub(super) empty_bytes: u64,
++    pub(super) dedicated_bytes: u64,
++    pub(super) imported_bytes: u64,
+ }
+ 
+ /// A host pointer the runtime may send between threads: the mapping of a block it owns.
+diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
+index 1c56ba2c..cf468a3a 100644
+--- a/crates/metal2vulkan-runtime/src/work_counts.rs
++++ b/crates/metal2vulkan-runtime/src/work_counts.rs
+@@ -3259,6 +3259,13 @@ pub struct WorkCounts {
+     pub pooled_memory_blocks_freed: u64,
+     /// Its live dedicated blocks: a placement larger than half a block, or one placed apart.
+     pub dedicated_memory_blocks_live: u64,
++    /// Bytes of its live pooled blocks with a placement, of those the bytes placed, of its
++    /// empty kept pooled blocks, of its dedicated blocks, and of its host imports.
++    pub pooled_memory_bytes_live: u64,
++    pub pooled_memory_bytes_used: u64,
++    pub empty_memory_bytes_live: u64,
++    pub dedicated_memory_bytes_live: u64,
++    pub imported_memory_bytes_live: u64,
+     /// Every block its allocator freed so far, by what made it go (`MemoryFrees`): one
+     /// `vkFreeMemory` each, and the allocator's whole share of
+     /// `object_churn.vk_memory_freed`.
+@@ -5039,6 +5046,11 @@ impl Device {
+             pooled_memory_blocks_made: made,
+             pooled_memory_blocks_freed: freed,
+             dedicated_memory_blocks_live: census.dedicated,
++            pooled_memory_bytes_live: census.pooled_bytes,
++            pooled_memory_bytes_used: census.pooled_used_bytes,
++            empty_memory_bytes_live: census.empty_bytes,
++            dedicated_memory_bytes_live: census.dedicated_bytes,
++            imported_memory_bytes_live: census.imported_bytes,
+             memory_frees: MemoryFrees {
+                 dedicated: frees[FreeCause::Dedicated as usize],
+                 pooled_emptied: frees[FreeCause::PooledEmptied as usize],
