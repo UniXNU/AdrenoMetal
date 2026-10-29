@@ -1,0 +1,39 @@
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index b1b02b30..8baf3ded 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -2221,27 +2221,13 @@ impl Device {
+                         true => HostPageTexturePolicy::InPlace,
+                         false => self.compile_device().policy().host_page_textures,
+                     };
+-                    // A written texture in place under `InPlaceWrites` whose tile stores would
+-                    // reach past its rows or its buffer (`linear_plan::tile_store_fits`) is a
+-                    // shadow instead.
+-                    let writes = usage.intersects(
+-                        TextureUsage::RENDER_TARGET
+-                            | TextureUsage::SHADER_WRITE
+-                            | TextureUsage::SHADER_ATOMIC,
+-                    );
+-                    let policy = match policy {
+-                        HostPageTexturePolicy::InPlaceWrites
+-                            if writes
+-                                && !tile_store_fits(
+-                                    &texels.layout,
+-                                    u64::from(layout.extent[0]),
+-                                    texels.buffer.length(),
+-                                ) =>
+-                        {
+-                            HostPageTexturePolicy::Shadow
+-                        }
+-                        policy => policy,
+-                    };
++                    // A written texture in place under `InPlaceWrites` is rendered by the
++                    // device's own texels alone, whatever its size: the driver renders a linear
++                    // image over a host allocation whose size is not whole tile blocks without
++                    // tile memory (the board's Turnip, `turnip-render-mode-for-attachment-memory`).
++                    // Its shadow merged every pass's writes back through a scratch of twice its
++                    // bytes (iPadOS 27's backboardd, a 3048x2032 RGBA16Float surface: 58 GB of
++                    // scratch in 613 passes).
+                     let verdict = |class| match checking {
+                         true => Verdict::Passed,
+                         false => self.in_place_verdict(class),
