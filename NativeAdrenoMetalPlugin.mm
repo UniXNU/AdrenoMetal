@@ -310,7 +310,11 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
-            // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156). A framebuffer still RGhA with 0x6E23 is the display's own flag.
+            // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
+            // i35abaf83 read 0x6E23 and the framebuffer stayed RGhA (48388K swap surfaces, 8 bytes a pixel). The function has two more
+            // ways to RGhA: the display's own flag (+0x6840 of the display) and, when no compression format was picked, the virtualized
+            // byte, which sub_184541f10 stores once from a call with the constant CFString at 0x1e9021680; the string's text is noted
+            // ("ca virtualized key ...") so the answer behind it can be found.
             static uintptr_t gSlide;
             gSlide = slide;
             pthread_t reader;
@@ -320,7 +324,18 @@ static id deviceForPort(unsigned port) {
                 const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
                 const uint8_t force = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 128 + gSlide);
                 const uint8_t mirroring = *reinterpret_cast<volatile const uint8_t *>(0x1e702116c + 156 + gSlide);
-                static_cast<Gpu *>(arg)->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0));
+                const uint8_t virtualized = *reinterpret_cast<volatile const uint8_t *>(0x1e701bdd9 + gSlide);
+                static_cast<Gpu *>(arg)->mark(0x6E20 | (headroom == 1.0f ? 1 : 0) | (threshold > 1.0f ? 2 : 0) | (force ? 4 : 0) | (mirroring ? 8 : 0) |
+                                              (virtualized ? 0x10 : 0));
+                // A constant CFString: isa, flags, bytes, length. Only an 8-bit constant (flags 0x7c8) with a short length is read.
+                const uint64_t *cf = reinterpret_cast<const uint64_t *>(0x1e9021680 + gSlide);
+                char note[96];
+                if ((uint32_t)cf[1] == 0x7c8 && cf[3] > 0 && cf[3] < 64) {
+                    const char *text = reinterpret_cast<const char *>(ptrauth_strip(reinterpret_cast<void *>(cf[2]), ptrauth_key_process_independent_data));
+                    snprintf(note, sizeof note, "ca virtualized key %.*s = %u", (int)cf[3], text, virtualized);
+                } else
+                    snprintf(note, sizeof note, "ca virtualized key ? flags %llx = %u", (unsigned long long)cf[1], virtualized);
+                native_bridge_metal_note(note);
                 return nullptr;
             }, gpu) == 0)
                 pthread_detach(reader);
