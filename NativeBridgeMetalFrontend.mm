@@ -327,14 +327,17 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
   std::vector<std::pair<uint32_t,uint64_t>> rows;
   for(auto &entry:addresses)rows.push_back({entry.second.inclusive,entry.first});
   std::sort(rows.rbegin(),rows.rend());
-  for(unsigned i=0;i<rows.size() && i<1500;i++){
+  for(unsigned i=0;i<rows.size() && i<800;i++){
    Dl_info info={};if(!dladdr((const void *)rows[i].second,&info) || !info.dli_fname)continue;
    char line[400];snprintf(line,sizeof line,"A %u %u %s 0x%llx\n",rows[i].first,addresses[rows[i].second].leaf,info.dli_fname,(unsigned long long)(rows[i].second-(uint64_t)info.dli_fbase));
    out+=line;
   }
  }
- ftruncate(fd,0);lseek(fd,0,SEEK_SET);
- if(write(fd,out.data(),out.size())<0)return;
+ // A fixed size, rewritten in place: the diagnostic export measures a file's size once and copies exactly that many bytes, so a file that
+ // grows between the measurement and the copy came out cut (16 bytes of 34663 samples).
+ const size_t fixedSize=262144;
+ out.resize(fixedSize>out.size()?fixedSize:out.size(),'\n');out.resize(fixedSize);
+ if(pwrite(fd,out.data(),out.size(),0)<0)return;
 }
 static void traceStartWriter() {
  bool expected=false;
