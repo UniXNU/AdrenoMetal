@@ -65,10 +65,51 @@ done:
   ret void
 }
 
+; scanout_opaque: BGRA rows to the scanout's rows with alpha 0xff. The display fetches the scanout with its per-pixel alpha (SSPP
+; SRC_FORMAT 0x237ff: bit 8, alpha enable) and blends it over its own background; the compositor's framebuffer alpha is not opacity, so
+; a frame copied as it is showed translucent tinted blocks wherever the alpha was below 1 (around Liquid Glass, i23c80d087).
+;   kernel void scanout_opaque(device const uint *src [[buffer(0)]], device uint *dst [[buffer(1)]], constant uint4 &p [[buffer(3)]],
+;                              uint2 gid [[thread_position_in_grid]])
+define void @scanout_opaque(ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, ptr addrspace(1) noundef "air-buffer-no-alias" %dst, ptr addrspace(2) noundef readonly align 16 dereferenceable(16) "air-buffer-no-alias" %p, <2 x i32> noundef %gid) local_unnamed_addr #0 {
+entry:
+  %w = load i32, ptr addrspace(2) %p, align 16
+  %ph = getelementptr inbounds i32, ptr addrspace(2) %p, i64 1
+  %h = load i32, ptr addrspace(2) %ph, align 4
+  %pss = getelementptr inbounds i32, ptr addrspace(2) %p, i64 2
+  %ss = load i32, ptr addrspace(2) %pss, align 8
+  %pds = getelementptr inbounds i32, ptr addrspace(2) %p, i64 3
+  %ds = load i32, ptr addrspace(2) %pds, align 4
+  %x = extractelement <2 x i32> %gid, i64 0
+  %y = extractelement <2 x i32> %gid, i64 1
+  %inx = icmp ult i32 %x, %w
+  %iny = icmp ult i32 %y, %h
+  %in = and i1 %inx, %iny
+  br i1 %in, label %body, label %done
+
+body:
+  %x64 = zext i32 %x to i64
+  %y64 = zext i32 %y to i64
+  %ss64 = zext i32 %ss to i64
+  %srow = mul i64 %y64, %ss64
+  %si = add i64 %srow, %x64
+  %sp = getelementptr inbounds i32, ptr addrspace(1) %src, i64 %si
+  %v = load i32, ptr addrspace(1) %sp, align 4
+  %px = or i32 %v, -16777216
+  %ds64 = zext i32 %ds to i64
+  %drow = mul i64 %y64, %ds64
+  %di = add i64 %drow, %x64
+  %dp = getelementptr inbounds i32, ptr addrspace(1) %dst, i64 %di
+  store i32 %px, ptr addrspace(1) %dp, align 4
+  br label %done
+
+done:
+  ret void
+}
+
 attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "frame-pointer"="all" "min-legal-vector-width"="0" "no-builtins" "no-trapping-math"="true" "stack-protector-buffer-size"="8" }
 
 !llvm.module.flags = !{!0, !1, !2, !3, !4, !5, !6, !7, !8}
-!air.kernel = !{!9}
+!air.kernel = !{!9, !22}
 !air.compile_options = !{!17, !18}
 !llvm.ident = !{!19}
 !air.version = !{!20}
@@ -96,3 +137,7 @@ attributes #0 = { mustprogress nofree norecurse nosync nounwind willreturn "fram
 !19 = !{!"Apple metal version 32023.921 (metalfe-32023.921.6)"}
 !20 = !{i32 2, i32 8, i32 0}
 !21 = !{!"Metal", i32 4, i32 0, i32 0}
+!22 = !{ptr @scanout_opaque, !10, !23}
+!23 = !{!12, !13, !25, !24}
+!24 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
+!25 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uint4", !"air.arg_name", !"p"}

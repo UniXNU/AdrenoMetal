@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Host check of the GPU scanout (GpuScanoutPresenter.h): a half-float frame converted by the compute kernel stores exactly the bytes of the
-// display driver's table (NativeHalfCodes.h), for linear and encoded frames, with padded rows on both sides; a BGRA frame is still copied.
+// display driver's table (NativeHalfCodes.h), for linear and encoded frames, with padded rows on both sides; a BGRA frame is copied with
+// its alpha opaque.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <cstdio>
@@ -58,13 +59,20 @@ int main(int argc, char **argv) {
             }
             if (wrong) {std::printf("FAIL format %u: %llu wrong\n", format, (unsigned long long)wrong); ++failed;}
         }
-        // BGRA still takes the copy
+        // BGRA is copied with its alpha made opaque (the display blends the scanout by its alpha), every row, the padding left alone
         for (size_t i = 0; i < inBytes; ++i) in[i] = (uint8_t)random();
-        if (presenter.present({in, inBytes, width * 4 + 64, width, height, 0, NGP_BGRX8888}) != gpupresent::kOk ||
-            memcmp(out + 3 * outStride, in + 3 * (width * 4 + 64), width * 4)) {std::printf("FAIL BGRA copy\n"); ++failed;}
+        memset(out, 0x5a, outBytes);
+        if (presenter.present({in, inBytes, width * 4 + 64, width, height, 0, NGP_BGRX8888}) != gpupresent::kOk) {std::printf("FAIL BGRA copy\n"); ++failed;}
+        uint64_t bgraWrong = 0;
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint32_t *src = (const uint32_t *)(in + y * (width * 4 + 64)), *dst = (const uint32_t *)(out + y * outStride);
+            for (uint32_t x = 0; x < width; ++x) if (dst[x] != (src[x] | 0xff000000u) && bgraWrong++ < 4) std::printf("  BGRA (%u,%u): %08x\n", x, y, dst[x]);
+            for (size_t b = width * 4; b < outStride; ++b) if (out[y * outStride + b] != 0x5a && bgraWrong++ < 4) std::printf("  BGRA padding written\n");
+        }
+        if (bgraWrong) {std::printf("FAIL BGRA copy: %llu wrong\n", (unsigned long long)bgraWrong); ++failed;}
         if (presenter.present({in, inBytes, inStride, width, height, 0, 77}) != gpupresent::kBadFrame) {std::printf("FAIL unknown format taken\n"); ++failed;}
         if (failed) return 1;
-        std::printf("PASS: half-float frames convert to the display driver's bytes on the GPU (linear and encoded), BGRA copies, unknown formats refused\n");
+        std::printf("PASS: half-float frames convert to the display driver's bytes on the GPU (linear and encoded), BGRA copies opaque, unknown formats refused\n");
     }
     return 0;
 }

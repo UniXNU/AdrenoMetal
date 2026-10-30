@@ -17,6 +17,8 @@
 #include <pwd.h>
 #include <fts.h>
 #include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <libkern/OSCacheControl.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
 #include "NativeMetalBridgePhase.h"
@@ -80,6 +82,32 @@ static bool writeTask(uintptr_t address, const void *data, size_t size) {
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
 // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
+// EXPERIMENT (boot-arg sheng-fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
+// framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
+// 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
+// tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
+// nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
+static bool bootArgSet(const char *key) {
+    char args[1100] = {};
+    size_t size = sizeof args - 1;
+    return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+}
+static unsigned patchFramebufferBranch(uintptr_t slide) {
+    const uintptr_t site = 0x184461928 + slide;
+    uint32_t word = 0;
+    if (!readTask(site, &word, sizeof word)) return 0x6E40;
+    if (word == 0xd503201f) return 0x6E42;
+    if (word != 0x37000608) return 0x6E41;
+    const vm_address_t page = site & ~(uintptr_t)(vm_page_size - 1);
+    if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) != KERN_SUCCESS) return 0x6E51;
+    const uint32_t nop = 0xd503201f;
+    const bool wrote = vm_write(mach_task_self(), site, (vm_offset_t)&nop, sizeof nop) == KERN_SUCCESS;
+    const bool restored = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS;
+    sys_icache_invalidate((void *)site, sizeof nop);
+    if (!wrote) return 0x6E52;
+    if (!restored) return 0x6E53;
+    return 0x6E42;
+}
 static unsigned gReports;
 struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
 static DisplaySample sampleDisplay(id first, intptr_t slide) {
@@ -175,9 +203,11 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         // follows in rows of its own, up to six, each 46 characters.
         if (!strcmp(step, "problem") && length > 46)
             for (unsigned part = 1, at = 46; part <= 6 && at < length; ++part, at += 46) {
-                char row[64];
-                snprintf(row, sizeof row, "problem%u %.46s", part, detail + at);
-                streamText(*gpu, row);
+                // The log keeps the latest text row only: each part follows the one before it by 4 s so a sample catches every one.
+                std::string row = "problem" + std::to_string(part) + " " + std::string(detail + at).substr(0, 46);
+                auto *target = gpu;
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, int64_t(part) * 4 * NSEC_PER_SEC),
+                               dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{streamText(*target, row.c_str());});
             }
     }
 }
@@ -250,7 +280,24 @@ static id deviceForPort(unsigned port) {
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
             fclose(flags);
         }
-        setenv("TU_DEBUG", "nocb", 0);
+        // sheng-tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
+        {
+            char args[1100] = {};
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = strstr(args, "sheng-tu-debug=")) {
+                    char value[64] = {};
+                    strlcpy(value, at + 15, sizeof value);
+                    value[strcspn(value, " ")] = 0;
+                    setenv("TU_DEBUG", value, 1);
+                }
+        }
+        // With the 8-bit BGRA framebuffer (sheng-fb-bgra=1) every pass renders in system memory. A mutable BGRA image is written with a colour swap,
+        // and Turnip's tile-memory loads and stores (the blit event's resolve, the 3D and 2D copies) each swap it once more, at some places and not
+        // at others: the passes that went through them left R and B exchanged, in the big passes and in the small ones that sample them, as
+        // blocks of the lock screen's wallpaper. In system memory the render targets take the swap and nothing copies it again: the lock screen
+        // matches the RGhA framebuffer's to the tile (99.5 %, no exchanged tile; tile memory 59 % exchanged, automatic choice 62 %).
+        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -316,6 +363,7 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
