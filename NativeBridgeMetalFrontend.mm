@@ -218,12 +218,12 @@ static void traceNote(uint32_t tid) {
 
 // ---- sampler: where the render thread's CPU goes, inside a command buffer's window (creation to commit) and between windows ----
 // A thread suspends the render thread every 2 ms and keeps the program counter plus the frame-pointer chain in a ring (no allocation, no locks: the
-// suspended thread may hold any). The writer thread resolves the addresses with dladdr and rewrites cpu.profile every few seconds: L = samples
-// inside a window whose leaf is that symbol, I = samples with that symbol anywhere in the chain; G and J the same for the gaps between windows,
-// the time the render thread spends on something other than encoding. sheng-gpu-sample=0 on the kernel command line turns the sampler off.
+// suspended thread may hold any). The writer thread resolves the addresses with dladdr and puts the samples into the frame trace (types 9 and 10,
+// below); the leaf and inclusive histograms inside windows and in the gaps between windows (the time the render thread spends on something other
+// than encoding) are built offline. sheng-gpu-sample=0 on the kernel command line turns the sampler off.
 static std::atomic<mach_port_t> gSampleThread{0};
 static std::atomic<uint64_t> gSampleTop{0};
-struct StackSample {uint64_t frames[8];uint32_t gap;};
+struct StackSample {uint64_t frames[8];uint64_t us;uint32_t gap;};
 static std::atomic<bool> gSampleInWindow{false};
 static bool samplerWanted() {
  static const bool wanted=[]{
@@ -269,6 +269,7 @@ static void sampleWindowOpen() {
    }
    thread_resume(port);
    sample.gap=gSampleInWindow.load()?0:1;
+   sample.us=nowUs();
    if(sample.frames[0])gSamples[gSampleHead.fetch_add(1)%8192]=sample;
   }
  }).detach();
@@ -276,68 +277,43 @@ static void sampleWindowOpen() {
 static void sampleWindowClose() {
  if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleInWindow.store(false);   // the thread stays sampled: its gaps are the data
 }
-static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *paths) {
- static std::unordered_map<uint64_t,std::string> names;
- static std::unordered_map<std::string,uint32_t> leaf,inclusive,gapLeaf,gapInclusive;
- struct AddressCount {uint32_t leaf=0,inclusive=0;};
- static std::unordered_map<uint64_t,AddressCount> addresses;
- static uint32_t total=0,rounds=0,gapTotal=0;
+// The writer thread turns the ring's samples into trace records: type 10 names a function the first time a sample holds it {a id, the name (image`symbol,
+// 60 characters) in t0..t3 and b..tid2}, type 9 is one sample {t0 nowUs() when it was taken, t1 1 when it fell between two windows, a..d the eight frames as
+// 16-bit function ids, pc first, 0 = no frame}. The offline reader (local-tools/blue-block/prof.py) rebuilds the leaf and inclusive histograms for the
+// windows and the gaps from them.
+// Type 11 is Turnip's counters for the copies that need a row-by-row path (tu_copy_row_stats), written when they change {t0 nowUs(), t1 buffer to image copies |
+// image to buffer copies << 32, t2 how many of each were split per row (same packing), t3 rows of the split buffer to image copies, a rows of the split image to buffer
+// copies, b rows of the largest split copy, c its pitch in bytes, d its VkFormat, tid its width, cpu0 its height}.
+static void sampleEmitTrace(uint32_t &consumed) {
+ static std::unordered_map<uint64_t,uint32_t> addressId;
+ static std::unordered_map<std::string,uint32_t> nameId;
  const uint32_t head=gSampleHead.load();
  if(head-consumed>8000)consumed=head-8000;
- auto resolve=[&](uint64_t address)->const std::string & {
-  auto it=names.find(address);if(it!=names.end())return it->second;
-  Dl_info info={};std::string name;
+ auto identify=[&](uint64_t address)->uint32_t {
+  auto cached=addressId.find(address);if(cached!=addressId.end())return cached->second;
+  Dl_info info={};char text[256];
   if(dladdr((const void *)address,&info)){
    const char *image=info.dli_fname?strrchr(info.dli_fname,'/'):NULL;image=image?image+1:(info.dli_fname?info.dli_fname:"?");
-   char text[256];
-   if(info.dli_sname)snprintf(text,sizeof text,"%s`%s+%llu",image,info.dli_sname,(unsigned long long)(address-(uint64_t)info.dli_saddr));
+   if(info.dli_sname)snprintf(text,sizeof text,"%s`%s",image,info.dli_sname);
    else snprintf(text,sizeof text,"%s`+0x%llx",image,(unsigned long long)(address-(uint64_t)info.dli_fbase));
-   name=text;
-  } else name="?";
-  return names[address]=name;
+  } else snprintf(text,sizeof text,"?");
+  auto found=nameId.find(text);
+  if(found!=nameId.end())return addressId[address]=found->second;
+  uint32_t id=(uint32_t)nameId.size()+1;
+  if(id>0xfffe)return addressId[address]=0xffff;
+  nameId[text]=id;
+  char field[60]={};strncpy(field,text,sizeof field-1);
+  TraceRec rec={};rec.type=10;rec.a=id;memcpy(&rec.t0,field,32);memcpy(&rec.b,field+32,28);tracePush(rec);
+  return addressId[address]=id;
  };
  while(consumed<head) {
-  const StackSample &sample=gSamples[consumed%8192];++consumed;++total;
-  auto &leafMap=sample.gap?gapLeaf:leaf;
-  auto &inclusiveMap=sample.gap?gapInclusive:inclusive;
-  if(sample.gap)++gapTotal;
-  leafMap[resolve(sample.frames[0])]++;
-  addresses[sample.frames[0]].leaf++;
-  for(unsigned i=0;i<8 && sample.frames[i];i++){bool dup=false;for(unsigned j=0;j<i;j++)if(sample.frames[j]==sample.frames[i])dup=true;if(!dup)addresses[sample.frames[i]].inclusive++;}
-  std::string seen[8];unsigned count=0;
-  for(unsigned i=0;i<8 && sample.frames[i];i++) {
-   std::string name=resolve(sample.frames[i]);
-   const size_t plus=name.rfind('+');if(plus!=std::string::npos && i>0)name.resize(plus);
-   bool dup=false;for(unsigned j=0;j<count;j++)if(seen[j]==name)dup=true;
-   if(!dup){seen[count++]=name;inclusiveMap[name]++;}
-  }
+  const StackSample sample=gSamples[consumed%8192];++consumed;
+  uint32_t ids[8]={};
+  for(unsigned i=0;i<8 && sample.frames[i];i++)ids[i]=identify(sample.frames[i]);
+  TraceRec rec={};rec.type=9;rec.t0=sample.us;rec.t1=sample.gap;
+  rec.a=ids[0]|ids[1]<<16;rec.b=ids[2]|ids[3]<<16;rec.c=ids[4]|ids[5]<<16;rec.d=ids[6]|ids[7]<<16;
+  tracePush(rec);
  }
- if(++rounds%12 || !total)return;   // a process that never sampled must not overwrite the one that did
- if(fd<0)for(int i=0;i<2 && fd<0;i++)fd=open(paths[i],O_WRONLY|O_CREAT,0644);   // no O_TRUNC: the file keeps its fixed size
- if(fd<0)return;
- auto top=[&](std::unordered_map<std::string,uint32_t> &map,char tag,unsigned limit,std::string &out) {
-  std::vector<std::pair<uint32_t,std::string>> rows;
-  for(auto &entry:map)rows.push_back({entry.second,entry.first});
-  std::sort(rows.rbegin(),rows.rend());
-  for(unsigned i=0;i<rows.size() && i<limit;i++){char line[320];snprintf(line,sizeof line,"%c %u %s\n",tag,rows[i].first,rows[i].second.c_str());out+=line;}
- };
- std::string out="samples "+std::to_string(total)+" gap "+std::to_string(gapTotal)+"\n";
- top(leaf,'L',60,out);top(inclusive,'I',90,out);top(gapLeaf,'G',60,out);top(gapInclusive,'J',90,out);
- {   // exact addresses (image path, offset in the image) for offline symbolization, the busiest ones
-  std::vector<std::pair<uint32_t,uint64_t>> rows;
-  for(auto &entry:addresses)rows.push_back({entry.second.inclusive,entry.first});
-  std::sort(rows.rbegin(),rows.rend());
-  for(unsigned i=0;i<rows.size() && i<800;i++){
-   Dl_info info={};if(!dladdr((const void *)rows[i].second,&info) || !info.dli_fname)continue;
-   char line[400];snprintf(line,sizeof line,"A %u %u %s 0x%llx\n",rows[i].first,addresses[rows[i].second].leaf,info.dli_fname,(unsigned long long)(rows[i].second-(uint64_t)info.dli_fbase));
-   out+=line;
-  }
- }
- // A fixed size, rewritten in place: the diagnostic export measures a file's size once and copies exactly that many bytes, so a file that
- // grows between the measurement and the copy came out cut (16 bytes of 34663 samples).
- const size_t fixedSize=262144;
- out.resize(fixedSize>out.size()?fixedSize:out.size(),'\n');out.resize(fixedSize);
- if(pwrite(fd,out.data(),out.size(),0)<0)return;
 }
 static void traceStartWriter() {
  bool expected=false;
@@ -346,8 +322,7 @@ static void traceStartWriter() {
   pthread_setname_np("frame-trace");
   int fd=-1;
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
-  uint32_t written=0,sampled=0;int profileFd=-1;
-  static const char *const profilePaths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/cpu.profile","/private/var/root/Library/Caches/com.apple.backboardd/m2v/cpu.profile"};
+  uint32_t written=0,sampled=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==32 && sizeof(SubRec)==32,"turnip ring records");
@@ -355,10 +330,12 @@ static void traceStartWriter() {
   void *turnip=nullptr;
   uint32_t (*passRead)(uint32_t,PassRec *,uint32_t,uint32_t *)=nullptr;
   uint32_t (*subRead)(uint32_t,SubRec *,uint32_t,uint32_t *)=nullptr;
+  void (*copyStats)(uint64_t *)=nullptr;
+  uint64_t copyLast[16]={};
   bool header=false;
   for(;;) {
    usleep(250000);
-   sampleWriteProfile(sampled,profileFd,profilePaths);
+   sampleEmitTrace(sampled);
    if(fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
    if(fd<0)continue;
    if(!turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
@@ -366,6 +343,7 @@ static void traceStartWriter() {
     if(turnip) {
      passRead=(uint32_t (*)(uint32_t,PassRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_pass_ring_read");
      subRead=(uint32_t (*)(uint32_t,SubRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_darwin_submit_ring_read");
+     copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
     }
    }
    if(!header) {
@@ -398,6 +376,15 @@ static void traceStartWriter() {
       tracePush(rec);subFrom=p.seq+1;
      }
      if(n<64)break;
+    }
+   }
+   if(copyStats) {
+    uint64_t now[16]={};copyStats(now);
+    if(memcmp(now,copyLast,sizeof now)) {
+     memcpy(copyLast,now,sizeof now);
+     TraceRec rec={};rec.type=11;rec.t0=nowUs();rec.t1=now[0]|now[3]<<32;rec.t2=now[1]|now[4]<<32;rec.t3=now[2];
+     rec.a=(uint32_t)now[5];rec.b=(uint32_t)now[6];rec.c=(uint32_t)now[7];rec.d=(uint32_t)now[9];rec.tid=(uint32_t)now[8];rec.cpu0=(uint32_t)(now[8]>>32);
+     tracePush(rec);
     }
    }
    uint32_t head=gTraceHead.load();
