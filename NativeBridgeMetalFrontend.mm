@@ -1438,6 +1438,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @interface NBRenderPipeline : NBObject
 @property(nonatomic) NmbRenderPipeline *handle;
 @property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its functions, formats and vertex layout
+@property(nonatomic) uint32_t stateFormat;   // its colour 0 pixel format (the DF rows)
 @end
 @implementation NBRenderPipeline
 - (void)dealloc {nmb_render_pipeline_release(_handle);}
@@ -1846,6 +1847,17 @@ static void waitForResource(id resource) {
 // before it in the encoder -- a setter that binds what is already bound changes nothing -- tallied per process into
 // ngpu-draw-stats-<process>.txt in its temporary directory every 2000 draws (the render server's sandbox refuses /private/var/tmp): how
 // often a draw binds what the draw before it bound, which a runtime that kept the last draw's bind work could skip.
+// Which pipeline formats draw into which pass targets (telemetry DF rows): a pass key (colour 0 format, load action, a surface, a big target)
+// with the bound pipeline's colour 0 format, counted at each pipeline bind. A state format that is not its target's is the case plain Metal
+// stores with the target's byte order (BGRA8 exchanges bytes 0 and 2).
+static std::mutex gPassFormatLock;
+static struct {uint64_t key,n;} gPassFormatRows[32];
+static unsigned gPassFormatCount;
+static void noteFormats(uint64_t key) {
+ std::lock_guard<std::mutex> lock(gPassFormatLock);
+ for(unsigned i=0;i<gPassFormatCount;i++)if(gPassFormatRows[i].key==key){gPassFormatRows[i].n++;return;}
+ if(gPassFormatCount<32){gPassFormatRows[gPassFormatCount].key=key;gPassFormatRows[gPassFormatCount].n=1;gPassFormatCount++;}
+}
 static const bool gDrawStats=access("/private/var/ngpu/debug/draw-stats",F_OK)==0;
 enum : uint32_t {kDSPipeline=1,kDSBuffer=2,kDSOffset=4,kDSBytes=8,kDSTexture=16,kDSSampler=32,kDSDepth=64,kDSViewport=128,kDSOther=256,kDSFirst=512};
 struct DrawStateNote {std::unordered_map<uint32_t,std::pair<uintptr_t,uint64_t>> bound;uint32_t changed=kDSFirst;};
@@ -2062,11 +2074,13 @@ static void writeDrawStats() {
 @end
 
 @interface NBRenderEncoder : NBEncoder
+@property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
 @end
 @implementation NBRenderEncoder
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(dumpRange().first)self.dumpPipeline=state;
+ noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
 }
@@ -2682,7 +2696,14 @@ static char kUserDictionaryKey;
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NmbCommandBuffer *handle=_handle;
- return [self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+ id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
+ if(made) {
+  id<MTLTexture> t0=d.colorAttachments[0].texture;
+  const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
+  ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
+   (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
+ }
+ return made;
 }
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_scheduledHandlers addObject:[block copy]];}}
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {if(block)@synchronized(self){[_completedHandlers addObject:[block copy]];}}
@@ -3951,7 +3972,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   if(error)*error=nbError([@"render pipeline: " stringByAppendingString:why]);
   return nil;
  }
- NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;gPipelines++;if(error)*error=nil;
  if(dumpRange().first)state.dumpInfo=renderDumpInfo(d);
  return (id<MTLRenderPipelineState>)state;
 }
@@ -4239,6 +4260,15 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
   (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
   (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
+ {
+  // The five most used (pass target, pipeline) format pairs: p target format, s pipeline format, l load action, S an IOSurface, B a screen-size target.
+  struct {uint64_t key,n;} top[5]={};
+  {std::lock_guard<std::mutex> lock(gPassFormatLock);
+   for(unsigned i=0;i<gPassFormatCount;i++)for(unsigned t=0;t<5;t++)if(gPassFormatRows[i].n>top[t].n){for(unsigned u=4;u>t;u--)top[u]=top[u-1];top[t]={gPassFormatRows[i].key,gPassFormatRows[i].n};break;}}
+  for(unsigned t=0;t<5 && top[t].n;t++)
+   row("DF p%u s%u l%u %s%s n%llu",(unsigned)(top[t].key&0xffff),(unsigned)(top[t].key>>32),(unsigned)(top[t].key>>16&3),top[t].key>>18&1?"S":"-",
+    top[t].key>>19&1?"B":"-",(unsigned long long)top[t].n);
+ }
  row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
  row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
  row("T compile n=%llu total=%llums max=%llums cached=%llu",(unsigned long long)gTimeCompile.count.load(),ms(gTimeCompile.total.load()),

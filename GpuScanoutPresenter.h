@@ -3,8 +3,10 @@
 // imported without a copy (newBufferWithBytesNoCopy: pinned by the kernel and mapped into the GPU's 4 KiB context), the copy is a blit on
 // the GPU's queue, and the call returns after the GPU retired it. A half-float frame (RGBA 16F, what iPadOS 27's render server draws
 // once a Metal device renders) is converted by a compute kernel (shaders/scanout_convert.ll) through the display driver's own table of
-// codes (NativeHalfCodes.h), so the bytes match its CPU path. No CPU touches a pixel; there is no staging copy and no software fallback
-// here. Used through the public Metal API, on any device (the native frontend on the tablet, the Mac's device for the host check).
+// codes (NativeHalfCodes.h), so the bytes match its CPU path. A BGRA frame goes through the kernel scanout_opaque, which copies it with
+// alpha 0xff, as the half-float conversion stores it: the display blends the scanout by its per-pixel alpha (SSPP SRC_FORMAT 0x237ff),
+// and the compositor's framebuffer alpha is not opacity (translucent tinted blocks around Liquid Glass, i23c80d087); a device without
+// the kernel blits it. No CPU touches a pixel; there is no staging copy and no software fallback here. Used through the public Metal API, on any device (the native frontend on the tablet, the Mac's device for the host check).
 #pragma once
 #import <Metal/Metal.h>
 #include <unistd.h>
@@ -61,6 +63,21 @@ public:
         const uint32_t rows = gHalfRows.load(std::memory_order_relaxed) ? frame.height / 2 : frame.height;
         id<MTLBuffer> source = sourceFor(frame);
         if (!source) return kNoResource;
+        if (!(frame.stride & 3) && !(scanout_.stride & 3) && pipeline(opaque_, opaqueFailed_, @"scanout_opaque")) {
+            id<MTLCommandBuffer> commands = [queue_ commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
+            if (!encoder) return kNoResource;
+            const uint32_t params[4] = {frame.width, rows, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
+            [encoder setComputePipelineState:opaque_];
+            [encoder setBuffer:source offset:0 atIndex:0];
+            [encoder setBuffer:target_ offset:0 atIndex:1];
+            [encoder setBytes:params length:sizeof params atIndex:3];
+            [encoder dispatchThreadgroups:MTLSizeMake((frame.width + 15) / 16, (rows + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            [encoder endEncoding];
+            [commands commit];
+            [commands waitUntilCompleted];
+            return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
+        }
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
         id<MTLBlitCommandEncoder> blit = commands ? [commands blitCommandEncoder] : nil;
         if (!blit) return kNoResource;
@@ -96,7 +113,7 @@ public:
             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row || (frame.stride & 3) ||
             (scanout_.stride & 3) || frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
         const bool encoded = frame.format == NGP_RGBA16F_ENCODED;
-        if (!convertPipeline() || !table(encoded)) return kNoResource;
+        if (!pipeline(convert_, convertFailed_, @"scanout_convert") || !table(encoded)) return kNoResource;
         id<MTLBuffer> source = sourceFor(frame);
         if (!source) return kNoResource;
         id<MTLCommandBuffer> commands = [queue_ commandBuffer];
@@ -115,20 +132,21 @@ public:
         [commands waitUntilCompleted];
         return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
     }
-    // Made once; a failure is not retried (every later half-float frame then goes back to the display driver's own path).
-    bool convertPipeline() {
-        if (convert_ || convertFailed_) return convert_ != nil;
-        convertFailed_ = true;
+    // A kernel of the scanout library, made once; a failure is not retried (every later half-float frame then goes back to the display
+    // driver's own path, every BGRA frame to the blit).
+    bool pipeline(__strong id<MTLComputePipelineState> &state, bool &failed, NSString *name) {
+        if (state || failed) return state != nil;
+        failed = true;
         if (!nmb_scanout_convert_air || !native_bridge_metal_library_with_air) return false;
         size_t length = 0;
         const void *air = nmb_scanout_convert_air(&length);
         id<MTLLibrary> library = air && length ? native_bridge_metal_library_with_air(air, length) : nil;
-        id<MTLFunction> function = [library newFunctionWithName:@"scanout_convert"];
+        id<MTLFunction> function = [library newFunctionWithName:name];
         NSError *error = nil;
-        convert_ = function ? [device_ newComputePipelineStateWithFunction:function error:&error] : nil;
-        if (convert_ && convert_.maxTotalThreadsPerThreadgroup < 128) convert_ = nil;
-        convertFailed_ = convert_ == nil;
-        return convert_ != nil;
+        state = function ? [device_ newComputePipelineStateWithFunction:function error:&error] : nil;
+        if (state && state.maxTotalThreadsPerThreadgroup < 128) state = nil;
+        failed = state == nil;
+        return state != nil;
     }
     // The 8-bit code of every 16-bit half pattern, as 32-bit words (65536 of them, 256 KiB).
     id<MTLBuffer> table(bool encoded) {
@@ -169,8 +187,8 @@ private:
     Scanout scanout_;
     id<MTLCommandQueue> queue_;
     id<MTLBuffer> target_;
-    id<MTLComputePipelineState> convert_ = nil;
-    bool convertFailed_ = false;
+    id<MTLComputePipelineState> convert_ = nil, opaque_ = nil;
+    bool convertFailed_ = false, opaqueFailed_ = false;
     id<MTLBuffer> tables_[2] = {nil, nil};
     Source sources_[kSources] = {};
     uint64_t uses_ = 0;
