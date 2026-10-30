@@ -312,8 +312,8 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
    if(!dup){seen[count++]=name;inclusiveMap[name]++;}
   }
  }
- if(++rounds%12)return;
- if(fd<0)for(int i=0;i<2 && fd<0;i++)fd=open(paths[i],O_WRONLY|O_CREAT|O_TRUNC,0644);
+ if(++rounds%12 || !total)return;   // a process that never sampled must not overwrite the one that did
+ if(fd<0)for(int i=0;i<2 && fd<0;i++)fd=open(paths[i],O_WRONLY|O_CREAT,0644);   // no O_TRUNC: the file keeps its fixed size
  if(fd<0)return;
  auto top=[&](std::unordered_map<std::string,uint32_t> &map,char tag,unsigned limit,std::string &out) {
   std::vector<std::pair<uint32_t,std::string>> rows;
