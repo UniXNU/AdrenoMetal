@@ -292,11 +292,10 @@ static id deviceForPort(unsigned port) {
                     setenv("TU_DEBUG", value, 1);
                 }
         }
-        // With the 8-bit BGRA framebuffer (sheng-fb-bgra=1) every pass renders in system memory. A mutable BGRA image is written with a colour swap,
-        // and Turnip's tile-memory loads and stores (the blit event's resolve, the 3D and 2D copies) each swap it once more, at some places and not
-        // at others: the passes that went through them left R and B exchanged, in the big passes and in the small ones that sample them, as
-        // blocks of the lock screen's wallpaper. In system memory the render targets take the swap and nothing copies it again: the lock screen
-        // matches the RGhA framebuffer's to the tile (99.5 %, no exchanged tile; tile memory 59 % exchanged, automatic choice 62 %).
+        // Every pass renders in system memory with the 8-bit BGRA framebuffer (sheng-fb-bgra=1): measured against tile memory with the swap of
+        // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
+        // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
+        // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.

@@ -310,6 +310,46 @@ pub extern "C" fn nmb_device_work_stats(device: *const NmbDevice, out: *mut u64)
     })
 }
 
+/// The device's shader cache counts into the caller's 24 words (`nmb_device_shader_cache_detail` in the header): everything
+/// `ShaderCacheStatistics` holds that tells whether the cache worked and why not.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_shader_cache_detail(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null stats".into());
+        }
+        // SAFETY: the header's 24 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 24) };
+        let c = get(device)?.0.shader_cache_statistics();
+        let words = [
+            c.hits,
+            c.misses,
+            c.function_hits,
+            c.function_misses,
+            c.compute_pipeline_hits,
+            c.compute_pipeline_misses,
+            c.render_pipeline_hits,
+            c.render_pipeline_misses,
+            c.rejected,
+            c.read_failures,
+            c.writes,
+            c.writes_queued,
+            c.writes_on_thread,
+            c.written_bytes,
+            c.queued_hits,
+            c.write_failures,
+            c.evictions,
+            c.driver_loads,
+            c.driver_pipeline_hits,
+            c.driver_pipeline_misses,
+            c.driver_saves,
+        ];
+        out.fill(0);
+        out[..words.len()].copy_from_slice(&words);
+        Ok(true)
+    })
+}
+
 /// The device's texture copy counts into the caller's eight words: textures over host pages in place, of them linear images at Metal's
 /// row pitch, host-page textures shadowed for their pitch and for no image the driver makes, textures given a shadow image, shadow
 /// copies in and texels copied back, and host-page textures shadowed as render targets.

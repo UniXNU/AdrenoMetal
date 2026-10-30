@@ -36,6 +36,8 @@
 #include <thread>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/time.h>
+#include <sys/sysctl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
@@ -180,7 +182,12 @@ static CommitRecord gCommitRing[32];
 // 72-byte records: type 1 command buffer {idx, t0 created, t1 committed, t2 scheduled (0: unknown), t3 completion callback, a passes, b draws,
 // c thousands of pixels, d blits, tid creator thread, cpu0/cpu1 its cumulative CPU microseconds at creation and at commit, tid2 committing
 // thread}; type 2 waitUntilCompleted {t0 begin, t1 end, tid, a caller (low 32 bits), cpu0 the thread's CPU time at the start, cpu1 at the end};
-// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}; type 6 a full-screen render pass's target (see renderCommandEncoderWithDescriptor). Times are nowUs().
+// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}; type 0 the file's first record {t0 nowUs() now, t1 wall clock microseconds, b process id, c wall clock
+// seconds, d format version 2}; type 7 a render pass from Turnip's ring (tu_pass_ring_read) {t0 recorded, t1 its sequence, a width | height << 16, b mode (0 GMEM, 1 SYSMEM
+// by the autotuner, 2 SYSMEM otherwise) | colour attachments << 8 | flags (1 mutable view, 2 linear, 4 unpadded, 8 loaded, 16 stored, 32 FDM) << 16 | the first colour
+// attachment's view swap << 24, c draws | VkFormat << 16, d thousands of pixels}; type 8 a kernel submission from the Turnip kmd's ring (tu_darwin_submit_ring_read) {t0 when
+// it began, t1 its sequence, a the kernel fence, b microseconds waiting for an unsubmitted sync, c microseconds in the kernel calls, d of those waiting for ring space,
+// cpu0 busy answers | chunks << 16 | indirect buffers << 24}. Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
 static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
@@ -209,28 +216,37 @@ static void traceNote(uint32_t tid) {
  TraceRec rec={};rec.type=4;rec.tid=tid;pthread_getname_np(pthread_self(),(char *)&rec.t0,24);tracePush(rec);
 }
 
-// ---- sampler: where the render thread's CPU goes between a command buffer's creation and its commit ----
-// A thread suspends the render thread every 500 us while it is inside that window and keeps the program counter plus the frame-pointer chain in a
-// ring (no allocation, no locks: the suspended thread may hold any). The writer thread resolves the addresses with dladdr and rewrites cpu.profile
-// every few seconds: L = samples whose leaf is that symbol, I = samples with that symbol anywhere in the chain.
+// ---- sampler: where the render thread's CPU goes, inside a command buffer's window (creation to commit) and between windows ----
+// A thread suspends the render thread every 2 ms and keeps the program counter plus the frame-pointer chain in a ring (no allocation, no locks: the
+// suspended thread may hold any). The writer thread resolves the addresses with dladdr and rewrites cpu.profile every few seconds: L = samples
+// inside a window whose leaf is that symbol, I = samples with that symbol anywhere in the chain; G and J the same for the gaps between windows,
+// the time the render thread spends on something other than encoding. sheng-gpu-sample=0 on the kernel command line turns the sampler off.
 static std::atomic<mach_port_t> gSampleThread{0};
 static std::atomic<uint64_t> gSampleTop{0};
-struct StackSample {uint64_t frames[8];};
+struct StackSample {uint64_t frames[8];uint32_t gap;};
+static std::atomic<bool> gSampleInWindow{false};
+static bool samplerWanted() {
+ static const bool wanted=[]{
+  char args[1024]={};size_t size=sizeof args;
+  if(sysctlbyname("kern.bootargs",args,&size,NULL,0))return true;
+  return !strstr(args,"sheng-gpu-sample=0");
+ }();
+ return wanted;
+}
 static StackSample gSamples[8192];
 static std::atomic<uint32_t> gSampleHead{0};
 static std::atomic<bool> gSamplerStarted{false};
 static void sampleWindowOpen() {
-#ifndef NB_SAMPLER
- return;   // the sampler suspends the render thread 2000 times a second: off unless asked for
-#endif
+ if(!samplerWanted())return;
  char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
  if(strncmp(name,"com.apple.coreanimation",23))return;
+ gSampleInWindow.store(true);
  gSampleTop.store((uint64_t)pthread_get_stackaddr_np(pthread_self()));
  gSampleThread.store(pthread_mach_thread_np(pthread_self()));
  if(!gSamplerStarted.exchange(true))std::thread([]{
   pthread_setname_np("frame-sampler");
   for(;;) {
-   usleep(500);
+   usleep(2000);
    const mach_port_t port=gSampleThread.load();
    if(!port)continue;
    if(thread_suspend(port)!=KERN_SUCCESS)continue;
@@ -252,19 +268,20 @@ static void sampleWindowOpen() {
     }
    }
    thread_resume(port);
+   sample.gap=gSampleInWindow.load()?0:1;
    if(sample.frames[0])gSamples[gSampleHead.fetch_add(1)%8192]=sample;
   }
  }).detach();
 }
 static void sampleWindowClose() {
- if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleThread.store(0);
+ if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleInWindow.store(false);   // the thread stays sampled: its gaps are the data
 }
 static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *paths) {
  static std::unordered_map<uint64_t,std::string> names;
- static std::unordered_map<std::string,uint32_t> leaf,inclusive;
+ static std::unordered_map<std::string,uint32_t> leaf,inclusive,gapLeaf,gapInclusive;
  struct AddressCount {uint32_t leaf=0,inclusive=0;};
  static std::unordered_map<uint64_t,AddressCount> addresses;
- static uint32_t total=0,rounds=0;
+ static uint32_t total=0,rounds=0,gapTotal=0;
  const uint32_t head=gSampleHead.load();
  if(head-consumed>8000)consumed=head-8000;
  auto resolve=[&](uint64_t address)->const std::string & {
@@ -281,7 +298,10 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
  };
  while(consumed<head) {
   const StackSample &sample=gSamples[consumed%8192];++consumed;++total;
-  leaf[resolve(sample.frames[0])]++;
+  auto &leafMap=sample.gap?gapLeaf:leaf;
+  auto &inclusiveMap=sample.gap?gapInclusive:inclusive;
+  if(sample.gap)++gapTotal;
+  leafMap[resolve(sample.frames[0])]++;
   addresses[sample.frames[0]].leaf++;
   for(unsigned i=0;i<8 && sample.frames[i];i++){bool dup=false;for(unsigned j=0;j<i;j++)if(sample.frames[j]==sample.frames[i])dup=true;if(!dup)addresses[sample.frames[i]].inclusive++;}
   std::string seen[8];unsigned count=0;
@@ -289,7 +309,7 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
    std::string name=resolve(sample.frames[i]);
    const size_t plus=name.rfind('+');if(plus!=std::string::npos && i>0)name.resize(plus);
    bool dup=false;for(unsigned j=0;j<count;j++)if(seen[j]==name)dup=true;
-   if(!dup){seen[count++]=name;inclusive[name]++;}
+   if(!dup){seen[count++]=name;inclusiveMap[name]++;}
   }
  }
  if(++rounds%12)return;
@@ -301,8 +321,8 @@ static void sampleWriteProfile(uint32_t &consumed,int &fd,const char *const *pat
   std::sort(rows.rbegin(),rows.rend());
   for(unsigned i=0;i<rows.size() && i<limit;i++){char line[320];snprintf(line,sizeof line,"%c %u %s\n",tag,rows[i].first,rows[i].second.c_str());out+=line;}
  };
- std::string out="samples "+std::to_string(total)+"\n";
- top(leaf,'L',60,out);top(inclusive,'I',90,out);
+ std::string out="samples "+std::to_string(total)+" gap "+std::to_string(gapTotal)+"\n";
+ top(leaf,'L',60,out);top(inclusive,'I',90,out);top(gapLeaf,'G',60,out);top(gapInclusive,'J',90,out);
  {   // exact addresses (image path, offset in the image) for offline symbolization, the busiest ones
   std::vector<std::pair<uint32_t,uint64_t>> rows;
   for(auto &entry:addresses)rows.push_back({entry.second.inclusive,entry.first});
@@ -325,11 +345,58 @@ static void traceStartWriter() {
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
   uint32_t written=0,sampled=0;int profileFd=-1;
   static const char *const profilePaths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/cpu.profile","/private/var/root/Library/Caches/com.apple.backboardd/m2v/cpu.profile"};
+  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;};
+  struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
+  static_assert(sizeof(PassRec)==32 && sizeof(SubRec)==32,"turnip ring records");
+  uint32_t passFrom=0,subFrom=0;
+  void *turnip=nullptr;
+  uint32_t (*passRead)(uint32_t,PassRec *,uint32_t,uint32_t *)=nullptr;
+  uint32_t (*subRead)(uint32_t,SubRec *,uint32_t,uint32_t *)=nullptr;
+  bool header=false;
   for(;;) {
-   usleep(400000);
+   usleep(250000);
    sampleWriteProfile(sampled,profileFd,profilePaths);
    if(fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
    if(fd<0)continue;
+   if(!turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
+    turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+    if(turnip) {
+     passRead=(uint32_t (*)(uint32_t,PassRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_pass_ring_read");
+     subRead=(uint32_t (*)(uint32_t,SubRec *,uint32_t,uint32_t *))dlsym(turnip,"tu_darwin_submit_ring_read");
+    }
+   }
+   if(!header) {
+    header=true;
+    struct timeval wall;gettimeofday(&wall,nullptr);
+    TraceRec rec={};rec.type=0;rec.t0=nowUs();rec.t1=(uint64_t)wall.tv_sec*1000000ull+(uint64_t)wall.tv_usec;rec.b=(uint32_t)getpid();rec.c=(uint32_t)wall.tv_sec;rec.d=2;tracePush(rec);
+   }
+   // Turnip's own rings (render passes, kernel submissions) go into the same file, in the order they are read.
+   if(passRead) {
+    PassRec recs[64];uint32_t newest=0;
+    for(;;) {
+     const uint32_t n=passRead(passFrom,recs,64,&newest);
+     for(uint32_t i=0;i<n;i++) {
+      const PassRec &p=recs[i];
+      TraceRec rec={};rec.type=7;rec.t0=p.ns/1000;rec.t1=p.seq;rec.a=p.width|(uint32_t)p.height<<16;
+      rec.b=p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24;rec.c=p.draws|(uint32_t)p.format<<16;rec.d=p.kpx;
+      tracePush(rec);passFrom=p.seq+1;
+     }
+     if(n<64)break;
+    }
+   }
+   if(subRead) {
+    SubRec recs[64];uint32_t newest=0;
+    for(;;) {
+     const uint32_t n=subRead(subFrom,recs,64,&newest);
+     for(uint32_t i=0;i<n;i++) {
+      const SubRec &p=recs[i];
+      TraceRec rec={};rec.type=8;rec.t0=p.ns/1000;rec.t1=p.seq;rec.a=p.fence;rec.b=p.syncWaitUs;rec.c=p.callUs;rec.d=p.spaceWaitUs;
+      rec.cpu0=p.busy|(uint32_t)p.chunks<<16|(uint32_t)p.buffers<<24;
+      tracePush(rec);subFrom=p.seq+1;
+     }
+     if(n<64)break;
+    }
+   }
    uint32_t head=gTraceHead.load();
    if(head<written+4)continue;
    head-=4;                                   // records still being filled stay for the next round
@@ -2629,16 +2696,6 @@ static char kUserDictionaryKey;
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};
- // type 6 a full-screen render pass's target: {t0 begin, t1 the command buffer's creation time (joins type 1), t2 the surface's base address in this
- // task (the kernel's import list names it by the same address), a/b width and height, c attachment, tid}.
- for(unsigned i=0;i<2;i++) {
-  MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
-  id<MTLTexture> target=c.resolveTexture?c.resolveTexture:c.texture;
-  if(target && [(id)target isKindOfClass:[NBTexture class]] && [(NBTexture *)target surface] && target.width*target.height>=2000000) {
-   TraceRec rec={};rec.type=6;rec.t0=nowUs();rec.t1=createdUs;rec.t2=(uint64_t)(uintptr_t)IOSurfaceGetBaseAddress([(NBTexture *)target surface]);
-   rec.a=(uint32_t)target.width;rec.b=(uint32_t)target.height;rec.c=i;rec.tid=threadIdLow();tracePush(rec);traceStartWriter();
-  }
- }
  _dumpPasses++;
  if(dumpMaybe(self)) {
   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
@@ -3968,10 +4025,18 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
+ uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
- journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),gJournalPath.empty()?std::string():NBCost::now().since(costBegan));
+ std::string cost=gJournalPath.empty()?std::string():NBCost::now().since(costBegan);
+ if(!gJournalPath.empty()) {   // what the shader cache did for this making: artifacts found, not found, handed to the directory
+  uint64_t after[10]={};nmb_device_work_stats(gDevice,after);
+  char text[96];snprintf(text,sizeof text," cache hit=%llu miss=%llu wr=%llu",(unsigned long long)(after[7]-cacheBefore[7]),(unsigned long long)(after[8]-cacheBefore[8]),
+   (unsigned long long)(after[9]-cacheBefore[9]));
+  cost+=text;
+ }
+ journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),cost);
  if(!handle) {
   // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
   // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
@@ -4313,6 +4378,17 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    (unsigned long long)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(unsigned long long)work[4]);
   row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],(unsigned long long)work[5],
    (unsigned long long)work[6]);
+  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
+  // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
+  // pipeline cache: loads, saves, hits, misses.
+  uint64_t sc[24]={};
+  if(nmb_device_shader_cache_detail(gDevice,sc)) {
+   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(unsigned long long)sc[2],(unsigned long long)sc[3],(unsigned long long)sc[4],(unsigned long long)sc[5],
+    (unsigned long long)sc[6],(unsigned long long)sc[7],(unsigned long long)sc[8],(unsigned long long)sc[9]);
+   row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(unsigned long long)sc[10],(unsigned long long)sc[11],
+    (unsigned long long)sc[12],(unsigned long long)(sc[13]>>10),(unsigned long long)sc[15],(unsigned long long)sc[16],(unsigned long long)sc[14],(unsigned long long)sc[17],
+    (unsigned long long)sc[20],(unsigned long long)sc[18],(unsigned long long)sc[19]);
+  }
   // Where textures over buffers and surfaces cost copies: host-page textures in place (of them at Metal's pitch), shadowed for their
   // pitch and for no driver image; shadowed textures, their copies in, texels copied back; host-page render targets shadowed.
   uint64_t tc[8]={};
@@ -4358,6 +4434,20 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     modeStats(rm);
     row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
      (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
+   }
+  }
+  // The tile-memory side of GMEM loads and stores (tu_gmem_side_stats), per site: 3D store source, 3D load source, 2D store source, input attachment; each
+  // transfers / of them with a swap other than WZYX / with MUTABLEEN / of a linear image. The second number must stay 0 for linear images.
+  {
+   uint64_t gm[16]={};
+   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+   static void (*sideStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats"):nullptr;
+   if(sideStats) {
+    sideStats(gm);
+    row("GM s3d %llu/%llu/%llu/%llu l3d %llu/%llu/%llu/%llu",(unsigned long long)gm[0],(unsigned long long)gm[1],(unsigned long long)gm[2],(unsigned long long)gm[3],
+     (unsigned long long)gm[4],(unsigned long long)gm[5],(unsigned long long)gm[6],(unsigned long long)gm[7]);
+    row("GMb s2d %llu/%llu/%llu/%llu in %llu/%llu/%llu/%llu",(unsigned long long)gm[8],(unsigned long long)gm[9],(unsigned long long)gm[10],(unsigned long long)gm[11],
+     (unsigned long long)gm[12],(unsigned long long)gm[13],(unsigned long long)gm[14],(unsigned long long)gm[15]);
    }
   }
   // Who allocated the device memory (4 MiB or more at once): the three call stacks with the most bytes, as MiB, allocations and return
