@@ -180,7 +180,7 @@ static CommitRecord gCommitRing[32];
 // 72-byte records: type 1 command buffer {idx, t0 created, t1 committed, t2 scheduled (0: unknown), t3 completion callback, a passes, b draws,
 // c thousands of pixels, d blits, tid creator thread, cpu0/cpu1 its cumulative CPU microseconds at creation and at commit, tid2 committing
 // thread}; type 2 waitUntilCompleted {t0 begin, t1 end, tid, a caller (low 32 bits), cpu0 the thread's CPU time at the start, cpu1 at the end};
-// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}. Times are nowUs().
+// type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}; type 6 a full-screen render pass's target (see renderCommandEncoderWithDescriptor). Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
 static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
@@ -2629,6 +2629,16 @@ static char kUserDictionaryKey;
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};
+ // type 6 a full-screen render pass's target: {t0 begin, t1 the command buffer's creation time (joins type 1), t2 the surface's base address in this
+ // task (the kernel's import list names it by the same address), a/b width and height, c attachment, tid}.
+ for(unsigned i=0;i<2;i++) {
+  MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+  id<MTLTexture> target=c.resolveTexture?c.resolveTexture:c.texture;
+  if(target && [(id)target isKindOfClass:[NBTexture class]] && [(NBTexture *)target surface] && target.width*target.height>=2000000) {
+   TraceRec rec={};rec.type=6;rec.t0=nowUs();rec.t1=createdUs;rec.t2=(uint64_t)(uintptr_t)IOSurfaceGetBaseAddress([(NBTexture *)target surface]);
+   rec.a=(uint32_t)target.width;rec.b=(uint32_t)target.height;rec.c=i;rec.tid=threadIdLow();tracePush(rec);traceStartWriter();
+  }
+ }
  _dumpPasses++;
  if(dumpMaybe(self)) {
   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
