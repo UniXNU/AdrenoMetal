@@ -41,6 +41,10 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
+/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, compute pipeline hits and misses, render pipeline hits and misses,
+ * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
+ * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
+bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
 /* The translator source the runtime was built from, which keys the shader cache (build-native-metal-bridge.py). */
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
