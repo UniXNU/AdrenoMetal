@@ -284,9 +284,15 @@ static void sampleWindowClose() {
 // Type 11 is Turnip's counters for the copies that need a row-by-row path (tu_copy_row_stats), written when they change {t0 nowUs(), t1 buffer to image copies |
 // image to buffer copies << 32, t2 how many of each were split per row (same packing), t3 rows of the split buffer to image copies, a rows of the split image to buffer
 // copies, b rows of the largest split copy, c its pitch in bytes, d its VkFormat, tid its width, cpu0 its height}.
+static void emitDefinition(uint32_t id,const std::string &text) {
+ char field[60]={};strncpy(field,text.c_str(),sizeof field-1);
+ TraceRec rec={};rec.type=10;rec.a=id;memcpy(&rec.t0,field,32);memcpy(&rec.b,field+32,28);tracePush(rec);
+}
 static void sampleEmitTrace(uint32_t &consumed) {
  static std::unordered_map<uint64_t,uint32_t> addressId;
  static std::unordered_map<std::string,uint32_t> nameId;
+ static std::vector<std::pair<uint32_t,std::string>> defined;   // every definition, repeated every 15 s: the writer drops the oldest records when the ring laps
+ static uint64_t definedAt=0;
  const uint32_t head=gSampleHead.load();
  if(head-consumed>8000)consumed=head-8000;
  auto identify=[&](uint64_t address)->uint32_t {
@@ -302,10 +308,15 @@ static void sampleEmitTrace(uint32_t &consumed) {
   uint32_t id=(uint32_t)nameId.size()+1;
   if(id>0xfffe)return addressId[address]=0xffff;
   nameId[text]=id;
-  char field[60]={};strncpy(field,text,sizeof field-1);
-  TraceRec rec={};rec.type=10;rec.a=id;memcpy(&rec.t0,field,32);memcpy(&rec.b,field+32,28);tracePush(rec);
+  defined.push_back({id,text});
+  emitDefinition(id,text);
   return addressId[address]=id;
  };
+ const uint64_t now=nowUs();
+ if(now-definedAt>=15000000ull) {
+  definedAt=now;
+  for(auto &entry:defined)emitDefinition(entry.first,entry.second);
+ }
  while(consumed<head) {
   const StackSample sample=gSamples[consumed%8192];++consumed;
   uint32_t ids[8]={};
