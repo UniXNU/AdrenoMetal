@@ -5,8 +5,11 @@
 // the same stem (`_vert_` -> `_frag_`, or a fragment-less pipeline) and one BGRA8 attachment. Pipelines a caller makes with other constants
 // or attachments still compile then, but their functions' modules are decoded and the translator has seen every function once.
 // State in the cache directory: prime-done lists finished libraries (path, size, mtime), prime-bad the functions that ended the process
-// (prime-current names the function being compiled; a start that finds it moves it to prime-bad), prime.log one line per library.
-// A library listed as finished is never read again, so a restart resumes where the previous run stopped.
+// (prime-current names the function being compiled; a start that finds it moves it to prime-bad), prime.log one line per library, and
+// prime-fn the functions finished inside the libraries not finished yet (path, name and the build that made them).
+// A library listed as finished is never read again, and a function listed in prime-fn is not compiled again, so a restart resumes where
+// the previous run stopped even inside a library with thousands of functions (the one that held priming at 162 of 280 libraries for
+// every boot: each boot ended before it did and began it again).
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -34,7 +37,8 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 // Priming's progress for the telemetry table (the PR row): what the thread does (1 a pipeline compiles, 2 it waits for the desktop to
 // settle, 3 it opens a library and its functions), libraries done of the list, pipelines made, and the most command buffers the last wait
 // saw in 250 ms.
-extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate;}
+extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate,
+               native_prime_functions_resumed;}
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
@@ -204,8 +208,9 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
 }
 
 // One library: every function it names, in its order; returns the log line.
-static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad) {
-    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0;
+static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
+                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &build) {
+    unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
@@ -221,8 +226,10 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         for (NSString *name in names) {
             @autoreleasepool {
                 const std::string key = path + "\t" + name.UTF8String;
+                const std::string doneKey = key + "\t" + build;
                 native_prime_compiling = 3;
                 if (bad.count(key)) {++skipped; continue;}
+                if (functionsDone.count(doneKey)) {native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
                 id<MTLFunction> function = [lib newFunctionWithName:name];
                 if (!function) {++refused; continue;}
                 const MTLFunctionType type = function.functionType;
@@ -263,11 +270,19 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                             }
                         }
                         ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                        // The render server's framebuffer is half-float (RGhA) on this board: its pipelines draw into RGBA16Float, a state
+                        // of its own to Turnip, so the same pair is made for it too.
+                        if (ok) {
+                            d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+                            NSError *half = nil;
+                            if ([device newRenderPipelineStateWithDescriptor:d error:&half]) ++halfMade;
+                        }
                     }
                 } @catch (NSException *exception) {
                     ok = false;
                 }
                 native_prime_compiling = 0;
+                appendLine(functionsPath, doneKey);
                 ok ? ++made : ++refused;
                 if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {
@@ -283,9 +298,9 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         }
     }
     unlink(current.c_str());
-    char line[180];
-    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
-             made, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
+    char line[200];
+    snprintf(line, sizeof line, " kernels=%u renders=%u made=%u half=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
+             made, halfMade, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
     return path + line + firstRefusal;
 }
 
@@ -302,6 +317,8 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     sleep(delaySeconds);
     const std::set<std::string> bad = readLines(badPath);
     std::set<std::string> done = readLines(donePath);
+    const std::string functionsPath = root + "/prime-fn";
+    const std::set<std::string> functionsDone = readLines(functionsPath);
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0;
     std::string note;
@@ -317,7 +334,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
         if (done.count(id)) {++finished; continue;}
-        appendLine(logPath, library(device, path, current, bad));
+        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build));
         appendLine(donePath, id);
         done.insert(id);
         ++finished;

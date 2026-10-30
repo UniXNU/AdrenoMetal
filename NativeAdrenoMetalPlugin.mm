@@ -171,6 +171,14 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
         char text[64];
         snprintf(text, sizeof text, "%.14s %s", step, shown);
         streamText(*gpu, text);
+        // A refusal's text is what says why a client ends (iconservicesagent's pipeline refusal showed 18 characters of it): the rest of it
+        // follows in rows of its own, up to six, each 46 characters.
+        if (!strcmp(step, "problem") && length > 46)
+            for (unsigned part = 1, at = 46; part <= 6 && at < length; ++part, at += 46) {
+                char row[64];
+                snprintf(row, sizeof row, "problem%u %.46s", part, detail + at);
+                streamText(*gpu, row);
+            }
     }
 }
 static id clientDevice(unsigned port) {

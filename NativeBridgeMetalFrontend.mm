@@ -158,6 +158,10 @@ static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
 struct Timed {std::atomic<uint64_t> count{0},total{0},slowest{0};
  void add(uint64_t began){const uint64_t took=nowUs()-began;count++;total+=took;uint64_t seen=slowest.load();while(took>seen && !slowest.compare_exchange_weak(seen,took)){}}};
 static Timed gTimePipeline,gTimeLibrary,gTimeFunction,gTimeEncodeToCommit;
+// Where a frame's time goes, as histograms over power-of-two millisecond buckets (<1, <2, <4 ... <256, more): commit to completion of the
+// command buffers that hold a full-screen pass (a frame's), of every other one, and a frame's encoding (creation to commit).
+static std::atomic<uint64_t> gHistFrameGpu[10],gHistOtherGpu[10],gHistFrameEncode[10];
+static void histAdd(std::atomic<uint64_t> *bins,uint64_t us) {unsigned b=0;const uint64_t ms=us/1000;while(b<9 && ms>=(1ull<<b))++b;bins[b]++;}
 static Timed gTimeCompile;                     // the system compiler's requests (codeGenRequest), the shader cache's misses
 static std::atomic<uint64_t> gCompileCached;   // requests the shader cache answered
 static Timed gTimeWaitScheduled,gTimeWaitCompleted;
@@ -464,6 +468,7 @@ __attribute__((weak)) volatile uint32_t native_prime_libraries_done;
 __attribute__((weak)) volatile uint32_t native_prime_libraries_total;
 __attribute__((weak)) volatile uint32_t native_prime_made;
 __attribute__((weak)) volatile uint32_t native_prime_rate;
+__attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
 }
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
@@ -2857,6 +2862,11 @@ static void completed(void *context) {
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
+  {
+   const bool frame=commandBuffer->encodedWork.pixels>=2000000;
+   histAdd(frame?gHistFrameGpu:gHistOtherGpu,took);
+   if(frame)histAdd(gHistFrameEncode,commandBuffer.committedUs-commandBuffer->createdUs);
+  }
   gTimeEncodeToCommit.count++;gTimeEncodeToCommit.total+=took;
   uint64_t seen=gTimeEncodeToCommit.slowest.load();while(took>seen && !gTimeEncodeToCommit.slowest.compare_exchange_weak(seen,took)){}
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -4237,6 +4247,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
   ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
+ for(int k=0;k<3;k++) {
+  const std::atomic<uint64_t> *bins=k==0?gHistFrameGpu:k==1?gHistOtherGpu:gHistFrameEncode;
+  row("H %s <1=%llu <2=%llu <4=%llu <8=%llu <16=%llu <32=%llu <64=%llu <128=%llu <256=%llu more=%llu",k==0?"frame-gpu":k==1?"other-gpu":"frame-enc",
+   (unsigned long long)bins[0].load(),(unsigned long long)bins[1].load(),(unsigned long long)bins[2].load(),(unsigned long long)bins[3].load(),
+   (unsigned long long)bins[4].load(),(unsigned long long)bins[5].load(),(unsigned long long)bins[6].load(),(unsigned long long)bins[7].load(),
+   (unsigned long long)bins[8].load(),(unsigned long long)bins[9].load());
+ }
  row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
  row("J completed wait n=%llu total=%llums max=%llums t=%llu",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()),(unsigned long long)gWaitTimeouts.load());
  row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
@@ -4330,7 +4347,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
   char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
-  row("PR compiling=%u libs=%u/%u made=%u rate=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate);
+  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
    (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
