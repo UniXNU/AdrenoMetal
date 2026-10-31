@@ -407,6 +407,13 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// Free the runtime's spare dedicated blocks and kept empty pooled blocks (bridge patch 0021), as Metal gives its resource cache's
+/// memory back when the system reports memory pressure: how many blocks went.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_release_kept_memory(device: *const NmbDevice) -> usize {
+    guard(0, || Ok(get(device)?.0.release_kept_memory()))
+}
+
 /// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
 /// of twelve words: bytes, allocations, then ten return addresses (0 past the stack's end). Returns the records written.
 #[unsafe(no_mangle)]
