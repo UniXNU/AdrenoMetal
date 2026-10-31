@@ -195,13 +195,27 @@ static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
 static std::atomic<uint32_t> gTraceHead{0};
 static std::atomic<bool> gTraceStarted{false};
+/* The slowest render pass this process's Turnip recorded, with the size, format and draw count that identify it, and all of them summed:
+ * the line the frontend streams to the kernel log. A process whose jobs each took 77 ms showed only that; which pass, at what size and in
+ * which mode, is what says whether the cost is ours. Written by the trace writer alone, read by the streaming thread. */
+struct SlowPass {
+ uint64_t us=0,totalUs=0,whenUs=0;
+ uint64_t passes=0;
+ uint32_t width=0,height=0,mode=0,format=0,flags=0,swap=0,draws=0,kpx=0;
+};
+static SlowPass gSlowPass;
+// Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
+// with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
 static uint32_t threadCpuUs() {
  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
  if(thread_info(pthread_mach_thread_np(pthread_self()),THREAD_BASIC_INFO,(thread_info_t)&info,&count)!=KERN_SUCCESS)return 0;
  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
+static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
 static void tracePush(const TraceRec &rec) {
+ if(!traceWanted())return;
  const uint32_t at=gTraceHead.fetch_add(1);
  gTrace[at%16384]=rec;
  gTrace[at%16384].idx=rec.type==1?rec.idx:at;
@@ -222,16 +236,17 @@ static void traceNote(uint32_t tid) {
 // A thread suspends the render thread every 2 ms and keeps the program counter plus the frame-pointer chain in a ring (no allocation, no locks: the
 // suspended thread may hold any). The writer thread resolves the addresses with dladdr and puts the samples into the frame trace (types 9 and 10,
 // below); the leaf and inclusive histograms inside windows and in the gaps between windows (the time the render thread spends on something other
-// than encoding) are built offline. sheng-gpu-sample=0 on the kernel command line turns the sampler off.
+// than encoding) are built offline. Suspending the render thread every 2 ms delays its frames (half of the render server's busiest-thread samples
+// in untagged-3f2bd680 were this thread), so it runs only with sheng-diag=1 and sheng-gpu-sample=1 both on the kernel command line.
 static std::atomic<mach_port_t> gSampleThread{0};
 static std::atomic<uint64_t> gSampleTop{0};
 struct StackSample {uint64_t frames[8];uint64_t us;uint32_t gap;};
 static std::atomic<bool> gSampleInWindow{false};
 static bool samplerWanted() {
  static const bool wanted=[]{
-  char args[1024]={};size_t size=sizeof args;
-  if(sysctlbyname("kern.bootargs",args,&size,NULL,0))return true;
-  return !strstr(args,"sheng-gpu-sample=0");
+  if(!diagOn())return false;
+  char args[1100]={};size_t size=sizeof args-1;
+  return !sysctlbyname("kern.bootargs",args,&size,NULL,0) && strstr(args,"sheng-gpu-sample=1");
  }();
  return wanted;
 }
@@ -328,7 +343,21 @@ static void sampleEmitTrace(uint32_t &consumed) {
   tracePush(rec);
  }
 }
+/* The process's slowest pass and its pass total, for a line of the kernel log: "R pass <us> us <w>x<h> mode <m> fmt <f> draws <d> flags <x>
+ * swap <s> | <passes> passes <total> us". Zero characters before any pass with GPU times was recorded. */
+extern "C" size_t nmb_slowest_pass(char *out,size_t size) {
+ if(!out || !size)return 0;
+ const SlowPass p=gSlowPass;
+ if(!p.passes) {out[0]=0;return 0;}
+ const int n=snprintf(out,size,"R pass %llu us %ux%u mode %u fmt %u draws %u flags %x swap %u | %llu passes %llu us",
+  (unsigned long long)p.us,p.width,p.height,p.mode,p.format,p.draws,p.flags,p.swap,
+  (unsigned long long)p.passes,(unsigned long long)p.totalUs);
+ return n>0?(size_t)n:0;
+}
 static void traceStartWriter() {
+ // The file is the render server's: SpringBoard, which runs as the same user, opened the same path with O_TRUNC and the two processes'
+ // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
+ if(!diagOn() || strcmp(getprogname(),"backboardd"))return;
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
@@ -378,6 +407,14 @@ static void traceStartWriter() {
       rec.b=p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24;rec.c=p.draws|(uint32_t)p.format<<16;rec.d=p.kpx;
       rec.t2=p.gpuBegin/1000;rec.t3=p.gpuEnd/1000;
       tracePush(rec);passFrom=p.seq+1;
+      if(p.gpuEnd>p.gpuBegin) {
+       const uint64_t us=(p.gpuEnd-p.gpuBegin)/1000;
+       if(us>gSlowPass.us) {
+        gSlowPass.us=us;gSlowPass.width=p.width;gSlowPass.height=p.height;gSlowPass.mode=p.mode;gSlowPass.format=p.format;
+        gSlowPass.draws=p.draws;gSlowPass.kpx=p.kpx;gSlowPass.flags=p.flags;gSlowPass.swap=p.swap;gSlowPass.whenUs=p.ns/1000;
+       }
+       ++gSlowPass.passes;gSlowPass.totalUs+=us;
+      }
      }
      if(n<64 || taken<n)break;
     }
