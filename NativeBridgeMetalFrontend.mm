@@ -202,8 +202,16 @@ struct SlowPass {
  uint64_t us=0,totalUs=0,whenUs=0;
  uint64_t passes=0;
  uint32_t width=0,height=0,mode=0,format=0,flags=0,swap=0,draws=0,kpx=0;
+ uint64_t over20=0,recentUs=0;   // passes of 20 ms or more, and the slowest since the stream last read it
+ // The slowest pass's shader and geometry figures (Turnip's pass record): heaviest fragment shader's ir3 instructions and texture fetches,
+ // its estimated stalls on (sy) and (ss), waves per core and highest GPR, samples, depth/stencil, bandwidth per sample, vertices.
+ uint32_t fsInstrs=0,fsTex=0,fsSy=0,fsSs=0,samples=0,ds=0,bandwidth=0,verts=0;
+ int32_t fsWaves=0,fsRegs=0;
 };
 static SlowPass gSlowPass;
+// What this process's queues asked for with setGPUPriority:/setBackgroundGPUPriority: and how many of those reached the driver.
+static std::atomic<uint32_t> gAskFg{0xffffffffu},gAskBg{0xffffffffu},gAskCount{0},gAskSent{0};
+static void nbForwardPriority(uint32_t foreground,uint32_t background);
 // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
 // with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
 static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
@@ -348,16 +356,81 @@ static void sampleEmitTrace(uint32_t &consumed) {
 extern "C" size_t nmb_slowest_pass(char *out,size_t size) {
  if(!out || !size)return 0;
  const SlowPass p=gSlowPass;
- if(!p.passes) {out[0]=0;return 0;}
- const int n=snprintf(out,size,"R pass %llu us %ux%u mode %u fmt %u draws %u flags %x swap %u | %llu passes %llu us",
-  (unsigned long long)p.us,p.width,p.height,p.mode,p.format,p.draws,p.flags,p.swap,
-  (unsigned long long)p.passes,(unsigned long long)p.totalUs);
+ if(!p.passes && !gAskCount.load()) {out[0]=0;return 0;}
+ // One 63-character row per process (the kernel keeps that much of a client's text), three kinds in turn at the 5 s tick: the timing of its
+ // passes, the shader and geometry figures of the slowest one, and what its queues asked the GPU priority to be.
+ static unsigned turn=0;
+ const unsigned kind=turn++%3;
+ int n;
+ if(kind==0) {
+  gSlowPass.recentUs=0;
+  n=snprintf(out,size,"slow %lluus %ux%u d%u m%u|n%llu >20ms %llu now %llu",
+   (unsigned long long)p.us,p.width,p.height,p.draws,p.mode,
+   (unsigned long long)p.passes,(unsigned long long)p.over20,(unsigned long long)p.recentUs);
+ } else if(kind==1) {
+  n=snprintf(out,size,"fs i%u t%u sy%u ss%u w%d r%d|smp%u ds%u bw%u v%u",
+   p.fsInstrs,p.fsTex,p.fsSy,p.fsSs,p.fsWaves,p.fsRegs,p.samples,p.ds,p.bandwidth,p.verts);
+ } else {
+  n=snprintf(out,size,"ask fg%d bg%d n%u sent%u",
+   gAskFg.load()==0xffffffffu?-1:(int)gAskFg.load(),gAskBg.load()==0xffffffffu?-1:(int)gAskBg.load(),gAskCount.load(),gAskSent.load());
+ }
  return n>0?(size_t)n:0;
+}
+// The runtime loads Turnip after this process may have started; its handle is local to it, so the exported setter is found by the path.
+static void nbForwardPriority(uint32_t foreground,uint32_t background) {
+ typedef bool (*SetPriority)(uint32_t,uint32_t);
+ static std::atomic<SetPriority> setter{nullptr};
+ SetPriority fn=setter.load();
+ if(!fn) {
+  if(gLoaderPath.empty())return;
+  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+  if(!turnip)return;
+  fn=(SetPriority)dlsym(turnip,"tu_darwin_set_priority");
+  if(!fn)return;
+  setter.store(fn);
+ }
+ gAskCount.fetch_add(1);
+ if(fn(foreground,background))gAskSent.fetch_add(1);
+}
+// A note for the kernel's log (Turnip's tu_darwin_note, NativeAdrenoMethodNote): the board's export writes it as a row of kernel.rings.txt, the one
+// place a process that has no file of its own (a sandboxed extension) can leave more than its 63-character text row. Kind 1 is a slow render pass
+// (row G), kind 2 a pipeline made or refused (row L). Only with the diagnostics on.
+static bool nbNote(uint32_t kind,const uint32_t *words,uint32_t count) {
+ typedef bool (*Note)(uint32_t,const uint32_t *,uint32_t);
+ static std::atomic<Note> note{nullptr};
+ Note fn=note.load();
+ if(!fn) {
+  if(gLoaderPath.empty())return false;
+  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+  if(!turnip)return false;
+  fn=(Note)dlsym(turnip,"tu_darwin_note");
+  if(!fn)return false;
+  note.store(fn);
+ }
+ return fn(kind,words,count);
+}
+// The shader hashes of the pipeline this thread just asked Turnip for (tu_darwin_last_program reads and clears them).
+static void nbLastProgram(uint32_t *vs,uint32_t *fs) {
+ typedef void (*Last)(uint32_t *,uint32_t *);
+ static std::atomic<Last> last{nullptr};
+ *vs=*fs=0;
+ Last fn=last.load();
+ if(!fn) {
+  if(gLoaderPath.empty())return;
+  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+  if(!turnip)return;
+  fn=(Last)dlsym(turnip,"tu_darwin_last_program");
+  if(!fn)return;
+  last.store(fn);
+ }
+ fn(vs,fs);
 }
 static void traceStartWriter() {
  // The file is the render server's: SpringBoard, which runs as the same user, opened the same path with O_TRUNC and the two processes'
  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
- if(!diagOn() || strcmp(getprogname(),"backboardd"))return;
+ // Every process with the diagnostics on reads its own Turnip's pass ring (the slowest-pass row); only the render server writes the file.
+ if(!diagOn())return;
+ static const bool render=!strcmp(getprogname(),"backboardd");
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
@@ -365,9 +438,9 @@ static void traceStartWriter() {
   int fd=-1;
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
   uint32_t written=0,sampled=0;
-  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;};
+  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
-  static_assert(sizeof(PassRec)==48 && sizeof(SubRec)==32,"turnip ring records");
+  static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
   uint32_t passFrom=0,subFrom=0;
   void *turnip=nullptr;
   uint32_t (*passRead)(uint32_t,PassRec *,uint32_t,uint32_t *)=nullptr;
@@ -377,9 +450,9 @@ static void traceStartWriter() {
   bool header=false;
   for(;;) {
    usleep(250000);
-   sampleEmitTrace(sampled);
-   if(fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
-   if(fd<0)continue;
+   if(render)sampleEmitTrace(sampled);
+   if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
+   if(render && fd<0)continue;
    if(!turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
     turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
     if(turnip) {
@@ -388,7 +461,7 @@ static void traceStartWriter() {
      copyStats=(void (*)(uint64_t *))dlsym(turnip,"tu_copy_row_stats");
     }
    }
-   if(!header) {
+   if(render && !header) {
     header=true;
     struct timeval wall;gettimeofday(&wall,nullptr);
     TraceRec rec={};rec.type=0;rec.t0=nowUs();rec.t1=(uint64_t)wall.tv_sec*1000000ull+(uint64_t)wall.tv_usec;rec.b=(uint32_t)getpid();rec.c=(uint32_t)wall.tv_sec;rec.d=2;tracePush(rec);
@@ -406,12 +479,36 @@ static void traceStartWriter() {
       TraceRec rec={};rec.type=7;rec.t0=p.ns/1000;rec.t1=p.seq;rec.a=p.width|(uint32_t)p.height<<16;
       rec.b=p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24;rec.c=p.draws|(uint32_t)p.format<<16;rec.d=p.kpx;
       rec.t2=p.gpuBegin/1000;rec.t3=p.gpuEnd/1000;
-      tracePush(rec);passFrom=p.seq+1;
+      if(render) {
+       tracePush(rec);
+       // type 13, the pass's shader and geometry figures (read with type 7 by seq): a = instructions | texture fetches << 16, b = (sy) | (ss) stalls << 16,
+       // c = waves | GPR << 8 | samples << 16 | depth/stencil << 24, d = bandwidth per sample, tid = vertices
+       TraceRec detail={};detail.type=13;detail.t0=p.ns/1000;detail.t1=p.seq;
+       detail.a=p.fsInstrs|(uint32_t)p.fsTex<<16;detail.b=p.fsSy|(uint32_t)p.fsSs<<16;
+       detail.c=(uint8_t)p.fsWaves|(uint32_t)(uint8_t)p.fsRegs<<8|(uint32_t)p.samples<<16|(uint32_t)p.ds<<24;
+       detail.d=p.bandwidth;detail.tid=p.verts;
+       detail.cpu0=p.fsHash;   // the heaviest fragment shader's tu_hash32, joined to the pipeline log's names
+       tracePush(detail);
+      }
+      passFrom=p.seq+1;
       if(p.gpuEnd>p.gpuBegin) {
        const uint64_t us=(p.gpuEnd-p.gpuBegin)/1000;
+       if(!render && us>=3000) {
+        // Row G of the kernel log (this process has no trace file): the pass, its shader figures and its heaviest fragment shader's hash.
+        const uint64_t at=p.ns/1000,began=p.gpuBegin/1000;
+        const uint32_t words[16]={p.seq,(uint32_t)at,(uint32_t)(at>>32),(uint32_t)began,(uint32_t)(began>>32),(uint32_t)us,
+         (uint32_t)p.width|(uint32_t)p.height<<16,(uint32_t)p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24,
+         (uint32_t)p.draws|(uint32_t)p.format<<16,p.kpx,(uint32_t)p.fsInstrs|(uint32_t)p.fsTex<<16,(uint32_t)p.fsSy|(uint32_t)p.fsSs<<16,
+         (uint8_t)p.fsWaves|(uint32_t)(uint8_t)p.fsRegs<<8|(uint32_t)p.samples<<16|(uint32_t)p.ds<<24,p.bandwidth,p.verts,p.fsHash};
+        nbNote(1,words,16);
+       }
+       if(us>=20000)++gSlowPass.over20;
+       if(us>gSlowPass.recentUs)gSlowPass.recentUs=us;
        if(us>gSlowPass.us) {
         gSlowPass.us=us;gSlowPass.width=p.width;gSlowPass.height=p.height;gSlowPass.mode=p.mode;gSlowPass.format=p.format;
         gSlowPass.draws=p.draws;gSlowPass.kpx=p.kpx;gSlowPass.flags=p.flags;gSlowPass.swap=p.swap;gSlowPass.whenUs=p.ns/1000;
+        gSlowPass.fsInstrs=p.fsInstrs;gSlowPass.fsTex=p.fsTex;gSlowPass.fsSy=p.fsSy;gSlowPass.fsSs=p.fsSs;gSlowPass.fsWaves=p.fsWaves;gSlowPass.fsRegs=p.fsRegs;
+        gSlowPass.samples=p.samples;gSlowPass.ds=p.ds;gSlowPass.bandwidth=p.bandwidth;gSlowPass.verts=p.verts;
        }
        ++gSlowPass.passes;gSlowPass.totalUs+=us;
       }
@@ -419,6 +516,7 @@ static void traceStartWriter() {
      if(n<64 || taken<n)break;
     }
    }
+   if(!render)continue;   // the submissions, stages and file are the render server's
    if(subRead) {
     SubRec recs[64];uint32_t newest=0;
     for(;;) {
@@ -506,6 +604,21 @@ void (*native_bridge_metal_problem_hook)(const char *);
 // reported, so the first problem and the last ones stay the clients' own.
 static thread_local bool tQuietProblems;
 extern "C" void native_bridge_metal_quiet_problems(bool quiet) {tQuietProblems=quiet;}
+// Row L of the kernel log: a pipeline creation. Words: 0 flags (1 made, 2 compute), 1 microseconds it took, 2 when (microseconds since boot,
+// low 32 bits), 3 vertex and 4 fragment shader hash (Turnip's tu_hash32; 0 for compute and refusals before a shader), 5 the first colour pixel
+// format, then 96 bytes of text "fragment|vertex|why" (names cut to 36 and 24 characters). Not for shader priming, which has its own log.
+static void nbNotePipeline(bool made,bool compute,uint64_t tookUs,uint32_t vsHash,uint32_t fsHash,uint32_t format,const char *fragment,const char *vertex,const char *why) {
+ if(!diagOn() || tQuietProblems)return;
+ static const bool renderServer=!strcmp(getprogname(),"backboardd");
+ if(renderServer)return;   // its 122 of 256 rows pushed the poster's out of the kernel's ring; its pipelines are in the shader cache journal
+ uint32_t words[30]={};
+ words[0]=(made?1u:0u)|(compute?2u:0u);words[1]=(uint32_t)tookUs;words[2]=(uint32_t)nowUs();words[3]=vsHash;words[4]=fsHash;words[5]=format;
+ char text[97]={};
+ snprintf(text,sizeof text,"%.36s|%.24s|%.30s",fragment?:"-",vertex?:"-",why?:"");
+ for(char *c=text;*c;++c)if(*c=='\n')*c=' ';
+ memcpy(&words[6],text,96);
+ nbNote(2,words,30);
+}
 // Notes every process makes and that change nothing it draws: they must not stand in the one line a client's failure is reported on.
 static bool harmlessProblem(NSString *what) {
  for(NSString *prefix in @[@"native-metal: no device answer",@"native-metal: setGPUPriority",@"native-metal: setBackgroundGPUPriority",
@@ -533,7 +646,11 @@ static void noteProblem(NSString *what) {
 extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
 // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
 static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
-#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];NSLog(@"%@",nbText);noteProblem(nbText);\
+// The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): NSLog output, the pipeline journal. The problem notes that feed
+// the status rows (noteProblem) are kept either way.
+static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;return on;}
+#define GLOG(...) do{if(logGpuOn())NSLog(__VA_ARGS__);}while(0)
+#define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];GLOG(@"%@",nbText);noteProblem(nbText);\
  if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
 // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
@@ -573,13 +690,13 @@ static void logTexture(const char *kind,MTLTextureDescriptor *d,IOSurfaceRef sur
  if(!textureLogTurn())return;
  const uint64_t n=gTexturesLogged.load();
  if(surface)
-  NSLog(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu rot %lu | surface id %u %zux%zu rows %zu fmt %08x planes %zu "
+  GLOG(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu rot %lu | surface id %u %zux%zu rows %zu fmt %08x planes %zu "
         @"plane %lu alloc %zu | offset %lu rows %lu",(unsigned long long)n,kind,made?"made":"REFUSED",(unsigned long)d.width,
         (unsigned long)d.height,(unsigned long)d.pixelFormat,(unsigned long)textureRotation(d),IOSurfaceGetID(surface),
         IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),IOSurfaceGetBytesPerRow(surface),IOSurfaceGetPixelFormat(surface),
         IOSurfaceGetPlaneCount(surface),(unsigned long)plane,IOSurfaceGetAllocSize(surface),(unsigned long)offset,(unsigned long)row);
  else
-  NSLog(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu | memory %p offset %lu rows %lu",(unsigned long long)n,kind,
+  GLOG(@"native-metal: texture-log %llu %s %s desc %lux%lu fmt %lu | memory %p offset %lu rows %lu",(unsigned long long)n,kind,
         made?"made":"REFUSED",(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.pixelFormat,bytes,(unsigned long)offset,
         (unsigned long)row);
 }
@@ -732,7 +849,7 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
     library=dlopen(path.c_str(),RTLD_NOW);
    }
   }
-  if(library && path!=std::string(kFramework)+"/MTLCompiler")NSLog(@"native-metal: Metal compiler loaded from %s",path.c_str());
+  if(library && path!=std::string(kFramework)+"/MTLCompiler")GLOG(@"native-metal: Metal compiler loaded from %s",path.c_str());
   const size_t versions=path.find("/Versions/");
   strlcpy(gCompilerLoaded,!library?"none":versions==std::string::npos?"top":path.substr(versions+10,path.rfind('/')-versions-10).c_str(),
           sizeof gCompilerLoaded);
@@ -1161,7 +1278,7 @@ NB_RESOURCE_SPI
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
  const uint64_t length=(r.size.depth>1?image*(r.size.depth-1):0)+row*r.size.height;
  if(gLogTextures && textureLogTurn())
-  NSLog(@"native-metal: texture-log %llu replaceRegion origin %lu,%lu size %lux%lu level %lu slice %lu rows %lu | texture %llux%llu fmt %llu "
+  GLOG(@"native-metal: texture-log %llu replaceRegion origin %lu,%lu size %lux%lu level %lu slice %lu rows %lu | texture %llux%llu fmt %llu "
         @"options %llx surface %u",(unsigned long long)gTexturesLogged.load(),(unsigned long)r.origin.x,(unsigned long)r.origin.y,
         (unsigned long)r.size.width,(unsigned long)r.size.height,(unsigned long)level,(unsigned long)slice,(unsigned long)row,
         (unsigned long long)_descriptor.width,(unsigned long long)_descriptor.height,(unsigned long long)_descriptor.format,
@@ -1244,7 +1361,7 @@ static bool b3a8Planes(IOSurfaceRef surface,size_t allocation,size_t planes[4]) 
  if(!w || !h || row0*h+row1*h>allocation)return false;
  planes[0]=0;planes[1]=row0;planes[2]=row0*h;planes[3]=row1;
  static std::atomic<int> told{0};
- if(told.fetch_add(1)<8)NSLog(@"native-metal: b3a8 %lux%lu planes computed (row %lu at 0, row %lu at %lu; %lu of %lu bytes)",(unsigned long)w,
+ if(told.fetch_add(1)<8)GLOG(@"native-metal: b3a8 %lux%lu planes computed (row %lu at 0, row %lu at %lu; %lu of %lu bytes)",(unsigned long)w,
   (unsigned long)h,(unsigned long)row0,(unsigned long)row1,(unsigned long)(row0*h),(unsigned long)(row0*h+row1*h),(unsigned long)allocation);
  gSurfaceB3a8++;
  return true;
@@ -2454,7 +2571,7 @@ static void writeDrawStats() {
  if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
  if(gLogTextures && textureLogTurn()) {
   const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
-  NSLog(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
+  GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
         @"buffer %lu%s | texture %llux%llu fmt %llu options %llx",(unsigned long long)gTexturesLogged.load(),(unsigned long)z.width,
         (unsigned long)z.height,(unsigned long)dO.x,(unsigned long)dO.y,(unsigned long)level,(unsigned long)slice,(unsigned long)row,
         (unsigned long)image,(unsigned long)o,(unsigned long)[s length],[(NBBuffer *)s wrapped]?" no-copy":"",
@@ -2897,7 +3014,7 @@ static char kUserDictionaryKey;
    if(!self.failedLocally && hashSource(source.bytes,source.length)!=source.hash) {
     const uint64_t raced=++gSourcesRaced[source.surface];
     if(raced<=50 || raced%500==0)
-     NSLog(@"native-metal: source-race %s %ux%u, rows %u bytes: rewritten while the GPU could read it (%llu of %llu such sources)",
+     GLOG(@"native-metal: source-race %s %ux%u, rows %u bytes: rewritten while the GPU could read it (%llu of %llu such sources)",
            source.surface?"IOSurface":"no-copy buffer",source.width,source.height,source.row,(unsigned long long)raced,
            (unsigned long long)gSourcesWatched[source.surface].load());
    }
@@ -3056,16 +3173,21 @@ static void completed(void *context) {
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
 // setCompletionQueue: is the property's setter.
-// GPU priorities are not applied per queue (a process's queues share one hardware queue, whose priority is set when the device opens):
-// reported as not applied. What a process asks for is logged once (the render server's queue is the one CoreAnimation raises).
+// A process's queues share one hardware queue here, so what a queue asks for is given to the driver for the whole process (the most urgent
+// request of any of its queues stands: tu_darwin_set_priority); the answer stays NO, as callers have always got it. What a process asks
+// for is logged once (the render server's queue is the one CoreAnimation raises) and counted in the process's text row.
 - (BOOL)setGPUPriority:(NSUInteger)priority {
  static std::atomic<bool> told{false};
- if(!told.exchange(true))NBLOG(@"native-metal: setGPUPriority:%lu (not applied per queue)",(unsigned long)priority);
- return NO;
+ if(!told.exchange(true))NBLOG(@"native-metal: setGPUPriority:%lu (given to the driver for the process)",(unsigned long)priority);
+ gAskFg.store((uint32_t)priority);
+ nbForwardPriority((uint32_t)priority,0xffffffffu);
+ return NO;   // as before: the answer callers have always got
 }
 - (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {
  static std::atomic<bool> told{false};
- if(!told.exchange(true))NBLOG(@"native-metal: setBackgroundGPUPriority:%lu (not applied per queue)",(unsigned long)priority);
+ if(!told.exchange(true))NBLOG(@"native-metal: setBackgroundGPUPriority:%lu (given to the driver for the process)",(unsigned long)priority);
+ gAskBg.store((uint32_t)priority);
+ nbForwardPriority(0xffffffffu,(uint32_t)priority);
  return NO;
 }
 // What a new Metal queue reports (MTLIOAccelCommandQueue: normal 1, background 3). RenderBox and Core Image read both before any frame.
@@ -3615,7 +3737,7 @@ static char dvmMemoryReleaseKey;
   NSString *why=lastError();
   uint64_t answer[2]={0,0};
   (void)nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer);
-  NSLog(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
+  GLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
         (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
         (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
         (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
@@ -3874,7 +3996,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbTextureDescriptor descriptor;if(!textureDescriptor(d,&descriptor))return nil;
  NmbTexture *handle=nmb_texture_new(gDevice,&descriptor);noteFormat((uint32_t)descriptor.format,handle!=nullptr);
  if(gLogTextures && textureLogTurn())
-  NSLog(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
+  GLOG(@"native-metal: texture-log %llu texture %llux%llu fmt %llu type %llu levels %llu usage %llx options %llx %s",
         (unsigned long long)gTexturesLogged.load(),(unsigned long long)descriptor.width,(unsigned long long)descriptor.height,
         (unsigned long long)descriptor.format,(unsigned long long)descriptor.type,(unsigned long long)descriptor.levels,
         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
@@ -4024,6 +4146,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
   NBFunction *f=(NBFunction *)function;
+  nbNotePipeline(false,true,nowUs()-pipelineBegan,0,0,0,f.name.UTF8String,"-",lastError().UTF8String);
   noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
@@ -4031,6 +4154,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   NmbComputePipelineDescriptor p={};p.function=built.handle;p.max_call_stack_depth=1;
   *reflection=(MTLComputePipelineReflection *)computeReflection(&p);
  }
+ nbNotePipeline(true,true,nowUs()-pipelineBegan,0,0,0,((NBFunction *)function).name.UTF8String,"-","");
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
@@ -4080,6 +4204,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   static std::atomic<int> told{0};
   if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline descriptor refused (vertex %@, fragment %@): %@",d.vertexFunction.name,
                                d.fragmentFunction.name,error?(*error).localizedDescription:@"?");
+  nbNotePipeline(false,false,0,0,0,(uint32_t)d.colorAttachments[0].pixelFormat,d.fragmentFunction.name.UTF8String,d.vertexFunction.name.UTF8String,
+                 [(error?(*error).localizedDescription:@"descriptor") UTF8String]);
   delete p;return nil;
  }
  std::vector<NmbBinaryArchive *> archives;
@@ -4087,7 +4213,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
+ uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ nbLastProgram(&programVs,&programFs);
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
  std::string cost=gJournalPath.empty()?std::string():NBCost::now().since(costBegan);
@@ -4098,6 +4226,8 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   cost+=text;
  }
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),cost);
+ nbNotePipeline(handle!=nullptr,false,nowUs()-pipelineBegan,programVs,programFs,(uint32_t)d.colorAttachments[0].pixelFormat,d.fragmentFunction.name.UTF8String,
+                d.vertexFunction.name.UTF8String,handle?"":lastError().UTF8String);
  if(!handle) {
   // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
   // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
@@ -4235,7 +4365,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
- if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
