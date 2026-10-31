@@ -407,6 +407,21 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// The runtime's command buffer stages (bridge patch 0022, `stage_trace.rs`) from sequence `from` on, at most `max` records of
+/// {u64 host uptime ns, u64 id, u32 sequence, u16 stage, u16 arg}: how many were written; `*next` the sequence to ask for next.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_stage_ring_read(from: u64, out: *mut metal2vulkan_runtime::stage_trace::StageRecord, max: usize,
+                                      next: *mut u64) -> usize {
+    if out.is_null() || next.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller's `max` records and its word.
+    let records = unsafe { std::slice::from_raw_parts_mut(out, max) };
+    let (count, following) = metal2vulkan_runtime::stage_trace::read(from, records);
+    unsafe { *next = following };
+    count
+}
+
 /// Free the runtime's spare dedicated blocks and kept empty pooled blocks (bridge patch 0021), as Metal gives its resource cache's
 /// memory back when the system reports memory pressure: how many blocks went.
 #[unsafe(no_mangle)]
