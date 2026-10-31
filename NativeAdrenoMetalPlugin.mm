@@ -9,6 +9,7 @@
 // own GPU plugin.
 #import <Foundation/Foundation.h>
 #include <pthread.h>
+#include <thread>
 #include <dlfcn.h>
 #if __has_feature(ptrauth_calls)
 #include <ptrauth.h>
@@ -211,6 +212,26 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
             }
     }
 }
+// Each process's own render passes, as its Turnip recorded them (NativeBridgeMetalFrontend.mm): the slowest one's size, format and draw
+// count and the pass total, on the client's text line every 10 s while the diagnostics are on. A client whose jobs each took 77 ms showed
+// only that; which pass and at what size is what says whether the cost is the driver's.
+extern "C" size_t nmb_slowest_pass(char *out, size_t size) __attribute__((weak));
+static void startPassReporter(unsigned port) {
+    if (!getenv("SHENG_DIAG") || !&nmb_slowest_pass) return;
+    static std::atomic<bool> started{false};
+    if (started.exchange(true)) return;
+    Gpu *gpu = makeGpu(port);
+    if (!gpu) return;
+    std::thread([gpu]{
+        pthread_setname_np("pass-reporter");
+        for (;;) {
+            sleep(10);
+            char row[200];
+            if (!nmb_slowest_pass(row, sizeof row) || !row[0]) continue;
+            streamText(*gpu, row);
+        }
+    }).detach();
+}
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
@@ -258,6 +279,7 @@ static id clientDevice(unsigned port) {
     // once-a-second reader never ran before the crash (i568).
     if (device) {
         gClientPort = port;
+        startPassReporter(port);
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
@@ -297,6 +319,10 @@ static id deviceForPort(unsigned port) {
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
         // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+        // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
+        if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
+        else unsetenv("SHENG_DIAG");
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
@@ -401,8 +427,9 @@ static id deviceForPort(unsigned port) {
         // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
         // an app's.
         setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
-        // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums.
-        setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
+        // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
+        // (sheng-diag=1).
+        if (getenv("SHENG_DIAG")) setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         char candidates[5][512] = {};
@@ -451,13 +478,15 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
-        // The status line (GPU8) every ten seconds, and the display hand-off client on its own thread: both only read or serve, neither is the discovery's.
+        // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
+        // neither is the discovery's.
         pthread_t monitor, scanout;
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
         pthread_attr_setstacksize(&attributes, 1u << 20);
-        pthread_create(&monitor, &attributes, [](void *arg) -> void * {
+        const bool diag = getenv("SHENG_DIAG") != nullptr;
+        if (diag) pthread_create(&monitor, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             for (;;) {
                 sleep(10);
@@ -483,7 +512,7 @@ static id deviceForPort(unsigned port) {
             return nullptr;
         }, gpu);
         pthread_t telemetry;
-        pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
+        if (diag) pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(5);
             // The bridge's telemetry table, resent whole every four seconds as markers (two characters each): 0xC000|row starts a row of the
