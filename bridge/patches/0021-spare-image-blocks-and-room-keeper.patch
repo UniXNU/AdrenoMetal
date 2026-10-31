@@ -1,0 +1,382 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 053cafe9..96352266 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -27,6 +27,7 @@ pub(super) mod keeper;
+ pub(super) mod prime;
+ pub(super) mod properties;
+ pub(crate) mod relay;
++mod room;
+ mod staging;
+ pub(super) mod submit;
+ pub(crate) mod submit_stalls;
+@@ -501,6 +502,9 @@ pub(super) struct DeviceShared {
+     /// The thread that lets go of what a released state's pool pieces gave back as they ended
+     /// (`pipeline/reaper.rs`).
+     pub(super) reaper: crate::pipeline::reaper::Reaper,
++    /// The thread that keeps room in the pools the encodings and commits place their own
++    /// resources in, asked by the creation calls (`device/room.rs`).
++    room: room::Room,
+     /// The trails its threads open between a signal and their last let-go of what they held for
+     /// the work, which a command buffer's waiters wait for (`trails.rs`).
+     pub(crate) trails: Arc<crate::trails::Trails>,
+@@ -718,6 +722,9 @@ impl Drop for DeviceShared {
+         // What the reaper is handed holds the device: none is left, and it only stops, unless
+         // this teardown runs on its thread.
+         self.reaper.stop();
++        // The room keeper holds the device only for a pass: it stops, unless this teardown runs
++        // on its thread.
++        self.room.stop();
+         // What the residency thread releases holds the device: none is left.
+         #[cfg(unix)]
+         self.residency.stop();
+@@ -1014,13 +1021,24 @@ impl Device {
+     /// a pipeline state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes
+     /// a memory block, whose `vkAllocateMemory` waited 2.37 s for other processes' GPU work on
+     /// NVIDIA's driver. Nothing in a host step, a serial point of the command buffers' stream
+-    /// that makes only what it needs.
++    /// that makes only what it needs. The device's room keeper makes the blocks, so the call
++    /// returns at once (`device/room.rs`).
+     pub(crate) fn keep_room(&self) {
+         if crate::exit_guard::in_host_step() {
+             return;
+         }
++        self.0.room.ask(self);
++    }
++
++    /// Give back the memory kept for later placements: every spare dedicated block and every
++    /// kept empty pooled block (`memory::SPARE_FOR`), as Metal's resource cache gives memory
++    /// back when the system reports memory pressure. How many blocks went. No Metal counterpart.
++    pub fn release_kept_memory(&self) -> usize {
++        let Some(_busy) = crate::exit_guard::enter() else {
++            return 0;
++        };
+         let shared = self.shared();
+-        crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
++        lock(&shared.memory).release_spare(shared.vk())
+     }
+ 
+     /// Whether `other` is this device (the same handle, not merely the same physical device).
+@@ -1898,6 +1916,7 @@ impl Device {
+             uncommitted: Arc::default(),
+             pipeline_pool: Default::default(),
+             reaper: Default::default(),
++            room: Default::default(),
+             trails: Arc::default(),
+             recoveries: Arc::default(),
+             libraries: graphics_pipeline_library.then(Default::default),
+diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
+new file mode 100644
+index 00000000..d0e24d65
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/device/room.rs
+@@ -0,0 +1,122 @@
++//! The device's room keeper: one thread of the device's that keeps room in the pools its encodings
++//! and commits place their own resources in (`memory::keep_room`), so the creation call that asks
++//! for room returns at once.
++//!
++//! - **Asked by the creation calls.** [`Room::ask`] marks that room is wanted and wakes the
++//!   thread, which it starts unless it runs; asks that come while the thread works are one more
++//!   pass, not one each.
++//! - **Why a thread.** Making a block is a `vkAllocateMemory` that a driver may make wait: on an
++//!   iPadOS guest whose GPU takes the system's pages, each 64 MiB block was wired page by page as it
++//!   was made, 30-110 ms in the texture creation that asked for it (Core Animation's surfaces,
++//!   the widget renderer's textures). A placement that finds no room before the block is there
++//!   makes its own, and the keeper's block then goes at once (`memory::keep_room`).
++//! - **Holds nothing of the device.** The thread holds a weak handle only while it waits, and the
++//!   device itself only for a pass. Where that pass held its last handle, the teardown runs here,
++//!   and its [`Room::stop`] does not join this thread.
++
++use super::{lock, Device, WeakDevice};
++use crate::exit_guard;
++use std::sync::{Arc, Condvar, Mutex, PoisonError};
++use std::thread::JoinHandle;
++
++/// The device's room keeper: its thread, once a creation call started it.
++#[derive(Default)]
++pub(crate) struct Room {
++    shared: Arc<Shared>,
++    thread: Mutex<Option<JoinHandle<()>>>,
++}
++
++#[derive(Default)]
++struct Shared {
++    state: Mutex<State>,
++    /// Room was asked for, or the thread is asked to stop.
++    work: Condvar,
++}
++
++#[derive(Default)]
++struct State {
++    asked: bool,
++    stopping: bool,
++}
++
++impl Room {
++    /// Ask for room in `device`'s pools: the thread keeps it, started unless it runs. Where the
++    /// host cannot start a thread, the room is kept here, as before there was one.
++    pub(crate) fn ask(&self, device: &Device) {
++        {
++            let mut state = lock(&self.shared.state);
++            if state.stopping {
++                return;
++            }
++            state.asked = true;
++        }
++        self.shared.work.notify_all();
++        let mut thread = lock(&self.thread);
++        if thread.is_some() {
++            return;
++        }
++        let shared = Arc::clone(&self.shared);
++        let weak = device.downgrade();
++        match exit_guard::spawn(
++            std::thread::Builder::new().name("metal2vulkan-room".into()),
++            move || run(&shared, &weak),
++        ) {
++            Ok(handle) => *thread = Some(handle),
++            Err(_) => {
++                drop(thread);
++                lock(&self.shared.state).asked = false;
++                keep(device);
++            }
++        }
++    }
++
++    /// The device's teardown: the thread ends, and is joined unless this is it.
++    pub(crate) fn stop(&self) {
++        lock(&self.shared.state).stopping = true;
++        self.shared.work.notify_all();
++        let mut thread = lock(&self.thread);
++        let own = thread
++            .as_ref()
++            .is_some_and(|handle| handle.thread().id() == std::thread::current().id());
++        if !own {
++            if let Some(handle) = thread.take() {
++                let _ = handle.join();
++            }
++        }
++    }
++}
++
++/// One pass: room kept in `device`'s pools, in a section of the exit guard.
++fn keep(device: &Device) {
++    let Some(_busy) = exit_guard::enter() else {
++        return;
++    };
++    let shared = device.shared();
++    crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
++}
++
++/// The thread's loop: a pass for each time room was asked since the last, until stopped.
++fn run(shared: &Shared, weak: &WeakDevice) {
++    loop {
++        {
++            let mut state = lock(&shared.state);
++            while !state.asked && !state.stopping {
++                state = shared
++                    .work
++                    .wait(state)
++                    .unwrap_or_else(PoisonError::into_inner);
++            }
++            if state.stopping {
++                return;
++            }
++            state.asked = false;
++        }
++        let Some(device) = weak.upgrade() else {
++            return;
++        };
++        keep(&device);
++        // Outside the state's lock: it may be the device's last handle, whose teardown stops
++        // this thread.
++        drop(device);
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 1f882747..e015fc9b 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -90,6 +90,26 @@ const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
+ /// guest's home screen.
+ pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
+ 
++/// How long a dedicated block of images whose image went stays spare for the next dedicated image
++/// of its pool ([`Memory::take_spare`]) before it is freed. Core Animation makes a memoryless
++/// attachment for every surface it renders to and releases it with the surface: where the device's
++/// lazily allocated memory is backed at the first pass (every pass renders in system memory), each
++/// one was a new 40-112 MiB allocation wired page by page, 1.4 s of an iPadOS render server's
++/// first minute in 29 of them, and its free unwired it again. No count or byte limit: as the
++/// pooled blocks kept empty, the spares go when a block of their type cannot be made
++/// ([`Memory::release_kept`]) and when the system reports memory pressure
++/// ([`Memory::release_spare`]).
++pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
++
++/// A dedicated block of images whose image went, kept for the next dedicated image of its pool
++/// ([`SPARE_FOR`]).
++#[derive(Debug)]
++struct Spare {
++    pool: (Holds, u32),
++    block: Block,
++    since: Instant,
++}
++
+ /// What memory a resource needs.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+ pub(super) enum MemoryClass {
+@@ -754,6 +774,12 @@ struct BlockAddresses {
+ }
+ 
+ impl Block {
++    /// Whether it is the runtime's own memory, imported from nothing: what a spare may be
++    /// ([`SPARE_FOR`]).
++    fn plain(&self) -> bool {
++        !self.imported && self.pages.is_none() && self.view.is_none()
++    }
++
+     /// The cause its `vkFreeMemory` is counted under. A block freed as the one placement in it
+     /// went ([`FreeCause::Dedicated`]) that is an import of its own is counted as that import
+     /// instead: the caller's host memory ([`Memory::import_host`]) or a buffer's fresh pages
+@@ -1052,6 +1078,9 @@ pub(super) struct Memory {
+     /// ([`binds_wait`]), so an image bound while such work may be queued takes a block of its own
+     /// ([`allocate_image_while_queued`]).
+     binds_wait: bool,
++    /// The dedicated blocks of images kept for the next dedicated image of their pool
++    /// ([`SPARE_FOR`]).
++    spare: Vec<Spare>,
+ }
+ 
+ impl Memory {
+@@ -1087,6 +1116,7 @@ impl Memory {
+             freed_by: [0; FreeCause::COUNT],
+             log: None,
+             binds_wait: binds_wait(driver),
++            spare: Vec::new(),
+         }
+     }
+ 
+@@ -1162,6 +1192,10 @@ impl Memory {
+         for pool in &self.pools {
+             pool.count_into(&mut census, |block| block.imported);
+         }
++        for spare in &self.spare {
++            census.empty += 1;
++            census.empty_bytes += spare.block.size;
++        }
+         census
+     }
+ 
+@@ -1433,7 +1467,17 @@ impl Memory {
+             // SAFETY: nothing is placed in a kept empty block, and no command reads it.
+             drop(unsafe { self.let_go(device, stale, FreeCause::KeptStale, None) });
+         }
++        self.age_spare(device, now);
+         match freed {
++            Some((block, true)) if holds == Holds::Images && block.plain() => {
++                self.say_block("kept a dedicated block of an image spare", &block);
++                self.spare.push(Spare {
++                    pool: (holds, type_index),
++                    block,
++                    since: now,
++                });
++                after
++            }
+             Some((block, dedicated)) => {
+                 let cause = match dedicated {
+                     true => FreeCause::Dedicated,
+@@ -1449,10 +1493,15 @@ impl Memory {
+     /// Release every kept empty pooled block of memory type `type_index`, of buffers and of
+     /// images, as a block of that type fails to be made ([`place`]): how many went.
+     fn release_kept(&mut self, device: &ash::Device, type_index: u32) -> usize {
+-        let blocks: Vec<Block> = [Holds::Buffers, Holds::Images]
++        let mut blocks: Vec<Block> = [Holds::Buffers, Holds::Images]
+             .into_iter()
+             .flat_map(|holds| self.pool(holds, type_index).take_kept())
+             .collect();
++        blocks.extend(
++            (self.spare)
++                .extract_if(.., |spare| spare.pool.1 == type_index)
++                .map(|spare| spare.block),
++        );
+         let count = blocks.len();
+         for block in blocks {
+             // SAFETY: nothing is placed in a kept empty block, and no command reads it.
+@@ -1461,6 +1510,46 @@ impl Memory {
+         count
+     }
+ 
++    /// Free the spare blocks that stayed spare for [`SPARE_FOR`] at `now`.
++    fn age_spare(&mut self, device: &ash::Device, now: Instant) {
++        let stale: Vec<Spare> = (self.spare)
++            .extract_if(.., |spare| now.saturating_duration_since(spare.since) >= SPARE_FOR)
++            .collect();
++        for spare in stale {
++            // SAFETY: nothing is placed in a spare block, and no command reads it.
++            drop(unsafe { self.let_go(device, spare.block, FreeCause::KeptStale, None) });
++        }
++    }
++
++    /// The smallest spare block of `pool` that holds `size` bytes with at most a quarter of it
++    /// left over, taken out for a dedicated image ([`place`]); the stale spares go first.
++    fn take_spare(&mut self, device: &ash::Device, pool: (Holds, u32), size: u64) -> Option<Block> {
++        self.age_spare(device, Instant::now());
++        let (index, _) = (self.spare.iter().enumerate())
++            .filter(|(_, spare)| {
++                spare.pool == pool
++                    && spare.block.size >= size
++                    && spare.block.size - size <= spare.block.size / 4
++            })
++            .min_by_key(|(_, spare)| spare.block.size)?;
++        Some(self.spare.swap_remove(index).block)
++    }
++
++    /// Free every spare block and every kept empty pooled block: the system reports memory
++    /// pressure, the signal Metal's resource cache gives memory back on. How many went.
++    pub(super) fn release_spare(&mut self, device: &ash::Device) -> usize {
++        let mut blocks: Vec<Block> = self.spare.drain(..).map(|spare| spare.block).collect();
++        for pool in &mut self.pools {
++            blocks.extend(pool.take_kept());
++        }
++        let count = blocks.len();
++        for block in blocks {
++            // SAFETY: nothing is placed in a spare or kept empty block, and no command reads it.
++            drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
++        }
++        count
++    }
++
+     /// Over every pool: the block slots the room queries have walked and the free ranges they
+     /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
+     /// where it derived per call ([`Pool::room_per_call`]).
+@@ -1741,9 +1830,10 @@ impl Memory {
+     /// and no resource is left. What waited with them, for the caller to let go of with no lock
+     /// held.
+     pub(super) fn destroy(&mut self, device: &ash::Device) -> Vec<Box<dyn Send>> {
+-        let blocks: Vec<Block> = (self.pools.iter_mut())
++        let mut blocks: Vec<Block> = (self.pools.iter_mut())
+             .flat_map(|pool| pool.drain())
+             .collect();
++        blocks.extend(self.spare.drain(..).map(|spare| spare.block));
+         for block in blocks {
+             self.say_block("freed a block as the device is destroyed", &block);
+             self.freed_by[block.cause(FreeCause::Teardown) as usize] += 1;
+@@ -2123,6 +2213,19 @@ fn place(
+                 return Ok(placement);
+             }
+         }
++        // A dedicated image takes a spare block of its pool where one fits ([`SPARE_FOR`]); one
++        // placed apart takes memory no submission has used ([`Fit`]).
++        if dedicated && fit == Fit::Pooled && holds == Holds::Images && addressed.is_none() {
++            let mut memory = lock(memory);
++            if let Some(block) = memory.take_spare(device, pool, size) {
++                let bytes = block.size;
++                memory.say_block("took a spare dedicated block for an image", &block);
++                let index = memory.pool(pool.0, pool.1).add(bytes, true, block, size);
++                let placement = memory.placement(pool, index, 0, size, false);
++                memory.say_placement("placed", &placement, Some(class));
++                return Ok(placement);
++            }
++        }
+         // The type's kept empty blocks go before a block of it fails to be made.
+         let made = match maker.make(device, type_index, block_size, addressed) {
+             Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {

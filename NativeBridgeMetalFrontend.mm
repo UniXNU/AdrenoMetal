@@ -918,7 +918,8 @@ static void watchImportPressure() {
   dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
    DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
-  dispatch_source_set_event_handler(source,^{trimHeldImports(true);});
+  // The runtime's spare and kept empty memory blocks go too (bridge patch 0021), as Metal's resource cache gives memory back.
+  dispatch_source_set_event_handler(source,^{trimHeldImports(true);if(gDevice)(void)nmb_device_release_kept_memory(gDevice);});
   dispatch_activate(source);
  });
 }
@@ -4174,6 +4175,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
+ watchImportPressure();
  if(cache){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
