@@ -1,0 +1,118 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index e5e7a777..b11379b2 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -478,6 +478,7 @@ impl CommandBufferShared {
+         };
+         // The scrubs of emulated textures' writes, as mapped now, then every segment in its place.
+         self.record_scrubs(&mut state, range.clone())?;
++        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 1);
+         state
+             .place(range.clone())
+             .map_err(|error| recording_error(device, error))?;
+@@ -939,6 +940,7 @@ impl CommandBufferShared {
+         let buffers = (submits.iter())
+             .map(|info| info.command_buffer_count as usize)
+             .sum();
++        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 2);
+         // From here its heap set versions may be pending: nothing writes them any more, and its
+         // first batch takes the ticket a texture that goes from now on waits for
+         // (`heap_sets.rs`). One committed and not yet submitted holds no gone texture.
+@@ -989,6 +991,7 @@ impl CommandBufferShared {
+                 scheduler
+                     .group
+                     .submit(device, &mut scheduler.waited[queue], Some(after));
++            crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 3);
+             if let Err(error) = submitted {
+                 if let Some(fence) = fence {
+                     // SAFETY: the failed submission is not pending; inside the section.
+@@ -1070,6 +1073,7 @@ impl CommandBufferShared {
+         // The holds its completion lets go (`State::holds_until`).
+         let holds = state.holds_until(index);
+         drop(state);
++        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 4);
+         if rebound {
+             device.degrade_encoded_use_rebound(rebound_use);
+         }
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+index bbb1fb47..c6f0995a 100644
+--- a/crates/metal2vulkan-runtime/src/creation.rs
++++ b/crates/metal2vulkan-runtime/src/creation.rs
+@@ -117,7 +117,8 @@ pub(crate) unsafe fn allocate_memory(
+ /// The call stacks that allocated device memory of at least [`SITE_BYTES`], by the bytes they
+ /// allocated: what a process's GPU memory went to, without a debugger on the device. A stack is
+ /// its first [`SITE_FRAMES`] return addresses past this function's; at most [`SITE_COUNT`]
+-/// stacks are kept, a new one past them counted under the last.
++/// stacks are kept, a new one past them counted under the last. Kept only with the diagnostics on
++/// (`stage_trace::diagnostics`).
+ const SITE_BYTES: u64 = 4 << 20;
+ const SITE_FRAMES: usize = 10;
+ const SITE_COUNT: usize = 32;
+@@ -135,7 +136,7 @@ pub struct AllocationSite {
+ }
+ 
+ fn note_allocation_site(bytes: u64) {
+-    if bytes < SITE_BYTES {
++    if bytes < SITE_BYTES || !crate::stage_trace::diagnostics() {
+         return;
+     }
+     let mut raw = [std::ptr::null_mut::<libc::c_void>(); SITE_FRAMES + 2];
+diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+index d401a6c8..53af5b0b 100644
+--- a/crates/metal2vulkan-runtime/src/stage_trace.rs
++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
+@@ -8,11 +8,14 @@
+ //!   keeps the newest [`RING`] records; a reader that falls behind loses the oldest.
+ //! - **One clock.** The host's uptime clock in nanoseconds (`CLOCK_UPTIME_RAW` on Apple
+ //!   platforms), the one the frontend's trace and the driver's rings use.
++//! - **Off unless asked for.** Records are kept only where the host's environment has
++//!   `SHENG_DIAG` ([`diagnostics`]), read once; the same switch keeps the allocation sites
++//!   (`creation.rs`). Without it a record costs one relaxed load.
+ //! - **Ids.** A command buffer's id is the address of its shared state, alive from its commit to
+ //!   its completion: records of one id between a commit stage and its completion are one command
+ //!   buffer's.
+ 
+-use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+ 
+ /// The records the ring keeps.
+ const RING: usize = 1 << 16;
+@@ -53,6 +56,10 @@ pub enum Stage {
+     Seen = 14,
+     /// Its completion ran (`arg`: 1 on the waiter, 2 posted to its queue's context).
+     Finished = 15,
++    /// A step inside a batch's submission ended (`arg`: 1 the scrubs and segments placed, 2 its
++    /// waits and signals gathered, 3 the driver's `vkQueueSubmit` returned, 4 the submission's
++    /// changes made).
++    SubmitStep = 16,
+     /// The scheduler's thread went to sleep (id 0, `arg`: slice in ms, | 0x8000 on the GPU).
+     SchedulerSleep = 20,
+     /// Something woke the scheduler's thread (id 0, `arg`: 0 commit, 1 completion, 2 host).
+@@ -102,8 +109,26 @@ pub fn now_nanos() -> u64 {
+     }
+ }
+ 
+-/// Record `stage` of `id` with `arg`, now.
++/// Whether the host asked for the runtime's diagnostics: `SHENG_DIAG` in the environment, read
++/// once.
++pub(crate) fn diagnostics() -> bool {
++    // 0 not read yet, 1 off, 2 on.
++    static ON: AtomicU8 = AtomicU8::new(0);
++    match ON.load(Ordering::Relaxed) {
++        0 => {
++            let on = std::env::var_os("SHENG_DIAG").is_some();
++            ON.store(if on { 2 } else { 1 }, Ordering::Relaxed);
++            on
++        }
++        state => state == 2,
++    }
++}
++
++/// Record `stage` of `id` with `arg`, now, where the diagnostics are on ([`diagnostics`]).
+ pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
++    if !diagnostics() {
++        return;
++    }
+     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+     let slot = &SLOTS[(sequence as usize) & (RING - 1)];
+     slot.word.store(0, Ordering::Release);
