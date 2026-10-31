@@ -185,7 +185,8 @@ static CommitRecord gCommitRing[32];
 // type 3 the same for waitUntilScheduled; type 4 a thread's name {tid, 24 characters in t0..t2}; type 0 the file's first record {t0 nowUs() now, t1 wall clock microseconds, b process id, c wall clock
 // seconds, d format version 2}; type 7 a render pass from Turnip's ring (tu_pass_ring_read) {t0 recorded, t1 its sequence, a width | height << 16, b mode (0 GMEM, 1 SYSMEM
 // by the autotuner, 2 SYSMEM otherwise) | colour attachments << 8 | flags (1 mutable view, 2 linear, 4 unpadded, 8 loaded, 16 stored, 32 FDM) << 16 | the first colour
-// attachment's view swap << 24, c draws | VkFormat << 16, d thousands of pixels}; type 8 a kernel submission from the Turnip kmd's ring (tu_darwin_submit_ring_read) {t0 when
+// attachment's view swap << 24, c draws | VkFormat << 16, d thousands of pixels, t2/t3 when the GPU began and ended it in microseconds of its always-on counter (0: not
+// run when read; read 300 ms after it was recorded)}; type 8 a kernel submission from the Turnip kmd's ring (tu_darwin_submit_ring_read) {t0 when
 // it began, t1 its sequence, a the kernel fence, b microseconds waiting for an unsubmitted sync, c microseconds in the kernel calls, d of those waiting for ring space,
 // cpu0 busy answers | chunks << 16 | indirect buffers << 24}. Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
@@ -334,9 +335,9 @@ static void traceStartWriter() {
   int fd=-1;
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
   uint32_t written=0,sampled=0;
-  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;};
+  struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
-  static_assert(sizeof(PassRec)==32 && sizeof(SubRec)==32,"turnip ring records");
+  static_assert(sizeof(PassRec)==48 && sizeof(SubRec)==32,"turnip ring records");
   uint32_t passFrom=0,subFrom=0;
   void *turnip=nullptr;
   uint32_t (*passRead)(uint32_t,PassRec *,uint32_t,uint32_t *)=nullptr;
@@ -367,13 +368,17 @@ static void traceStartWriter() {
     PassRec recs[64];uint32_t newest=0;
     for(;;) {
      const uint32_t n=passRead(passFrom,recs,64,&newest);
-     for(uint32_t i=0;i<n;i++) {
+     // A pass recorded in the last 300 ms may not have run yet: it is read, with its GPU times, at the next turn.
+     const uint64_t ripe=nowUs()-300000;
+     uint32_t taken=0;
+     for(uint32_t i=0;i<n && recs[i].ns/1000<=ripe;i++,taken++) {
       const PassRec &p=recs[i];
       TraceRec rec={};rec.type=7;rec.t0=p.ns/1000;rec.t1=p.seq;rec.a=p.width|(uint32_t)p.height<<16;
       rec.b=p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24;rec.c=p.draws|(uint32_t)p.format<<16;rec.d=p.kpx;
+      rec.t2=p.gpuBegin/1000;rec.t3=p.gpuEnd/1000;
       tracePush(rec);passFrom=p.seq+1;
      }
-     if(n<64)break;
+     if(n<64 || taken<n)break;
     }
    }
    if(subRead) {
