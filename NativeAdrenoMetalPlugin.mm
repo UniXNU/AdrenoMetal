@@ -225,7 +225,7 @@ static void startPassReporter(unsigned port) {
     std::thread([gpu]{
         pthread_setname_np("pass-reporter");
         for (;;) {
-            sleep(10);
+            sleep(5);
             char row[200];
             if (!nmb_slowest_pass(row, sizeof row) || !row[0]) continue;
             streamText(*gpu, row);
@@ -323,6 +323,9 @@ static id deviceForPort(unsigned port) {
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
+        // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
+        if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
+        else unsetenv("SHENG_LOG_GPU");
         if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
