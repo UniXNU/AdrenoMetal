@@ -55,6 +55,9 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+/* The runtime's command buffer stages from sequence from on (bridge patch 0022): 24-byte records {u64 uptime ns, u64 id, u32 sequence,
+ * u16 stage, u16 arg}; returns how many, *next the sequence to ask for next. */
+size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);
 /* Frees the runtime's spare dedicated blocks and kept empty pooled blocks (memory pressure); returns how many went. */
 size_t nmb_device_release_kept_memory(const NmbDevice *);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return

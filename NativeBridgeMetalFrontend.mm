@@ -188,7 +188,8 @@ static CommitRecord gCommitRing[32];
 // attachment's view swap << 24, c draws | VkFormat << 16, d thousands of pixels, t2/t3 when the GPU began and ended it in microseconds of its always-on counter (0: not
 // run when read; read 300 ms after it was recorded)}; type 8 a kernel submission from the Turnip kmd's ring (tu_darwin_submit_ring_read) {t0 when
 // it began, t1 its sequence, a the kernel fence, b microseconds waiting for an unsubmitted sync, c microseconds in the kernel calls, d of those waiting for ring space,
-// cpu0 busy answers | chunks << 16 | indirect buffers << 24}. Times are nowUs().
+// cpu0 busy answers | chunks << 16 | indirect buffers << 24}; type 12 a runtime command buffer stage (nmb_stage_ring_read, bridge patch 0022) {t0 when (us of the
+// uptime clock), t1 the command buffer's id (its shared state's address; 0 the scheduler thread), a stage, b arg, c sequence}. Times are nowUs().
 struct TraceRec {uint32_t type,idx;uint64_t t0,t1,t2,t3;uint32_t a,b,c,d,tid,cpu0,cpu1,tid2;};
 static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
@@ -392,6 +393,22 @@ static void traceStartWriter() {
       tracePush(rec);subFrom=p.seq+1;
      }
      if(n<64)break;
+    }
+   }
+   {
+    struct StageRec {uint64_t ns,id;uint32_t seq;uint16_t stage,arg;};
+    static_assert(sizeof(StageRec)==24,"stage record");
+    static uint64_t stageFrom=0;
+    StageRec recs[256];
+    for(;;) {
+     uint64_t next=stageFrom;
+     const size_t n=nmb_stage_ring_read(stageFrom,recs,256,&next);
+     for(size_t i=0;i<n;i++) {
+      TraceRec rec={};rec.type=12;rec.t0=recs[i].ns/1000;rec.t1=recs[i].id;rec.a=recs[i].stage;rec.b=recs[i].arg;rec.c=recs[i].seq;
+      tracePush(rec);
+     }
+     stageFrom=next;
+     if(n<256)break;
     }
    }
    if(copyStats) {

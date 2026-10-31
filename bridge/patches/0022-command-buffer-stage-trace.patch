@@ -1,0 +1,447 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+index 87190761..4edc64e5 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
+@@ -438,6 +438,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+         } = batch;
+         lists.gathered.extend(fence.map(|fence| (queue, fence)));
+         if last {
++            crate::stage_trace::mark(
++                Arc::as_ptr(&*buffer) as usize,
++                crate::stage_trace::Stage::Seen,
++                queue.min(255) as u32,
++            );
+             let mut state = lock(&buffer.state);
+             state.times.completed = seen;
+             state.keep_holds(holds);
+@@ -670,6 +675,8 @@ struct Front {
+     value: u64,
+     /// The fence its submission signals, where it has one.
+     fence: Option<vk::Fence>,
++    /// Its command buffer, for the stage trace (`stage_trace.rs`).
++    id: usize,
+ }
+ 
+ /// `VkQueue` `queue`'s waiter (the module docs): it waits for its queue's first pending batch
+@@ -705,6 +712,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+                         let front = Front {
+                             value: batch.value,
+                             fence: batch.fence,
++                            id: Arc::as_ptr(&*batch.buffer) as usize,
+                         };
+                         Some((front, batch.buffer.device().clone()))
+                     }
+@@ -726,11 +734,18 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+             continue;
+         };
+         device.shared().counts.completion_armed(slept);
++        crate::stage_trace::mark(
++            front.id,
++            crate::stage_trace::Stage::PollArmed,
++            (queue.min(255) as u32) | (u32::from(slept) << 8),
++        );
+         // The wait is a section of the exit guard; once the process is exiting the waiters end,
+         // and what is pending stays pending, as Metal's does.
+         let polled = match exit_guard::enter() {
+             Some(busy) => {
++                let id = front.id;
+                 let polled = poll(&device, queue, front);
++                crate::stage_trace::mark(id, crate::stage_trace::Stage::PollDone, queue.min(255) as u32);
+                 drop(busy);
+                 Some(polled)
+             }
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 409a9db6..37fa6fcf 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -2436,9 +2436,12 @@ impl CommandBuffer {
+     /// [`commit`](Self::commit) for `call`, or, with `failure`,
+     /// [`commit_failed`](Self::commit_failed).
+     fn commit_as(&self, call: &'static str, failure: Option<CommitFailure>) -> Result<(), Error> {
++        let id = Arc::as_ptr(&self.0) as usize;
++        crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitCall, 0);
+         // Left to wait for the last render encoder's end, where its call left it to the device's
+         // lowering thread and the thread has not lowered it, or for the commits left so.
+         if failure.is_none() && self.queue_commit(call)? {
++            crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitQueued, 0);
+             return Ok(());
+         }
+         // The last render encoder's end, where its call left it to the device's lowering thread.
+@@ -2527,6 +2530,12 @@ impl CommandBuffer {
+         failure: Option<CommitFailure>,
+         run: CommitRun,
+     ) -> Result<(), Error> {
++        let run_kind = match run {
++            CommitRun::AtCall => 0,
++            CommitRun::Queued => 1,
++            CommitRun::Refused => 2,
++        };
++        crate::stage_trace::mark(Arc::as_ptr(&self.0) as usize, crate::stage_trace::Stage::CommitRun, run_kind);
+         // The waiting fetched render targets take their storage form at this commit where it
+         // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
+         // ends the switch once it submitted the command buffer. None where nothing of it runs.
+@@ -2739,6 +2748,11 @@ impl CommandBuffer {
+                 return Err(error);
+             }
+         };
++        crate::stage_trace::mark(
++            Arc::as_ptr(&self.0) as usize,
++            crate::stage_trace::Stage::Prepared,
++            prepared.len() as u32,
++        );
+         // The first segment a host step records, which the device announces (a loop's check
+         // records nothing).
+         let announced = segments
+@@ -4362,18 +4376,23 @@ impl CommandBufferShared {
+         result: Result<(), CommandBufferError>,
+     ) {
+         let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
++        let id = Arc::as_ptr(&*buffer) as usize;
+         let item = Item::Transition(Transition::finished(buffer, result));
+         let item = match program_objects::Unheld::enter() {
+             Some(unheld) => {
+                 let ran = contexts.run_here(queue, item);
+                 drop(unheld);
+                 match ran {
+-                    Ok(()) => return,
++                    Ok(()) => {
++                        crate::stage_trace::mark(id, crate::stage_trace::Stage::Finished, 1);
++                        return;
++                    }
+                     Err(item) => item,
+                 }
+             }
+             None => item,
+         };
++        crate::stage_trace::mark(id, crate::stage_trace::Stage::Finished, 2);
+         contexts.post(queue, item);
+     }
+ 
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index 7b18eb69..e5e7a777 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -343,6 +343,29 @@ impl CommandBufferShared {
+         last: bool,
+         event_waits: &[(vk::Semaphore, u64)],
+         scheduler: &mut scheduler::State,
++    ) -> Result<Submitting, CommandBufferError> {
++        let id = Arc::as_ptr(self) as usize;
++        let at = (index.min(0x7fff) as u32) | (u32::from(last) << 15);
++        crate::stage_trace::mark(id, crate::stage_trace::Stage::SubmitBegin, at);
++        let submitted = self.submit_batch_now(index, last, event_waits, scheduler);
++        let outcome = match &submitted {
++            Ok(Submitting::Submitted(_)) => 0,
++            Ok(Submitting::Grouped) => 1,
++            Ok(Submitting::Later) => 2,
++            Ok(Submitting::AfterGroup(_)) => 3,
++            Err(_) => 4,
++        };
++        crate::stage_trace::mark(id, crate::stage_trace::Stage::SubmitEnd, outcome);
++        submitted
++    }
++
++    /// [`submit_batch`](Self::submit_batch) itself.
++    fn submit_batch_now(
++        self: &Arc<Self>,
++        index: usize,
++        last: bool,
++        event_waits: &[(vk::Semaphore, u64)],
++        scheduler: &mut scheduler::State,
+     ) -> Result<Submitting, CommandBufferError> {
+         let device = &self.device;
+         if device.is_lost() {
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index 400f6882..c5b00b55 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -24,6 +24,7 @@
+ #![warn(missing_docs)]
+ 
+ mod address;
++pub mod stage_trace;
+ mod address_map;
+ mod address_pool;
+ mod amplification;
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+index d8a3b7b3..34485655 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
+@@ -388,6 +388,9 @@ impl SchedulerShared {
+     /// (`asleep`, read under the lock the mark was made under; one that sleeps later reads the
+     /// mark first), counted as `woken`; else the notify, a system call, is spared.
+     fn woken(&self, woken: Woken, asleep: Asleep) {
++        if !matches!(asleep, Asleep::No) {
++            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerWake, woken as u32);
++        }
+         match asleep {
+             Asleep::OnCondvar => {
+                 self.wakings[woken as usize].fetch_add(1, Ordering::Relaxed);
+@@ -537,6 +540,8 @@ struct Held {
+     /// The host nanoseconds at the first look of the scheduler's that found it held
+     /// ([`held_for`](Self::held_for)), until it goes ([`hold_ended`](Self::hold_ended)).
+     held_since: Option<u64>,
++    /// The reasons a look held it for that the stage trace recorded (`stage_trace.rs`), a bit each.
++    traced_reasons: u8,
+ }
+ 
+ impl Held {
+@@ -545,6 +550,15 @@ impl Held {
+     /// read from the host's clock while nothing waits.
+     fn held_for(&mut self, reason: HeldFor) {
+         (self.buffer.device().shared().counts).head_held_for(reason);
++        let bit = 1u8 << (reason as u8);
++        if self.traced_reasons & bit == 0 {
++            self.traced_reasons |= bit;
++            crate::stage_trace::mark(
++                Arc::as_ptr(&*self.buffer) as usize,
++                crate::stage_trace::Stage::Held,
++                (reason as u32 + 1) | ((self.index.min(255) as u32) << 8),
++            );
++        }
+         if self.held_since.is_none() {
+             self.held_since = Some(gpu_time::host_nanos());
+         }
+@@ -685,6 +699,11 @@ impl Scheduler {
+         batches: Vec<BatchSync>,
+     ) {
+         let shared = &*self.shared;
++        crate::stage_trace::mark(
++            Arc::as_ptr(buffer) as usize,
++            crate::stage_trace::Stage::Handed,
++            batches.len() as u32,
++        );
+         let committed = Committed {
+             buffer: buffer.hold(),
+             queue,
+@@ -966,15 +985,20 @@ fn run(shared: &SchedulerShared) {
+             };
+             let slice = bound.map_or(slice, |left| left.min(slice));
+             shared.sleeps.fetch_add(1, Ordering::Relaxed);
++            let slice_ms = slice.as_millis().min(0x7fff) as u32;
+             if let Some(nudge) = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu)) {
++                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms | 0x8000);
+                 state = wait_for_gpu(shared, state, nudge, &mut gpu, (slice, short));
++                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, 0);
+                 continue;
+             }
+             state.asleep = true;
++            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms);
+             let (woke, waited) = shared
+                 .wake
+                 .wait_timeout(state, slice)
+                 .unwrap_or_else(std::sync::PoisonError::into_inner);
++            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, u32::from(waited.timed_out()));
+             state = woke;
+             state.asleep = false;
+             if waited.timed_out() && !short {
+@@ -1072,7 +1096,10 @@ fn run_work(kind: Kind, work: Work) -> bool {
+     let (buffer, index) = &work;
+     match kind {
+         Kind::Step => {
++            let id = Arc::as_ptr(&**buffer) as usize;
++            crate::stage_trace::mark(id, crate::stage_trace::Stage::StepBegin, *index as u32);
+             buffer.host_step(*index);
++            crate::stage_trace::mark(id, crate::stage_trace::Stage::StepEnd, *index as u32);
+             for &call in exit_guard::HOST_STEP {
+                 exit_guard::called(call);
+             }
+@@ -1098,7 +1125,11 @@ fn run_work(kind: Kind, work: Work) -> bool {
+ fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
+     (shared.inbox).pass(|state, commits| {
+         shared.passes.fetch_add(1, Ordering::Relaxed);
++        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassBegin, 0);
++        let before = passed.spent.len();
+         pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
++        let spent = passed.spent.len().saturating_sub(before);
++        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassEnd, spent.min(0xffff) as u32);
+         !passed.exiting && left.is_empty() && !passed.more
+     });
+     passed.more = false;
+@@ -1137,6 +1168,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+     } in commits.drain(..)
+     {
+         let count = batches.len();
++        crate::stage_trace::mark(
++            Arc::as_ptr(&*buffer) as usize,
++            crate::stage_trace::Stage::Taken,
++            count as u32,
++        );
+         let State { order, binary, .. } = &mut *state;
+         let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
+             buffer: buffer.hold(),
+@@ -1151,6 +1187,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+             hastened: false,
+             counted_held: false,
+             held_since: None,
++            traced_reasons: 0,
+         });
+         order.push(queue, held);
+         spent.push(buffer);
+diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+new file mode 100644
+index 00000000..d401a6c8
+--- /dev/null
++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
+@@ -0,0 +1,161 @@
++//! A process-wide ring of the stages each command buffer passes from its commit to its completion,
++//! for a host that asks where the time between them goes ([`read`]): when it was committed, left
++//! to the lowering thread, run, recorded, handed to the scheduler and taken in, what held its
++//! batches, when each was submitted, and when the completion waiter armed, saw it and finished it.
++//! The scheduler's and the waiters' own sleeps and wakes are recorded under id 0 and the queue.
++//!
++//! - **Cheap.** A record is one atomic add and three stores; nothing allocates or locks. The ring
++//!   keeps the newest [`RING`] records; a reader that falls behind loses the oldest.
++//! - **One clock.** The host's uptime clock in nanoseconds (`CLOCK_UPTIME_RAW` on Apple
++//!   platforms), the one the frontend's trace and the driver's rings use.
++//! - **Ids.** A command buffer's id is the address of its shared state, alive from its commit to
++//!   its completion: records of one id between a commit stage and its completion are one command
++//!   buffer's.
++
++use std::sync::atomic::{AtomicU64, Ordering};
++
++/// The records the ring keeps.
++const RING: usize = 1 << 16;
++
++/// What happened, the record's `stage`.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++#[repr(u16)]
++pub enum Stage {
++    /// `commit` was called (`arg`: 0).
++    CommitCall = 1,
++    /// The commit was left to wait for the lowering thread's end of its last render encoder.
++    CommitQueued = 2,
++    /// The commit's own work began (`arg`: 0 at the call, 1 queued, 2 refused).
++    CommitRun = 3,
++    /// Its segments were recorded or prepared for their host steps (`arg`: segments).
++    Prepared = 4,
++    /// Its batches were handed to the scheduler (`arg`: batches).
++    Handed = 5,
++    /// The scheduler took its batches into its order (`arg`: batches).
++    Taken = 6,
++    /// A look of the scheduler's held one of its batches (`arg`: the reason, `HeldFor` + 1, |
++    /// batch index << 8); recorded once per reason and batch.
++    Held = 7,
++    /// A batch's submission began (`arg`: batch index | last << 15).
++    SubmitBegin = 8,
++    /// A batch's submission returned (`arg`: 0 submitted, 1 grouped, 2 later, 3 after the group,
++    /// 4 failed).
++    SubmitEnd = 9,
++    /// Its host step began recording on the scheduler's thread (`arg`: batch index).
++    StepBegin = 10,
++    /// Its host step ended (`arg`: batch index).
++    StepEnd = 11,
++    /// A completion waiter began waiting for its batch (`arg`: queue | slept first << 8).
++    PollArmed = 12,
++    /// The waiter's wait for its batch returned (`arg`: queue).
++    PollDone = 13,
++    /// A completion turn saw it complete (`arg`: queue).
++    Seen = 14,
++    /// Its completion ran (`arg`: 1 on the waiter, 2 posted to its queue's context).
++    Finished = 15,
++    /// The scheduler's thread went to sleep (id 0, `arg`: slice in ms, | 0x8000 on the GPU).
++    SchedulerSleep = 20,
++    /// Something woke the scheduler's thread (id 0, `arg`: 0 commit, 1 completion, 2 host).
++    SchedulerWake = 21,
++    /// The scheduler's thread resumed after its sleep (id 0, `arg`: 1 timed out).
++    SchedulerResumed = 22,
++    /// The scheduler's thread began a pass (id 0).
++    PassBegin = 23,
++    /// The scheduler's thread ended a pass (id 0, `arg`: batches submitted, capped).
++    PassEnd = 24,
++}
++
++struct Slot {
++    when: AtomicU64,
++    id: AtomicU64,
++    /// stage | arg << 16 | sequence << 32: a reader takes the slot only where the sequence is the
++    /// one it asked for.
++    word: AtomicU64,
++}
++
++#[allow(clippy::declare_interior_mutable_const)]
++const EMPTY: Slot = Slot {
++    when: AtomicU64::new(0),
++    id: AtomicU64::new(0),
++    word: AtomicU64::new(0),
++};
++static SLOTS: [Slot; RING] = [EMPTY; RING];
++static NEXT: AtomicU64 = AtomicU64::new(1);
++
++/// The host's uptime clock in nanoseconds.
++pub fn now_nanos() -> u64 {
++    #[cfg(any(target_os = "macos", target_os = "ios"))]
++    {
++        let mut spec = libc::timespec {
++            tv_sec: 0,
++            tv_nsec: 0,
++        };
++        // SAFETY: a valid clock id and an owned timespec.
++        if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut spec) } == 0 {
++            return spec.tv_sec as u64 * 1_000_000_000 + spec.tv_nsec as u64;
++        }
++        0
++    }
++    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
++    {
++        crate::gpu_time::host_nanos()
++    }
++}
++
++/// Record `stage` of `id` with `arg`, now.
++pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
++    let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
++    let slot = &SLOTS[(sequence as usize) & (RING - 1)];
++    slot.word.store(0, Ordering::Release);
++    slot.when.store(now_nanos(), Ordering::Relaxed);
++    slot.id.store(id as u64, Ordering::Relaxed);
++    let word = stage as u64 | ((arg as u64 & 0xffff) << 16) | ((sequence & 0xffff_ffff) << 32);
++    slot.word.store(word, Ordering::Release);
++}
++
++/// One record as [`read`] gives it.
++#[derive(Clone, Copy, Debug, Default)]
++#[repr(C)]
++pub struct StageRecord {
++    /// Host uptime nanoseconds.
++    pub when: u64,
++    /// The command buffer's id (0: the scheduler's thread).
++    pub id: u64,
++    /// Its place among all records.
++    pub sequence: u32,
++    /// [`Stage`] as its number.
++    pub stage: u16,
++    /// The stage's argument.
++    pub arg: u16,
++}
++
++/// The records from sequence `from` on (the oldest kept where `from` fell out of the ring), at most
++/// `out.len()`, oldest first: how many, and the sequence to ask for next.
++pub fn read(from: u64, out: &mut [StageRecord]) -> (usize, u64) {
++    let newest = NEXT.load(Ordering::Acquire);
++    let mut sequence = from.max(1).max(newest.saturating_sub(RING as u64 - 1024));
++    let mut written = 0;
++    while sequence < newest && written < out.len() {
++        let slot = &SLOTS[(sequence as usize) & (RING - 1)];
++        let word = slot.word.load(Ordering::Acquire);
++        if word >> 32 == sequence & 0xffff_ffff && word & 0xffff != 0 {
++            let when = slot.when.load(Ordering::Relaxed);
++            let id = slot.id.load(Ordering::Relaxed);
++            if slot.word.load(Ordering::Acquire) == word {
++                out[written] = StageRecord {
++                    when,
++                    id,
++                    sequence: sequence as u32,
++                    stage: (word & 0xffff) as u16,
++                    arg: ((word >> 16) & 0xffff) as u16,
++                };
++                written += 1;
++            }
++        } else if word == 0 {
++            // Being written: read again at the next call.
++            break;
++        }
++        sequence += 1;
++    }
++    (written, sequence)
++}
