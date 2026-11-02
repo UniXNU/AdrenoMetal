@@ -14,7 +14,7 @@ Unused owned image backing can serve later pooled or dedicated images. Extra ima
 
 ## Frame diagnostics
 
-`sheng-gpu-trace=1` records frame identities, synchronization and display decisions. `sheng-gpu-pixels=1` retains bounded raw samples after GPU completion. The sheng log exporter carries both streams. Events 61 through 63 identify encoding batches, frontend phases and render threads. The persistent frame trace includes memory decisions, completion stages and attachment conditions. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
+`sheng-gpu-trace=1` records allocation, command, completion, CPU/GPU and display latency evidence. Pixel capture is disabled. Repeated pending queries are coalesced and idle scheduler stages are excluded. The sheng exporter prioritizes the complete frontend timeline. Events 61 through 63 identify encoding batches, frontend phases and render threads. The persistent frame trace includes memory decisions, completion stages and attachment conditions. See [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics) for fields and decoding.
 
 `sheng-wallpaper-freeze=1` enables wallpaper isolation. A Poster renderer freezes GPU submission after a successful command draws into and stores an IOSurface of at least two million pixels. The completed output stays retained. Later commands remain committed and unscheduled, with their resources and queue leases retained. Already submitted work completes normally. PosterBoard and other processes keep submitting. The switch defaults to off; `NATIVE_METAL_FREEZE_WALLPAPER=1` selects the same mode directly in a renderer process. Trace event 60 records admitted commands, the completion transition and parked commands.
 
