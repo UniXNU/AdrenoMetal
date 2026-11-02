@@ -1602,7 +1602,7 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
  }
  return result;
 }
-- (void)dealloc {if(_handle)nmb_function_release(_handle);}
+- (void)dealloc {DetailSpan timing(8,(uintptr_t)_handle);if(_handle)nmb_function_release(_handle);}
 // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
 // object, its name and a serial no other function in the process has.
 - (const void *)bitCodeHash {
@@ -1668,7 +1668,7 @@ static std::string quartzCoreCallers();
 static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
 static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
 @implementation NBLibrary
-- (void)dealloc {nmb_library_release(_handle);}
+- (void)dealloc {DetailSpan timing(9,(uintptr_t)_handle);nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
  return [self nb_newFunctionWithName:name constantValues:values zeroRest:NO error:error];
 }
@@ -1855,7 +1855,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic) NmbComputePipeline *handle;
 @end
 @implementation NBComputePipeline
-- (void)dealloc {nmb_compute_pipeline_release(_handle);}
+- (void)dealloc {DetailSpan timing(10,(uintptr_t)_handle);nmb_compute_pipeline_release(_handle);}
 - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
 - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
 @end
@@ -1865,7 +1865,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic) uint32_t stateFormat;   // its colour 0 pixel format (the DF rows)
 @end
 @implementation NBRenderPipeline
-- (void)dealloc {nmb_render_pipeline_release(_handle);}
+- (void)dealloc {DetailSpan timing(11,(uintptr_t)_handle);nmb_render_pipeline_release(_handle);}
 // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
 - (NSUInteger)maxTotalThreadsPerThreadgroup {
  uint64_t s[3]={};if(!nmb_device_max_threads_per_threadgroup(gDevice,s))return 0;
@@ -1879,7 +1879,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @implementation NBSampler {
  NSMutableDictionary<NSString *,NBSampler *> *_clamped;
 }
-- (void)dealloc {nmb_sampler_release(_handle);}
+- (void)dealloc {DetailSpan timing(12,(uintptr_t)_handle);nmb_sampler_release(_handle);}
 - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
 // This sampler with its LOD clamps replaced (a binding's lodMinClamp:lodMaxClamp:, which GFXBench's Car Chase uses): made once per pair
 // and kept, at most 64 pairs (a caller that varies them every draw starts over rather than growing without bound).
@@ -1902,7 +1902,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic,copy) NSString *dumpInfo;   // NATIVE_METAL_DUMP_CB: its depth test and write
 @end
 @implementation NBDepthStencil
-- (void)dealloc {nmb_depth_stencil_release(_handle);}
+- (void)dealloc {DetailSpan timing(13,(uintptr_t)_handle);nmb_depth_stencil_release(_handle);}
 @end
 
 // ---- events and fences ----
@@ -1910,7 +1910,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic) NmbEvent *handle;
 @end
 @implementation NBEvent
-- (void)dealloc {nmb_event_release(_handle);}
+- (void)dealloc {DetailSpan timing(14,(uintptr_t)_handle);nmb_event_release(_handle);}
 @end
 @interface NBSharedEvent : NBEvent
 @end
@@ -1945,7 +1945,7 @@ static void notified(void *context,uint64_t value) {
 @property(nonatomic) NmbFence *handle;
 @end
 @implementation NBFence
-- (void)dealloc {nmb_fence_release(_handle);}
+- (void)dealloc {DetailSpan timing(15,(uintptr_t)_handle);nmb_fence_release(_handle);}
 @end
 
 // ---- command buffers and encoders ----
@@ -2370,7 +2370,7 @@ static uint64_t encodeCommandOf(id object) {
 @implementation NBEncoder {
  std::unique_ptr<DrawStateNote> _drawNote;
 }
-- (void)dealloc {if(_handle)nmb_encoder_discard(_handle);}
+- (void)dealloc {DetailSpan timing(16,(uintptr_t)_handle);if(_handle)nmb_encoder_discard(_handle);}
 // A setter of `kind` at `key` (UINT32_MAX: one not compared) binding `object` with `value`, for the draw-stats tally.
 - (void)noteState:(uint32_t)kind key:(uint32_t)key object:(const void *)object value:(uint64_t)value {
  if(!_drawNote)_drawNote.reset(new DrawStateNote);
@@ -3139,7 +3139,7 @@ static char kUserDictionaryKey;
  if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();installDispatchTrace();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);sampleWindowOpen();}
  return self;
 }
-- (void)dealloc {nmb_command_buffer_release(_handle);}
+- (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
 - (void)traceTexture:(NBTexture *)texture usage:(uint32_t)usage {
  if(!frameTraceOn() || !texture)return;
  NSValue *key=[NSValue valueWithPointer:texture.handle];_traceUsage[key]=@([_traceUsage[key] unsignedIntValue]|usage);
@@ -3639,6 +3639,7 @@ static void completed(void *context) {
  return self;
 }
 - (void)dealloc {
+ DetailSpan timing(18,(uintptr_t)_handle);
  nmb_queue_release(_handle);
  std::lock_guard<std::mutex> lock(gPriorityLock);
  gQueuePriorities.remove(_priority);auto p=gQueuePriorities.aggregate();nbForwardPriority(p.foreground,p.background);
@@ -4163,7 +4164,7 @@ static bool dvmBlockFormat(MTLPixelFormat format, NSUInteger &bytes, NSUInteger 
  if((self=[super init])){_bytes=bytes;_length=length;_deallocator=[deallocator copy];}
  return self;
 }
-- (void)dealloc {if(_deallocator)_deallocator(_bytes,_length);}
+- (void)dealloc {DetailSpan timing(21,(uintptr_t)_bytes,blockInvoke(_deallocator),true);if(_deallocator)_deallocator(_bytes,_length);}
 @end
 static char dvmMemoryReleaseKey;
 
@@ -4173,7 +4174,7 @@ static char dvmMemoryReleaseKey;
 @property(nonatomic) MTLHeapType heapType;
 @end
 @implementation NBHeap
-- (void)dealloc {nmb_heap_release(_handle);}
+- (void)dealloc {DetailSpan timing(19,(uintptr_t)_handle);nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
 - (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
 - (NSUInteger)currentAllocatedSize {return nmb_heap_allocated_size(_handle);}
@@ -4292,7 +4293,7 @@ static bool computeDescriptor(MTLComputePipelineDescriptor *d,NmbComputePipeline
 @property(nonatomic) NmbBinaryArchive *handle;
 @end
 @implementation NBBinaryArchive
-- (void)dealloc {nmb_binary_archive_release(_handle);}
+- (void)dealloc {DetailSpan timing(20,(uintptr_t)_handle);nmb_binary_archive_release(_handle);}
 - (NSUInteger)options {return 0;}
 - (BOOL)addRenderPipelineFunctionsWithDescriptor:(MTLRenderPipelineDescriptor *)d error:(NSError **)error {
  auto *p=new NBRenderDescriptor();
