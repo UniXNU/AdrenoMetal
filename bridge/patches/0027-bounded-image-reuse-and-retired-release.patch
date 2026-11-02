@@ -230,7 +230,39 @@
                  after
              }
              Some((block, dedicated)) => {
-@@ -1510,10 +1572,52 @@
+@@ -1502,7 +1564,30 @@
+                 .extract_if(.., |spare| spare.pool.1 == type_index)
+                 .map(|spare| spare.block),
+         );
+-        let count = blocks.len();
++        // Allocation failure must reclaim queued backing before retrying Vulkan.
++        let mut count = blocks.len();
++        while let Some(index) = self
++            .retired
++            .iter()
++            .position(|(_, block, _)| block.type_index == type_index)
++        {
++            let (id, block, cause) = self.retired.remove(index).expect("found retired block");
++            count += 1;
++            let bytes = block.size;
++            if id != 0 {
++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
++            }
++            // SAFETY: retired blocks have no placement, owner or pending GPU user.
++            unsafe { block.release(device) };
++            self.freed_by[cause as usize] += 1;
++            self.retiring_bytes
++                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
++            self.retiring_count
++                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
++            if id != 0 {
++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
++            }
++        }
+         for block in blocks {
+             // SAFETY: nothing is placed in a kept empty block, and no command reads it.
+             drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
+@@ -1510,10 +1595,52 @@
          count
      }
  
@@ -284,7 +316,7 @@
              .collect();
          for spare in stale {
              // SAFETY: nothing is placed in a spare block, and no command reads it.
-@@ -1586,13 +1690,52 @@
+@@ -1586,13 +1713,52 @@
          cause: FreeCause,
          after: Option<Box<dyn Send>>,
      ) -> Option<Box<dyn Send>> {
@@ -338,7 +370,7 @@
          self.say_block(
              "a block goes, freed once the batches in flight complete",
              &block,
-@@ -1834,6 +1977,11 @@
+@@ -1834,6 +2000,11 @@
              .flat_map(|pool| pool.drain())
              .collect();
          blocks.extend(self.spare.drain(..).map(|spare| spare.block));
@@ -350,7 +382,7 @@
          for block in blocks {
              self.say_block("freed a block as the device is destroyed", &block);
              self.freed_by[block.cause(FreeCause::Teardown) as usize] += 1;
-@@ -2206,22 +2354,36 @@
+@@ -2206,22 +2377,36 @@
              true => size,
              false => lock(memory).next_block_bytes(pool, size),
          };
@@ -390,7 +422,7 @@
                  memory.say_placement("placed", &placement, Some(class));
                  return Ok(placement);
              }
-@@ -2235,6 +2397,10 @@
+@@ -2235,14 +2420,26 @@
          };
          match made {
              Ok(block) => {
@@ -401,7 +433,25 @@
                  let mut memory = lock(memory);
                  let index = memory.add_block(pool, block, block_size, dedicated, size);
                  let placement = memory.placement(pool, index, 0, size, addressed.is_some());
-@@ -2255,6 +2421,35 @@
+                 memory.say_placement("placed", &placement, Some(class));
+                 return Ok(placement);
+             }
+-            Err(error @ Error::OutOfMemory(_)) => failure = error,
+-            Err(error) => return Err(error),
++            Err(error) => {
++                if trace != 0 {
++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryAllocated, 0);
++                }
++                if matches!(error, Error::OutOfMemory(_)) {
++                    failure = error;
++                } else {
++                    return Err(error);
++                }
++            }
+         }
+     }
+     Err(failure)
+@@ -2255,6 +2452,35 @@
  /// with room rather than making one. A block of buffers gets its buffer of addresses (counted in
  /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
  /// is left to the placement that needs it.
@@ -437,7 +487,7 @@
  pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
      let (lacking, maker) = {
          let mut memory = lock(memory);
-@@ -2274,19 +2469,170 @@
+@@ -2274,19 +2500,189 @@
          (lacking, memory.maker())
      };
      for (pool, bytes) in lacking {
@@ -589,6 +639,25 @@
 +        }
 +        drop(memory.destroy(&driver));
 +        assert_eq!(FREED.load(Ordering::Relaxed), 3);
++    }
++
++    #[test]
++    fn allocation_failure_reclaims_queued_backing_before_retry() {
++        let _serial = lock(&SERIAL);
++        FREED.store(0, Ordering::Relaxed);
++        let driver = driver();
++        let mut memory = allocator();
++        unsafe {
++            drop(memory.let_go(&driver, block(1, 64 << 20), FreeCause::Dedicated, None));
++        }
++        assert_eq!(FREED.load(Ordering::Relaxed), 0);
++        assert_eq!(memory.release_kept(&driver, 0), 1);
++        assert_eq!(FREED.load(Ordering::Relaxed), 1);
++        assert_eq!(memory.retiring_bytes.load(Ordering::Relaxed), 0);
++        assert_eq!(memory.retiring_count.load(Ordering::Relaxed), 0);
++        assert!(memory.retired.is_empty());
++        assert!(memory.destroy(&driver).is_empty());
++        assert_eq!(FREED.load(Ordering::Relaxed), 1);
 +    }
 +
 +    #[test]
