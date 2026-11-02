@@ -102,6 +102,7 @@ uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
     uint64_t rotation, framebuffer_only, is_drawable;
+    uint64_t swizzle; /* RGBA bytes, bit 32 marks an explicit value; zero means identity */
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);
@@ -128,6 +129,18 @@ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, c
 /* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
+uint64_t nmb_texture_allocated_size(const NmbTexture *);
+uint64_t nmb_device_current_allocated_size(const NmbDevice *);
+bool nmb_texture_make_aliasable(const NmbTexture *);
+bool nmb_texture_is_aliasable(const NmbTexture *);
+bool nmb_buffer_make_aliasable(const NmbBuffer *);
+bool nmb_buffer_is_aliasable(const NmbBuffer *);
+NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], uint64_t swizzle);
+uint32_t nmb_function_constant_count(const NmbFunction *);
+size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
+bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
+bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
+bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
 void nmb_texture_release(NmbTexture *);
 void nmb_texture_describe(const NmbTexture *, struct NmbTextureDescriptor *out);
 bool nmb_texture_replace(NmbTexture *, const uint64_t region[6], uint64_t level, uint64_t slice, const void *bytes, uint64_t bytes_per_row,
@@ -150,6 +163,7 @@ NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
 /* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
 NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);
+bool nmb_function_set_specialized_name(NmbFunction *, const char *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);
 uint64_t nmb_function_patch_type(const NmbFunction *);              /* MTLPatchType */
@@ -225,6 +239,7 @@ NmbDepthStencil *nmb_depth_stencil_new(NmbDevice *, const struct NmbDepthStencil
 void nmb_depth_stencil_release(NmbDepthStencil *);
 
 NmbQueue *nmb_queue_new(NmbDevice *);
+NmbQueue *nmb_queue_new_with_max_command_buffer_count(NmbDevice *, size_t);
 void nmb_queue_release(NmbQueue *);
 NmbCommandBuffer *nmb_command_buffer_new(NmbQueue *);
 void nmb_command_buffer_release(NmbCommandBuffer *);
