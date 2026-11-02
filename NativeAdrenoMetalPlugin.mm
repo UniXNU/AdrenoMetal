@@ -110,70 +110,6 @@ static unsigned patchFramebufferBranch(uintptr_t slide) {
     if (!restored) return 0x6E53;
     return 0x6E42;
 }
-static unsigned gReports;
-struct DisplaySample {unsigned flags = 0, mode = 0, behaviour = 0, globals = 0; uint16_t display = 0; uintptr_t object = 0;};
-static DisplaySample sampleDisplay(id first, intptr_t slide) {
-    DisplaySample out;
-    uintptr_t a = first ? (uintptr_t) *(void **) ((char *) (__bridge void *) first + 8) : 0, b = 0, d = 0;
-    if (a && readTask(a + 0x40, &b, 8) && b && readTask(b + 0x60, &d, 8) && d) {
-        uint32_t f = 0; uint64_t m = 0; uint8_t byte[4] = {};
-        readTask(d + 0x238, &f, 4);
-        readTask(d + 0x258, &out.display, 2);
-        readTask(d + 0x248, &m, 8);
-        readTask(d + 0x6c17, &byte[0], 1);
-        readTask(d + 0x6658 + 0x57d, &byte[1], 1);
-        readTask(d + 0x6658 + 0x58a, &byte[2], 1);
-        readTask(d + 0x6658 + 0x59b, &byte[3], 1);
-        out.object = d;
-        out.flags = f & 0xff;
-        out.mode = (unsigned) ((m >> 55) & 31) | (m ? 0x20 : 0);
-        out.behaviour = (byte[0] ? 1 : 0) | (byte[1] ? 2 : 0) | (byte[2] ? 4 : 0) | (byte[3] ? 8 : 0);
-    }
-    uint8_t v[4] = {};
-    readTask(0x1f491ae10 + slide, &v[0], 1);    // the render server's deep-framebuffer flag
-    readTask(0x1ed7abf10 + slide, &v[1], 1);    // framebuffer compression in effect
-    readTask(0x1f4919dc0 + slide, &v[2], 1);    // its default
-    readTask(0x1f4919c20 + slide, &v[3], 1);    // universal buffer compression
-    out.globals = (v[0] ? 1 : 0) | (v[1] ? 2 : 0) | (v[2] ? 4 : 0) | (v[3] ? 8 : 0);
-    return out;
-}
-static void markSample(Gpu &gpu, const DisplaySample &x, unsigned base) {
-    gpu.mark(base | (x.flags << 4) | x.globals);                  // display flags (bit 3 deep), globals: deep/compression/default/universal
-    gpu.mark((base + 0x1000) | (x.display >> 4));                 // display limits word: 0x200 compression support, 0x1c00 type
-    gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
-}
-static void reportDisplayState(Gpu &gpu) {
-#if defined(__arm64e__)
-    (void)gpu;
-    return;   // the addresses above are the 21H461 cache's; the arm64e (iPadOS 27) build must not read or write them
-#endif
-    ++gReports;
-    static DisplaySample before;
-    static bool changed;
-    Class serverClass = NSClassFromString(@"CAWindowServer");
-    void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart");
-    if (!serverClass || !start) return;
-    const intptr_t slide = (intptr_t) start - 0x189651efc;
-    @try {
-        id server = ((id (*)(id, SEL)) objc_msgSend)(serverClass, NSSelectorFromString(@"serverIfRunning"));
-        NSArray *displays = server ? ((id (*)(id, SEL)) objc_msgSend)(server, NSSelectorFromString(@"displays")) : nil;
-        id first = displays.count ? displays[0] : nil;
-        DisplaySample now = sampleDisplay(first, slide);
-        if (!changed) {
-            before = now;
-            if (gReports >= 2 && now.object) {
-                uint32_t f = 0;
-                if (readTask(now.object + 0x238, &f, 4) && (f & 8)) {f &= ~8u; writeTask(now.object + 0x238, &f, 4);}
-                uint8_t zero = 0;
-                writeTask(0x1f4919c20 + slide, &zero, 1);
-                changed = true;
-                now = sampleDisplay(first, slide);
-            }
-        }
-        markSample(gpu, before, 0x7000);
-        markSample(gpu, now, 0xA000);
-    } @catch (NSException *) {}
-}
 // Every process other than the render server: the same runtime on its own connection, with none of the render server's threads (no
 // display hand-off, telemetry, benchmark or cache export). Its shader cache lives in its own cache or temp directory.
 // The reason a client's device failed, as a text line the driver keeps per process (the render server's report row is rewritten every ten seconds):
@@ -212,26 +148,6 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
                                dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{streamText(*target, row.c_str());});
             }
     }
-}
-// Each process's own render passes, as its Turnip recorded them (NativeBridgeMetalFrontend.mm): the slowest one's size, format and draw
-// count and the pass total, on the client's text line every 10 s while the diagnostics are on. A client whose jobs each took 77 ms showed
-// only that; which pass and at what size is what says whether the cost is the driver's.
-extern "C" size_t nmb_slowest_pass(char *out, size_t size) __attribute__((weak));
-static void startPassReporter(unsigned port) {
-    if (!getenv("SHENG_DIAG") || !&nmb_slowest_pass) return;
-    static std::atomic<bool> started{false};
-    if (started.exchange(true)) return;
-    Gpu *gpu = makeGpu(port);
-    if (!gpu) return;
-    std::thread([gpu]{
-        pthread_setname_np("pass-reporter");
-        for (;;) {
-            sleep(5);
-            char row[200];
-            if (!nmb_slowest_pass(row, sizeof row) || !row[0]) continue;
-            streamText(*gpu, row);
-        }
-    }).detach();
 }
 static id clientDevice(unsigned port) {
     char turnip[1024];
@@ -282,7 +198,6 @@ static id clientDevice(unsigned port) {
     // once-a-second reader never ran before the crash (i568).
     if (device) {
         gClientPort = port;
-        startPassReporter(port);
         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
         char problem[200] = {};
         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
@@ -328,7 +243,6 @@ static id deviceForPort(unsigned port) {
         else unsetenv("SHENG_DIAG");
         if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
-        unsetenv("SHENG_GPU_PIXELS");
         if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
@@ -484,66 +398,12 @@ static id deviceForPort(unsigned port) {
             return nil;
         }
         gpu->mark(0x6802);
-        // The status line (GPU8) every ten seconds (sheng-diag=1), and the display hand-off client on its own thread: both only read or serve,
-        // neither is the discovery's.
-        pthread_t monitor, scanout;
+        // The display hand-off client on its own thread: it only serves, not the discovery.
+        pthread_t scanout;
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
         pthread_attr_setstacksize(&attributes, 1u << 20);
-        const bool diag = getenv("SHENG_DIAG") != nullptr;
-        if (diag) pthread_create(&monitor, &attributes, [](void *arg) -> void * {
-            Gpu *g = static_cast<Gpu *>(arg);
-            for (;;) {
-                sleep(10);
-                char status[64], text[64];
-                static unsigned phase;
-                // status (counters, then the last two refusals' texts), formats; the stream carries 63 characters per line, so a long status goes
-                // out in 57-character pieces on consecutive lines (the UFS log keeps every line).
-                char full[420];
-                native_bridge_metal_status(full, sizeof full);
-                const size_t length = strlen(full);
-                const unsigned pieces = (unsigned)((length + 56) / 57);
-                const unsigned step = phase++ % (1 + (pieces ? (pieces > 7 ? 7 : pieces) : 1));
-                if (step == 0) {
-                    native_bridge_metal_formats(status, sizeof status);
-                    snprintf(text, sizeof text, "PUB %.58s", status);
-                } else {
-                    snprintf(text, sizeof text, "ST%u %.57s", step - 1, full + (size_t)(step - 1) * 57);
-                }
-                streamText(*g, text);
-                reportDisplayState(*g);
-                g->mark(0x6A00 | gDiagBits);   // the diagnostics page lists the last few markers only
-            }
-            return nullptr;
-        }, gpu);
-        pthread_t telemetry;
-        if (diag) pthread_create(&telemetry, &attributes, [](void *arg) -> void * {
-            Gpu *g = static_cast<Gpu *>(arg);
-            sleep(5);
-            // The bridge's telemetry table, resent whole every four seconds as markers (two characters each): 0xC000|row starts a row of the
-            // kernel's table, 0x8000|(a<<7)|b appends two characters. Rows are at most 90 characters; 48 rows.
-            for (;;) {
-                static char table[6144];
-                native_bridge_metal_telemetry(table, sizeof table);
-                unsigned row = 0;
-                for (char *line = table; *line && row < 48;) {
-                    char *end = strchr(line, '\n');
-                    if (end) *end = 0;
-                    g->mark(0xC000u | row);
-                    const size_t length = strlen(line) < 90 ? strlen(line) : 90;
-                    for (size_t i = 0; i < length; i += 2) {
-                        const unsigned a = (unsigned char)line[i] & 0x7f, b = i + 1 < length ? (unsigned char)line[i + 1] & 0x7f : 0;
-                        g->mark(0x8000u | (a << 7) | b);
-                    }
-                    ++row;
-                    if (!end) break;
-                    line = end + 1;
-                }
-                sleep(6);
-            }
-            return nullptr;
-        }, gpu);
         pthread_create(&scanout, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(3);
