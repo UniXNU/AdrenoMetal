@@ -21,6 +21,7 @@
 #include <zlib.h>
 #include <functional>
 #include <set>
+#include <atomic>
 #include <string>
 #include <vector>
 #ifndef CACHEEXPORT_FORMAT_ONLY   // the format alone (host check, bridge/cache_export_host.cpp); the plugin also gets the sender
@@ -55,6 +56,9 @@ static void scan(const std::string &root, const std::string &relative, std::vect
     if (!dir) return;
     while (dirent *entry = readdir(dir)) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+        // A concurrent import or cache writer has not published these entries yet.
+        const std::string leaf = entry->d_name;
+        if (leaf.find(".import.") != std::string::npos || leaf.rfind(".write-", 0) == 0) continue;
         const std::string path = relative.empty() ? std::string(entry->d_name) : relative + "/" + entry->d_name;
         struct stat st = {};
         if (lstat((root + "/" + path).c_str(), &st) != 0) continue;
@@ -223,8 +227,10 @@ static int importPack(const char *pack, const std::string &directory) {
     return importStream(r, directory);
 }
 static int importStream(PackReader &r, const std::string &directory) {
+    static std::atomic<unsigned long long> importSequence{0};
+    const std::string suffix=".import."+std::to_string(getpid())+"."+std::to_string(importSequence.fetch_add(1));
     std::vector<std::string> written;
-    auto fail = [&]() {for (const std::string &f : written) unlink((f + ".import").c_str()); return -1;};
+    auto fail = [&]() {for (const std::string &f : written) unlink((f + suffix).c_str()); return -1;};
     char magic[8];
     uint32_t rootLength = 0, count = 0;
     if (!r.read(magic, 8) || memcmp(magic, "M2VCACH1", 8) || !r.read(&rootLength, 4) || rootLength > 4096 || !r.skip(rootLength) ||
@@ -246,7 +252,7 @@ static int importStream(PackReader &r, const std::string &directory) {
         for (size_t slash = full.find('/', directory.size() + 1); slash != std::string::npos; slash = full.find('/', slash + 1))
             mkdir(full.substr(0, slash).c_str(), 0700);
         written.push_back(full);
-        FILE *out = fopen((full + ".import").c_str(), "wb");
+        FILE *out = fopen((full + suffix).c_str(), "wb");
         if (!out) return fail();
         bool ok = true;
         for (uint64_t left = size; ok && left;) {
@@ -259,7 +265,7 @@ static int importStream(PackReader &r, const std::string &directory) {
     }
     if (!r.finished()) return fail();
     int renamed = 0;
-    for (const std::string &f : written) if (rename((f + ".import").c_str(), f.c_str()) == 0) ++renamed; else unlink((f + ".import").c_str());
+    for (const std::string &f : written) if (rename((f + suffix).c_str(), f.c_str()) == 0) ++renamed; else unlink((f + suffix).c_str());
     baked().insert(seen.begin(), seen.end());   // only a pack read to its end counts
     return renamed;
 }

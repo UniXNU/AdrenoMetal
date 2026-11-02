@@ -7,6 +7,7 @@
 #include "../CacheExport.h"
 #include <cstdio>
 #include <cstdlib>
+#include <sys/wait.h>
 
 #define CHECK(x) do {if(!(x)){std::fprintf(stderr,"line %d: %s\n",__LINE__,#x);std::exit(1);}}while(0)
 
@@ -37,6 +38,18 @@ int main(int argc,char **argv) {
     CHECK(cacheexport::importPack(blobPath.c_str(),dest)==(int)files.size());
     CHECK(cacheexport::baked().size()==files.size());   /* every entry of a pack read to its end is known as baked */
     for(const auto &f:files)CHECK(slurp(source+"/"+f.path)==slurp(dest+"/"+f.path));
+    // Independent processes may populate the same directory at the same time.
+    const std::string shared=dest+"-shared";mkdir(shared.c_str(),0700);
+    pid_t workers[2];
+    for (auto &pid:workers) {
+        pid=fork();CHECK(pid>=0);
+        if(!pid)_exit(cacheexport::importPack(blobPath.c_str(),shared)>=0?0:1);
+    }
+    for(auto pid:workers){int status=0;CHECK(waitpid(pid,&status,0)==pid && WIFEXITED(status) && WEXITSTATUS(status)==0);}
+    for(const auto &f:files)CHECK(slurp(source+"/"+f.path)==slurp(shared+"/"+f.path));
+    std::vector<cacheexport::File> sharedFiles;cacheexport::scan(shared,"",sharedFiles,0);CHECK(sharedFiles.size()==files.size());
+    spill(shared+"/in-progress.import.1.0",{1,2});
+    sharedFiles.clear();cacheexport::scan(shared,"",sharedFiles,0);CHECK(sharedFiles.size()==files.size());
     CHECK(cacheexport::importPack(blobPath.c_str(),dest)==0);   /* all present with their sizes: nothing rewritten */
     /* damaged packs: truncated, bad magic, flipped compressed byte */
     std::vector<uint8_t> bad=blob;bad.resize(bad.size()/2);spill(blobPath+".t",bad);
