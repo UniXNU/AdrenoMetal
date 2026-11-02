@@ -9,10 +9,11 @@ static inline bool native_gpu_latency_stage(uint32_t stage) {
     return (stage >= 1 && stage <= 16) || (stage >= 40 && stage <= 57);
 }
 /* The kernel ring keeps GPU submission and retirement, display arrival, fence
- * and latch, build identity and the render threads the CPU sampler follows. */
+ * and latch, build identity, the render threads the CPU sampler follows and
+ * each process's Metal refusals (event 65, the text of what failed). */
 static inline bool native_gpu_latency_event(uint32_t event,const uint64_t *,uint32_t) {
     switch(event) {
-    case 1:case 3:case 10:case 11:case 20:case 21:case 22:case 23:case 63:return true;
+    case 1:case 3:case 10:case 11:case 20:case 21:case 22:case 23:case 63:case 65:return true;
     default:return false;
     }
 }
