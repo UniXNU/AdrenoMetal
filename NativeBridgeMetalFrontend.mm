@@ -1986,6 +1986,22 @@ struct EncodeThread {
 };
 static thread_local bool tOnEncodeThread;
 static thread_local EncodeBatch *tBatch;
+// The encoding thread does the render server's frame work for CoreAnimation's render thread, so it runs at that thread's scheduling
+// policy and priority, as the work would on the render thread itself. Created at user-interactive QoS, it is a timeshare thread whose
+// priority decayed under its own load (47 to 37 in untagged-102cb4a069) and then waited runnable behind other P-core work: 53 of 78
+// samples during encoding calls of 30 ms or more were on a run queue. The first CoreAnimation thread that makes a command buffer is the
+// reference; a timeshare reference leaves the encoding thread as it is.
+static std::atomic<pthread_t> gEncodeReference{nullptr};
+static void encodeAdoptReference() {
+ static bool adopted=false;
+ if(adopted)return;
+ const pthread_t reference=gEncodeReference.load(std::memory_order_acquire);
+ if(!reference)return;
+ adopted=true;
+ int policy=SCHED_OTHER;sched_param param{};
+ if(pthread_getschedparam(reference,&policy,&param) || policy==SCHED_OTHER)return;
+ (void)pthread_setschedparam(pthread_self(),policy,&param);
+}
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
   EncodeThread *t=new EncodeThread;
@@ -2000,6 +2016,7 @@ static EncodeThread &encodeThread() {
     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
     const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
     lock.unlock();tEncodeBatchId=batch->serial;
+    encodeAdoptReference();
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     @autoreleasepool {batch->run();}
     batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
@@ -2821,7 +2838,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);}
+ if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
 - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
