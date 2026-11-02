@@ -45,6 +45,7 @@
 #include <sys/stat.h>
 #include "bridge/NativeMetalObjects.h"
 #include "SharedShaderCache.h"
+#include "QueuePriority.h"
 #include "NativeBridgeMetalFrontend.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
@@ -212,7 +213,9 @@ struct SlowPass {
 static SlowPass gSlowPass;
 // What this process's queues asked for with setGPUPriority:/setBackgroundGPUPriority: and how many of those reached the driver.
 static std::atomic<uint32_t> gAskFg{0xffffffffu},gAskBg{0xffffffffu},gAskCount{0},gAskSent{0};
-static void nbForwardPriority(uint32_t foreground,uint32_t background);
+static bool nbForwardPriority(uint32_t foreground,uint32_t background);
+static NBQueuePriorities gQueuePriorities;
+static std::mutex gPriorityLock;
 // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
 // with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
 static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
@@ -378,20 +381,22 @@ extern "C" size_t nmb_slowest_pass(char *out,size_t size) {
  return n>0?(size_t)n:0;
 }
 // The runtime loads Turnip after this process may have started; its handle is local to it, so the exported setter is found by the path.
-static void nbForwardPriority(uint32_t foreground,uint32_t background) {
+static bool nbForwardPriority(uint32_t foreground,uint32_t background) {
  typedef bool (*SetPriority)(uint32_t,uint32_t);
  static std::atomic<SetPriority> setter{nullptr};
  SetPriority fn=setter.load();
  if(!fn) {
-  if(gLoaderPath.empty())return;
+  if(gLoaderPath.empty())return false;
   void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-  if(!turnip)return;
+  if(!turnip)return false;
   fn=(SetPriority)dlsym(turnip,"tu_darwin_set_priority");
-  if(!fn)return;
+  dlclose(turnip);
+  if(!fn)return false;
   setter.store(fn);
  }
  gAskCount.fetch_add(1);
- if(fn(foreground,background))gAskSent.fetch_add(1);
+ if(!fn(foreground,background))return false;
+ gAskSent.fetch_add(1);gAskFg.store(foreground);gAskBg.store(background);return true;
 }
 // A note for the kernel's log (Turnip's tu_darwin_note, NativeAdrenoMethodNote): the board's export writes it as a row of kernel.rings.txt, the one
 // place a process that has no file of its own (a sandboxed extension) can leave more than its 63-character text row. Kind 1 is a slow render pass
@@ -1836,7 +1841,7 @@ static void notified(void *context,uint64_t value) {
 @end
 
 // ---- command buffers and encoders ----
-@interface NBQueue : NBObject
+@interface NBQueue : NBObject {NBQueuePriorities::Request _priority;}
 @property(nonatomic) NmbQueue *handle;
 @property(atomic,strong) dispatch_queue_t completionQueue;   // SPI: where command buffers' handlers run (nil: the runtime's thread)
 @end
@@ -3291,7 +3296,18 @@ static void completed(void *context) {
 }
 
 @implementation NBQueue
-- (void)dealloc {nmb_queue_release(_handle);}
+- (instancetype)init {
+ if((self=[super init])) {
+  std::lock_guard<std::mutex> lock(gPriorityLock);
+  gQueuePriorities.add(_priority);auto p=gQueuePriorities.aggregate();nbForwardPriority(p.foreground,p.background);
+ }
+ return self;
+}
+- (void)dealloc {
+ nmb_queue_release(_handle);
+ std::lock_guard<std::mutex> lock(gPriorityLock);
+ gQueuePriorities.remove(_priority);auto p=gQueuePriorities.aggregate();nbForwardPriority(p.foreground,p.background);
+}
 - (id<MTLCommandBuffer>)commandBuffer {
  NmbCommandBuffer *handle=nmb_command_buffer_new(_handle);
  if(!handle){NBLOG(@"native-metal: commandBuffer refused: %@",lastError());return nil;}
@@ -3300,26 +3316,20 @@ static void completed(void *context) {
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences {return [self commandBuffer];}
 - (void)setSubmissionQueue:(dispatch_queue_t)queue {(void)queue;}   // submission happens on the caller's thread here
 // setCompletionQueue: is the property's setter.
-// A process's queues share one hardware queue here, so what a queue asks for is given to the driver for the whole process (the most urgent
-// request of any of its queues stands: tu_darwin_set_priority); the answer stays NO, as callers have always got it. What a process asks
-// for is logged once (the render server's queue is the one CoreAnimation raises) and counted in the process's text row.
-- (BOOL)setGPUPriority:(NSUInteger)priority {
- static std::atomic<bool> told{false};
- if(!told.exchange(true))NBLOG(@"native-metal: setGPUPriority:%lu (given to the driver for the process)",(unsigned long)priority);
- gAskFg.store((uint32_t)priority);
- nbForwardPriority((uint32_t)priority,0xffffffffu);
- return NO;   // as before: the answer callers have always got
+// Forward the current aggregate for this process's shared Vulkan queue.
+- (BOOL)updatePriority:(NSUInteger)value background:(BOOL)background {
+ if(value>5 || !NBQueuePriorities::valid((uint32_t)value,background))return NO;
+ std::lock_guard<std::mutex> lock(gPriorityLock);
+ const auto old=_priority;gQueuePriorities.remove(old);
+ if(background)_priority.background=(uint32_t)value;else _priority.foreground=(uint32_t)value;
+ gQueuePriorities.add(_priority);const auto effective=gQueuePriorities.aggregate();
+ if(nbForwardPriority(effective.foreground,effective.background))return YES;
+ gQueuePriorities.remove(_priority);_priority=old;gQueuePriorities.add(old);return NO;
 }
-- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {
- static std::atomic<bool> told{false};
- if(!told.exchange(true))NBLOG(@"native-metal: setBackgroundGPUPriority:%lu (given to the driver for the process)",(unsigned long)priority);
- gAskBg.store((uint32_t)priority);
- nbForwardPriority(0xffffffffu,(uint32_t)priority);
- return NO;
-}
-// What a new Metal queue reports (MTLIOAccelCommandQueue: normal 1, background 3). RenderBox and Core Image read both before any frame.
-- (NSUInteger)getGPUPriority {return 1;}
-- (NSUInteger)getBackgroundGPUPriority {return 3;}
+- (BOOL)setGPUPriority:(NSUInteger)priority {return [self updatePriority:priority background:NO];}
+- (BOOL)setBackgroundGPUPriority:(NSUInteger)priority {return [self updatePriority:priority background:YES];}
+- (NSUInteger)getGPUPriority {std::lock_guard<std::mutex> lock(gPriorityLock);return _priority.foreground;}
+- (NSUInteger)getBackgroundGPUPriority {std::lock_guard<std::mutex> lock(gPriorityLock);return _priority.background;}
 - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)d {(void)d;return [self commandBuffer];}
 @end
 
