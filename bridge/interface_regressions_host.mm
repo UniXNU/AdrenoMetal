@@ -38,8 +38,10 @@ static id<MTLBuffer> readback(id<MTLDevice> dev,id<MTLCommandBuffer> cb,id<MTLTe
   toBuffer:b destinationOffset:0 destinationBytesPerRow:32 destinationBytesPerImage:256];[e endEncoding];return b;
 }
 int main(int argc,char **argv) {@autoreleasepool {
- CHECK(argc==4);const bool single=!strcmp(argv[3],"single");
- setenv("NATIVE_METAL_SINGLE_SAMPLE",single?"1":"0",1);
+ CHECK(argc==4);const bool defaults=!strcmp(argv[3],"default");
+ const bool single=defaults || !strcmp(argv[3],"single");
+ if(defaults)unsetenv("NATIVE_METAL_SINGLE_SAMPLE");
+ else setenv("NATIVE_METAL_SINGLE_SAMPLE",single?"1":"0",1);
  id<MTLDevice> dev=native_bridge_metal_open(argv[1],argv[2],0,absent);CHECK(dev);
  id<MTLCommandQueue> queue=[dev newCommandQueue];CHECK(queue);
  // Automatic heaps reclaim their ranges while aliasable objects remain alive.

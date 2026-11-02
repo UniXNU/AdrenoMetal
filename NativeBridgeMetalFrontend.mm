@@ -1247,11 +1247,11 @@ static size_t pvrtcLevelBytes(uint32_t width,uint32_t height,bool twoBit) {
  while(down*4u<height)down<<=1;
  return (size_t)across*down*8;
 }
-// Poster rendering uses one sample. The override also allows host qualification.
+// All clients use one sample by default. The override also allows host qualification.
 static bool singleSample() {
  static const bool enabled=[] {
   if(const char *value=getenv("NATIVE_METAL_SINGLE_SAMPLE"))return strcmp(value,"0")!=0;
-  const char *name=getprogname();return name && strstr(name,"Poster");
+  return true;
  }();
  return enabled;
 }
