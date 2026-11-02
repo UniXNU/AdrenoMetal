@@ -122,6 +122,27 @@ int main(int argc,char **argv) {@autoreleasepool {
   auto pixels=readback(dev,cb,single?target:source);CHECK(finish(cb));
   for(unsigned i=0;i<64;i++)CHECK(((const uint32_t *)pixels.contents)[i]==(sampled?0xff102030u:0xff00ff00u));
  }
+ // Shader-selected viewport 1 must use the second viewport and scissor, not entry zero.
+ {
+  NSError *error=nil;
+  NSString *source=@"#include <metal_stdlib>\nusing namespace metal;\n"
+   "struct V {float4 p [[position]]; uint viewport [[viewport_array_index]];};\n"
+   "vertex V indexed_vertex(uint id [[vertex_id]]) {float2 p[3]={float2(-1,-1),float2(3,-1),float2(-1,3)}; return {float4(p[id],0,1),1};}\n"
+   "fragment float4 red_fragment() {return float4(1,0,0,1);}";
+  auto lib=[dev newLibraryWithSource:source options:nil error:&error];
+  if(!lib)fprintf(stderr,"viewport library: %s\n",error.description.UTF8String);CHECK(lib);
+  auto pd=[MTLRenderPipelineDescriptor new];pd.vertexFunction=[lib newFunctionWithName:@"indexed_vertex"];
+  pd.fragmentFunction=[lib newFunctionWithName:@"red_fragment"];pd.colorAttachments[0].pixelFormat=MTLPixelFormatRGBA8Unorm;
+  auto pipeline=[dev newRenderPipelineStateWithDescriptor:pd error:&error];CHECK(pipeline);
+  auto target=texture(dev);auto cb=[queue commandBuffer];auto pass=[MTLRenderPassDescriptor renderPassDescriptor];
+  pass.colorAttachments[0].texture=target;pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+  pass.colorAttachments[0].clearColor=MTLClearColorMake(0,0,0,0);
+  auto e=[cb renderCommandEncoderWithDescriptor:pass];[e setRenderPipelineState:pipeline];
+  MTLViewport vp[2]={{0,0,8,8,0,1},{4,0,4,8,0,1}};MTLScissorRect sc[2]={{0,0,8,8},{4,2,4,4}};
+  [e setViewports:vp count:2];[e setScissorRects:sc count:2];[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[e endEncoding];
+  auto pixels=readback(dev,cb,target);CHECK(finish(cb));
+  for(unsigned y=0;y<8;y++)for(unsigned x=0;x<8;x++)CHECK(((const uint32_t *)pixels.contents)[y*8+x]==(x>=4 && y>=2 && y<6?0xff0000ffu:0));
+ }
  // A zero-length compressed input infers its layout size and retains the deallocator.
  auto compressed=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_LDR width:4 height:4 mipmapped:NO];
  compressed.storageMode=MTLStorageModeShared;compressed.usage=MTLTextureUsageShaderRead;
