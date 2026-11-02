@@ -324,7 +324,9 @@ static id deviceForPort(unsigned port) {
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
-        if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (bootArgSet("sheng-gpu-pixels=1")) setenv("SHENG_GPU_PIXELS", "1", 1);
         else unsetenv("SHENG_DIAG");
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);

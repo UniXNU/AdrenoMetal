@@ -3042,3 +3042,12 @@ pub extern "C" fn nmb_queue_new_with_max_command_buffer_count(device: *mut NmbDe
         Ok(Box::into_raw(Box::new(NmbQueue(queue))))
     })
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_diagnostic_id(buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || Ok(get(buffer)?.0.diagnostic_id()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_gpu_diagnostic_hook(hook: extern "C" fn(u32,u64,u64,u64)) {
+    metal2vulkan_runtime::stage_trace::set_diagnostic_hook(hook);
+}
