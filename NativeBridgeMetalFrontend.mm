@@ -69,7 +69,8 @@ template<typename... T> static void frameEvent(uint32_t event,T... args) {
   if(!gFrameTransport(NativeGpuTraceMethod,&dropped,sizeof(dropped)))gFrameLost+=lost;
  }
 }
-static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){frameEvent(event,id,a,b);}
+static void traceRuntimeWide(uint64_t,uint32_t,uint32_t);
+static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && a>=40)traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);frameEvent(event,id,a,b);}
 static void frameText(uint32_t event,const char *text) {
  if(!frameTraceOn() || !gFrameTransport || !text)return;
  NativeGpuTraceRecord rec{};rec.event=event;strlcpy((char *)rec.value,text,sizeof(rec.value));
@@ -254,6 +255,11 @@ static void tracePush(const TraceRec &rec) {
  const uint32_t at=gTraceHead.fetch_add(1);
  gTrace[at%16384]=rec;
  gTrace[at%16384].idx=rec.type==1?rec.idx:at;
+}
+// The runtime's compact stage ring has a 16-bit argument. Keep memory sizes and
+// handle halves directly from its full-width diagnostic hook in the file.
+static void traceRuntimeWide(uint64_t id,uint32_t stage,uint32_t argument) {
+ TraceRec rec{};rec.type=22;rec.t0=nowUs();rec.t1=id;rec.a=stage;rec.b=argument;tracePush(rec);
 }
 static thread_local uint64_t tEncodeBatchId;
 static void traceThread(uint32_t role) {
