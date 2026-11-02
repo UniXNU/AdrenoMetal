@@ -77,7 +77,8 @@ static void installDispatchTrace() {
  auto install=(Install)dlsym(RTLD_DEFAULT,"dispatch_introspection_hooks_install");
  const auto *version=(const NBDispatchVersions *)dlsym(RTLD_DEFAULT,"dispatch_introspection_versions");
  if(!install || !version){frameEvent(68,0,0,1,0,0,0);return;}
- if(version->hooks_version!=2 || version->hooks_size!=sizeof(dispatch_introspection_hooks_s) ||
+ if(version->version!=1 || version->hooks_version!=2 || version->hooks_size!=sizeof(dispatch_introspection_hooks_s) ||
+    version->item_version!=1 || version->block_version!=1 || version->function_version!=1 ||
     version->item_size<64 || version->block_size<56 || version->function_size<56) {
   frameEvent(68,0,0,2,version->hooks_version,version->hooks_size,version->item_size);return;
  }
