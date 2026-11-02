@@ -18,4 +18,6 @@ Unused owned image backing can serve later pooled or dedicated images. Extra ima
 
 `sheng-wallpaper-freeze=1` enables wallpaper isolation. A Poster renderer freezes GPU submission after a successful command draws into and stores an IOSurface of at least two million pixels. The completed output stays retained. Later commands remain committed and unscheduled, with their resources and queue leases retained. Already submitted work completes normally. PosterBoard and other processes keep submitting. The switch defaults to off; `NATIVE_METAL_FREEZE_WALLPAPER=1` selects the same mode directly in a renderer process. Trace event 60 records admitted commands, the completion transition and parked commands.
 
+Slow encoding operations retain source lines and enqueue times. Completion handlers and resource destructors carry individual timing and identities. Dispatch introspection records its availability and, with ABI v2, task enqueue/dequeue/completion and parent links. Kernel blocked-thread sampling and Mach request/reply ports provide the cross-process wait record.
+
 `python3 scripts/check-wallpaper-freeze-host.py` in the resolved tree checks real pixels, callbacks, concurrent parked submissions and process selection.
