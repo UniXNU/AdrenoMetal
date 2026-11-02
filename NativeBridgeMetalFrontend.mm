@@ -49,6 +49,7 @@
 #include "QueuePriority.h"
 #include "NativeBridgeMetalFrontend.h"
 #include "NativeGpuTrace.h"
+#include "NativeGpuLatency.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
 
@@ -62,6 +63,7 @@ template<typename... T> static void frameEvent(uint32_t event,T... args) {
  if(!frameTraceOn() || !gFrameTransport)return;
  NativeGpuTraceRecord rec{};rec.event=event;const uint64_t values[]={uint64_t(args)...};
  static_assert(sizeof...(args)<=12,"frame event fields");
+ if(!native_gpu_latency_event(event,values,sizeof...(args)))return;
  memcpy(rec.value,values,sizeof(values));
  if(!gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec)))++gFrameLost;
  else if(uint64_t lost=gFrameLost.exchange(0)) {
@@ -70,7 +72,7 @@ template<typename... T> static void frameEvent(uint32_t event,T... args) {
  }
 }
 static void traceRuntimeWide(uint64_t,uint32_t,uint32_t);
-static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && a>=40)traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);frameEvent(event,id,a,b);}
+static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && !native_gpu_latency_stage((uint32_t)a))return;if(event==39 && a>=40)traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);frameEvent(event,id,a,b);}
 static void frameText(uint32_t event,const char *text) {
  if(!frameTraceOn() || !gFrameTransport || !text)return;
  NativeGpuTraceRecord rec{};rec.event=event;strlcpy((char *)rec.value,text,sizeof(rec.value));
@@ -252,6 +254,8 @@ static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);retur
 static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
 static void tracePush(const TraceRec &rec) {
  if(!traceWanted())return;
+ if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;
+ if(rec.type==9 || rec.type==10 || rec.type==11)return;
  const uint32_t at=gTraceHead.fetch_add(1);
  gTrace[at%16384]=rec;
  gTrace[at%16384].idx=rec.type==1?rec.idx:at;
@@ -311,7 +315,9 @@ static void detailDefinition(uint64_t key,const char *label) {
 }
 static void detailPoint(uint64_t id,uint32_t kind,uint32_t phase,uint64_t command,uint64_t object,uint64_t function,
                         uint64_t began,uint64_t parent,uint64_t queued,uint32_t line=0,uint64_t ended=0) {
- uint64_t tid=0;pthread_threadid_np(nullptr,&tid);const uint64_t now=ended?ended:nowUs();
+ const uint64_t now=ended?ended:nowUs();
+ if(phase==2 && kind!=1 && kind!=3 && began && now-began<250)return;
+ uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  TraceRec rec{};rec.type=17;rec.t0=now;rec.t1=id;rec.t2=command;rec.t3=object;
  rec.a=kind|(phase<<16);rec.b=(uint32_t)tid;rec.c=(uint32_t)function;rec.d=(uint32_t)(function>>32);
  rec.cpu0=(uint32_t)(began?now-began:0);rec.cpu1=line;tracePush(rec);
@@ -349,117 +355,6 @@ static void traceNote(uint32_t tid) {
  TraceRec rec={};rec.type=4;rec.tid=tid;pthread_getname_np(pthread_self(),(char *)&rec.t0,24);tracePush(rec);
 }
 
-// ---- sampler: where the render thread's CPU goes, inside a command buffer's window (creation to commit) and between windows ----
-// A thread suspends the render thread every 2 ms and keeps the program counter plus the frame-pointer chain in a ring (no allocation, no locks: the
-// suspended thread may hold any). The writer thread resolves the addresses with dladdr and puts the samples into the frame trace (types 9 and 10,
-// below); the leaf and inclusive histograms inside windows and in the gaps between windows (the time the render thread spends on something other
-// than encoding) are built offline. Suspending the render thread every 2 ms delays its frames (half of the render server's busiest-thread samples
-// in untagged-3f2bd680 were this thread), so it runs only with sheng-diag=1 and sheng-gpu-sample=1 both on the kernel command line.
-static std::atomic<mach_port_t> gSampleThread{0};
-static std::atomic<uint64_t> gSampleTop{0};
-struct StackSample {uint64_t frames[8];uint64_t us;uint32_t gap;};
-static std::atomic<bool> gSampleInWindow{false};
-static bool samplerWanted() {
- static const bool wanted=[]{
-  if(!diagOn())return false;
-  char args[1100]={};size_t size=sizeof args-1;
-  return !sysctlbyname("kern.bootargs",args,&size,NULL,0) && strstr(args,"sheng-gpu-sample=1");
- }();
- return wanted;
-}
-static StackSample gSamples[8192];
-static std::atomic<uint32_t> gSampleHead{0};
-static std::atomic<bool> gSamplerStarted{false};
-static void sampleWindowOpen() {
- if(!samplerWanted())return;
- char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
- if(strncmp(name,"com.apple.coreanimation",23))return;
- gSampleInWindow.store(true);
- gSampleTop.store((uint64_t)pthread_get_stackaddr_np(pthread_self()));
- gSampleThread.store(pthread_mach_thread_np(pthread_self()));
- if(!gSamplerStarted.exchange(true))std::thread([]{
-  pthread_setname_np("frame-sampler");
-  for(;;) {
-   usleep(2000);
-   const mach_port_t port=gSampleThread.load();
-   if(!port)continue;
-   if(thread_suspend(port)!=KERN_SUCCESS)continue;
-   arm_thread_state64_t state;mach_msg_type_number_t count=ARM_THREAD_STATE64_COUNT;
-   StackSample sample={};
-   if(thread_get_state(port,ARM_THREAD_STATE64,(thread_state_t)&state,&count)==KERN_SUCCESS) {
-    const uint64_t mask=0x0000007fffffffffull,top=gSampleTop.load();
-    const uint64_t sp=arm_thread_state64_get_sp(state);
-    unsigned n=0;
-    sample.frames[n++]=arm_thread_state64_get_pc(state)&mask;
-    sample.frames[n++]=arm_thread_state64_get_lr(state)&mask;
-    uint64_t fp=arm_thread_state64_get_fp(state)&mask;
-    while(n<8 && fp>=sp && fp+16<=top && !(fp&15)) {
-     const uint64_t *record=(const uint64_t *)fp;
-     sample.frames[n++]=record[1]&mask;
-     const uint64_t next=record[0]&mask;
-     if(next<=fp)break;
-     fp=next;
-    }
-   }
-   thread_resume(port);
-   sample.gap=gSampleInWindow.load()?0:1;
-   sample.us=nowUs();
-   if(sample.frames[0])gSamples[gSampleHead.fetch_add(1)%8192]=sample;
-  }
- }).detach();
-}
-static void sampleWindowClose() {
- if(gSampleThread.load()==pthread_mach_thread_np(pthread_self()))gSampleInWindow.store(false);   // the thread stays sampled: its gaps are the data
-}
-// The writer thread turns the ring's samples into trace records: type 10 names a function the first time a sample holds it {a id, the name (image`symbol,
-// 60 characters) in t0..t3 and b..tid2}, type 9 is one sample {t0 nowUs() when it was taken, t1 1 when it fell between two windows, a..d the eight frames as
-// 16-bit function ids, pc first, 0 = no frame}. The offline reader (local-tools/blue-block/prof.py) rebuilds the leaf and inclusive histograms for the
-// windows and the gaps from them.
-// Type 11 is Turnip's counters for the copies that need a row-by-row path (tu_copy_row_stats), written when they change {t0 nowUs(), t1 buffer to image copies |
-// image to buffer copies << 32, t2 how many of each were split per row (same packing), t3 rows of the split buffer to image copies, a rows of the split image to buffer
-// copies, b rows of the largest split copy, c its pitch in bytes, d its VkFormat, tid its width, cpu0 its height}.
-static void emitDefinition(uint32_t id,const std::string &text) {
- char field[60]={};strncpy(field,text.c_str(),sizeof field-1);
- TraceRec rec={};rec.type=10;rec.a=id;memcpy(&rec.t0,field,32);memcpy(&rec.b,field+32,28);tracePush(rec);
-}
-static void sampleEmitTrace(uint32_t &consumed) {
- static std::unordered_map<uint64_t,uint32_t> addressId;
- static std::unordered_map<std::string,uint32_t> nameId;
- static std::vector<std::pair<uint32_t,std::string>> defined;   // every definition, repeated every 15 s: the writer drops the oldest records when the ring laps
- static uint64_t definedAt=0;
- const uint32_t head=gSampleHead.load();
- if(head-consumed>8000)consumed=head-8000;
- auto identify=[&](uint64_t address)->uint32_t {
-  auto cached=addressId.find(address);if(cached!=addressId.end())return cached->second;
-  Dl_info info={};char text[256];
-  if(dladdr((const void *)address,&info)){
-   const char *image=info.dli_fname?strrchr(info.dli_fname,'/'):NULL;image=image?image+1:(info.dli_fname?info.dli_fname:"?");
-   if(info.dli_sname)snprintf(text,sizeof text,"%s`%s",image,info.dli_sname);
-   else snprintf(text,sizeof text,"%s`+0x%llx",image,(unsigned long long)(address-(uint64_t)info.dli_fbase));
-  } else snprintf(text,sizeof text,"?");
-  auto found=nameId.find(text);
-  if(found!=nameId.end())return addressId[address]=found->second;
-  uint32_t id=(uint32_t)nameId.size()+1;
-  if(id>0xfffe)return addressId[address]=0xffff;
-  nameId[text]=id;
-  defined.push_back({id,text});
-  emitDefinition(id,text);
-  return addressId[address]=id;
- };
- const uint64_t now=nowUs();
- if(now-definedAt>=15000000ull) {
-  definedAt=now;
-  for(auto &entry:defined)emitDefinition(entry.first,entry.second);
- }
- while(consumed<head) {
-  const StackSample sample=gSamples[consumed%8192];++consumed;
-  uint32_t ids[8]={};
-  for(unsigned i=0;i<8 && sample.frames[i];i++)ids[i]=identify(sample.frames[i]);
-  TraceRec rec={};rec.type=9;rec.t0=sample.us;rec.t1=sample.gap;
-  rec.a=ids[0]|ids[1]<<16;rec.b=ids[2]|ids[3]<<16;rec.c=ids[4]|ids[5]<<16;rec.d=ids[6]|ids[7]<<16;
-  tracePush(rec);
- }
-}
 /* The process's slowest pass and its pass total, for a line of the kernel log: "R pass <us> us <w>x<h> mode <m> fmt <f> draws <d> flags <x>
  * swap <s> | <passes> passes <total> us". Zero characters before any pass with GPU times was recorded. */
 extern "C" size_t nmb_slowest_pass(char *out,size_t size) {
@@ -548,7 +443,7 @@ static void traceStartWriter() {
   pthread_setname_np("frame-trace");
   int fd=-1;
   static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
-  uint32_t written=0,sampled=0;
+  uint32_t written=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
   static_assert(sizeof(PassRec)==72 && sizeof(SubRec)==32,"turnip ring records");
@@ -561,7 +456,6 @@ static void traceStartWriter() {
   bool header=false;
   for(;;) {
    usleep(250000);
-   if(render)sampleEmitTrace(sampled);
    if(render && fd<0)for(const char *path:paths){fd=open(path,O_WRONLY|O_CREAT|O_TRUNC,0644);if(fd>=0)break;}
    if(render && fd<0)continue;
    if(!turnip && !gLoaderPath.empty()) {   // the runtime loads Turnip after this thread may have started
@@ -3142,7 +3036,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();installDispatchTrace();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);sampleWindowOpen();}
+ if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();installDispatchTrace();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);}
  return self;
 }
 - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
@@ -3486,7 +3380,7 @@ static char kUserDictionaryKey;
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
  self.committed=YES;
  self.committedUs=nowUs();
- commitCpu=threadCpuUs();commitTid=threadIdLow();sampleWindowClose();
+ commitCpu=threadCpuUs();commitTid=threadIdLow();
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
   // Assign once under the same lock as publication. A concurrent commit cannot reuse this index.
