@@ -18,6 +18,7 @@
 #include <condition_variable>
 #include <cmath>
 #include <atomic>
+#include <optional>
 #include <mutex>
 #include <pthread.h>
 #include <functional>
@@ -280,6 +281,56 @@ static void batchStage(uint64_t batch,uint32_t phase,uint64_t queuedUs,uint32_t 
  TraceRec rec={};rec.type=14;rec.t0=nowUs();rec.t1=batch;rec.t2=queuedUs;rec.a=phase;rec.b=tasks;rec.c=depth;rec.tid=threadIdLow();tracePush(rec);
  frameEvent(61,batch,phase,queuedUs,tasks,depth,rec.tid);
 }
+static thread_local uint64_t tDetailCommand;
+static thread_local uint64_t tDispatchItem;
+static std::atomic<uint64_t> gDetailSequence{0};
+static uint64_t blockInvoke(id block) {
+ if(!block)return 0;
+ uintptr_t function=0;memcpy(&function,(const char *)(__bridge const void *)block+16,sizeof function);return function;
+}
+static void detailDefinition(uint64_t key,const char *label) {
+ static std::atomic<uint64_t> seen[1024];
+ if(!key || !label)return;
+ for(auto &slot:seen) {
+  uint64_t old=slot.load(std::memory_order_relaxed);if(old==key)return;
+  if(!old && slot.compare_exchange_strong(old,key)) {
+   char text[64]={};strncpy(text,label,sizeof text-1);
+   for(unsigned part=0;part<2;++part) {
+    uint64_t words[4]={};memcpy(words,text+part*32,32);frameEvent(67,key,part,words[0],words[1],words[2],words[3]);
+    TraceRec rec{};rec.type=19;rec.t0=key;rec.a=part;memcpy(&rec.t1,words,24);memcpy(&rec.b,(char *)words+24,8);tracePush(rec);
+   }
+   return;
+  }
+ }
+}
+static void detailPoint(uint64_t id,uint32_t kind,uint32_t phase,uint64_t command,uint64_t object,uint64_t function,
+                        uint64_t began,uint64_t parent,uint64_t queued,uint32_t line=0,uint64_t ended=0) {
+ uint64_t tid=0;pthread_threadid_np(nullptr,&tid);const uint64_t now=ended?ended:nowUs();
+ TraceRec rec{};rec.type=17;rec.t0=now;rec.t1=id;rec.t2=command;rec.t3=object;
+ rec.a=kind|(phase<<16);rec.b=(uint32_t)tid;rec.c=(uint32_t)function;rec.d=(uint32_t)(function>>32);
+ rec.cpu0=(uint32_t)(began?now-began:0);rec.cpu1=line;tracePush(rec);
+ if(phase!=1) {
+  TraceRec link{};link.type=18;link.t0=now;link.t1=id;link.t2=parent;link.t3=queued;
+  link.a=(uint32_t)began;link.b=(uint32_t)(began>>32);tracePush(link);
+ }
+ frameEvent(64,id,kind,phase,command,object,function,parent,tid,began,began?now-began:0,line,queued);
+}
+struct DetailCommandScope {
+ uint64_t previous;
+ explicit DetailCommandScope(uint64_t command):previous(tDetailCommand){tDetailCommand=command;}
+ ~DetailCommandScope(){tDetailCommand=previous;}
+};
+struct DetailSpan {
+ uint64_t id=0,began=0,command=0,object=0,function=0,parent=0;uint32_t kind=0;
+ DetailSpan(uint32_t k,uint64_t o,uint64_t f=0,bool announce=false):object(o),function(f),kind(k) {
+  if(!diagOn())return;
+  id=++gDetailSequence;began=nowUs();command=tDetailCommand;parent=tDispatchItem;
+  if(announce){detailPoint(id,kind,1,command,object,function,0,parent,0);began=nowUs();}
+ }
+ ~DetailSpan(){if(id)detailPoint(id,kind,2,command,object,function,began,parent,0);}
+};
+static uint64_t encodeCommandOf(id);
+#include "NativeMetalDispatchTrace.h"
 static void traceStartWriter();
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
@@ -1085,13 +1136,15 @@ static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
 static std::atomic<uint64_t> gNoCopyAll,gNoCopyMade,gNoCopyReleased,gSurfaceImportsMade,gSurfaceImportsReleased;
 static void releaseBlock(void *context,void *pointer,uint64_t length) {
  gNoCopyReleased++;
+ DetailSpan timing(6,(uintptr_t)pointer,blockInvoke((__bridge id)context),true);
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
 }
-static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
+static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(uintptr_t)context);gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
 @implementation NBBuffer
 - (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
 - (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
 - (void)dealloc {
+ DetailSpan timing(4,(uintptr_t)_handle);
  nmb_buffer_release(_handle);
 }
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
@@ -1311,7 +1364,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  const uint64_t s=_descriptor.swizzle;
  return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(s&255),(MTLTextureSwizzle)((s>>8)&255),(MTLTextureSwizzle)((s>>16)&255),(MTLTextureSwizzle)((s>>24)&255));
 }
-- (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
+- (void)dealloc {DetailSpan timing(5,(uintptr_t)_handle);nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
@@ -2214,7 +2267,7 @@ static void encodeFlush() {
  t.work.notify_one();
 }
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
-template<class F> static void encodeLater(F &&work) {
+template<class F> static void encodeLaterRaw(F &&work) {
  if(!gEncodeThread || onEncodeQueue()){work();return;}
  if(!tBatch) {
   EncodeThread &t=encodeThread();
@@ -2232,7 +2285,27 @@ static void encodeDrain() {
  const uint64_t target=t.queued;
  t.idle.wait(lock,[&]{return t.done>=target;});
 }
-#define ENCODE(...) encodeLater([=]{__VA_ARGS__;})
+template<class F> struct TracedEncodeCall {
+ std::optional<F> work;const char *label;uint32_t line;uint64_t id,command,parent,queued;
+ void operator()() {
+  DetailCommandScope scope(command);const uint64_t began=nowUs();
+  (*work)();const uint64_t ran=nowUs();
+  if(ran-began>=250) {
+   detailDefinition((uintptr_t)label,label);
+   detailPoint(id,1,2,command,tEncodeBatchId,(uintptr_t)label,began,parent,queued,line,ran);
+  }
+  const uint64_t releasing=nowUs();work.reset();
+  const uint64_t released=nowUs();
+  if(released-releasing>=250)detailPoint(id,2,2,command,tEncodeBatchId,(uintptr_t)label,releasing,parent,queued,line,released);
+ }
+};
+template<class F> static void encodeLater(F &&work,const char *label,uint32_t line,uint64_t command) {
+ if(!diagOn()){encodeLaterRaw(std::forward<F>(work));return;}
+ using Closure=std::decay_t<F>;
+ encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
+                ++gDetailSequence,command,tDispatchItem,nowUs()});
+}
+#define ENCODE(...) encodeLater([=]{__VA_ARGS__;},__func__,__LINE__,diagOn()?encodeCommandOf(self):0)
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
 static std::mutex gRuntimeHandleLock;
 static void waitForResource(id resource) {
@@ -2288,6 +2361,11 @@ static void writeDrawStats() {
   fprintf(f,"%6.2f%% %llu %s\n",100.0*n/draws,(unsigned long long)n,what.empty()?"(nothing)":what.c_str());
  }
  fclose(f);
+}
+static uint64_t encodeCommandOf(id object) {
+ if([object isKindOfClass:[NBCommandBuffer class]])return ((NBCommandBuffer *)object)->traceNumber;
+ if([object isKindOfClass:[NBEncoder class]])return ((NBEncoder *)object).commandBuffer->traceNumber;
+ return 0;
 }
 @implementation NBEncoder {
  std::unique_ptr<DrawStateNote> _drawNote;
@@ -3058,7 +3136,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);sampleWindowOpen();}
+ if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();installDispatchTrace();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);sampleWindowOpen();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -3333,6 +3411,7 @@ static char kUserDictionaryKey;
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
+ DetailCommandScope commandScope(traceNumber);
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
@@ -3387,7 +3466,8 @@ static char kUserDictionaryKey;
  const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
  void (^run)(void)=^{
   frontStage(self->traceNumber,self.commitIndex,12);
-  for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
+  DetailCommandScope commandScope(self->traceNumber);
+  for(MTLCommandBufferHandler block in completedHandlers){DetailSpan timing(3,(uintptr_t)(__bridge void *)block,blockInvoke(block),true);block((id<MTLCommandBuffer>)self);}
   frontStage(self->traceNumber,self.commitIndex,13);
   dispatch_group_leave(self->_handlers);
   if(lost)endRenderServerAfterGpuLoss();
@@ -3417,6 +3497,7 @@ static char kUserDictionaryKey;
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
+ DetailCommandScope commandScope(traceNumber);
  frontStage(traceNumber,self.commitIndex,3);
  std::unique_lock<std::recursive_mutex> wallpaperLock(gWallpaperLock,std::defer_lock);
  if(freezeWallpaperOn()) {

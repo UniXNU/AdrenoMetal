@@ -1,0 +1,20 @@
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -2611,12 +2611,11 @@
+         );
+         let memory = Arc::new(Mutex::new(memory));
+         let for_worker = Arc::clone(&memory);
+-        let thread = std::thread::Builder::new()
+-            .name("memory-release-test-worker".into())
+-            .spawn(move || {
+-                reap_retired(&for_worker, &driver);
+-            })
+-            .unwrap();
++        let thread = crate::exit_guard::spawn(
++            std::thread::Builder::new().name("memory-release-test-worker".into()),
++            move || reap_retired(&for_worker, &driver),
++        )
++        .unwrap();
+         thread.join().unwrap();
+         assert_eq!(WORKER_FREED.load(Ordering::Relaxed), 2);
+         assert_eq!(lock(&memory).census().empty_bytes, 0);
