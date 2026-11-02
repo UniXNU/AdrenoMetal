@@ -1,0 +1,120 @@
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 28c6643..bcc2c68 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -101,8 +101,6 @@ pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
+ /// ([`Memory::release_spare`]).
+ pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
+ 
+-/// Retained image backing, shared by all image pools of one device.
+-const SPARE_BYTES: u64 = 256 << 20;
+ /// Maximum backing waiting for physical release on the room worker.
+ const RETIRED_BYTES: u64 = 128 << 20;
+ /// Small frees do not need another thread handoff.
+@@ -1595,31 +1593,14 @@ impl Memory {
+         count
+     }
+ 
+-    /// Retain unused owned image backing within one byte budget for the device.
++    /// Keep unused owned image backing spare ([`SPARE_FOR`]). No byte limit: spares go when they
++    /// age, when a block of their type cannot be made and on memory pressure. A limit freed spares
++    /// the render server made again within seconds, each a new allocation wired page by page while
++    /// the compressor freed pages for it (untagged-102cb4a069: 13-14 us a page).
+     fn keep_spare(&mut self, device: &ash::Device, pool: (Holds, u32), block: Block, now: Instant) {
+         let id = trace_memory(pool, block.size, 0, 3);
+         trace_handle(id, block.memory);
+-        if block.size > SPARE_BYTES {
+-            // SAFETY: the block has no placement or pending GPU reader.
+-            drop(unsafe { self.let_go(device, block, FreeCause::PooledEmptied, None) });
+-            return;
+-        }
+-        while self.spare.iter().map(|spare| spare.block.size).sum::<u64>() + block.size
+-            > SPARE_BYTES
+-        {
+-            let oldest = self
+-                .spare
+-                .iter()
+-                .enumerate()
+-                .min_by_key(|(_, spare)| spare.since)
+-                .map(|(i, _)| i);
+-            let Some(index) = oldest else {
+-                break;
+-            };
+-            let old = self.spare.remove(index);
+-            // SAFETY: spare backing is unused.
+-            drop(unsafe { self.let_go(device, old.block, FreeCause::KeptStale, None) });
+-        }
++        let _ = device;
+         self.spare.push(Spare {
+             pool,
+             block,
+@@ -1662,6 +1643,16 @@ impl Memory {
+         Some(self.spare.swap_remove(index).block)
+     }
+ 
++    /// The smallest spare block of `pool` of at least `size` bytes, taken out to give the pool
++    /// room ([`keep_room`]): a spare is memory already made, where a new block is a fresh
++    /// allocation that may wait for the system to free pages.
++    fn take_spare_for_room(&mut self, pool: (Holds, u32), size: u64) -> Option<Block> {
++        let (index, _) = (self.spare.iter().enumerate())
++            .filter(|(_, spare)| spare.pool == pool && spare.block.size >= size)
++            .min_by_key(|(_, spare)| spare.block.size)?;
++        Some(self.spare.swap_remove(index).block)
++    }
++
+     /// Free every spare block and every kept empty pooled block: the system reports memory
+     /// pressure, the signal Metal's resource cache gives memory back on. How many went.
+     pub(super) fn release_spare(&mut self, device: &ash::Device) -> usize {
+@@ -2502,6 +2493,21 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+     for (pool, bytes) in lacking {
+         let available = lock(memory).pool(pool.0, pool.1).room();
+         let trace = trace_memory(pool, bytes, available, 2);
++        // A spare image block gives the room without a new allocation.
++        if pool.0 == Holds::Images {
++            let mut memory = lock(memory);
++            memory.age_spare(device, Instant::now());
++            if let Some(block) = memory.take_spare_for_room(pool, bytes / 2) {
++                trace_handle(trace, block.memory);
++                if trace != 0 {
++                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 3);
++                }
++                memory.say_block("took a spare block of images for room", &block);
++                let size = block.size;
++                memory.pool(pool.0, pool.1).add(size, false, block, 0);
++                continue;
++            }
++        }
+         let addressed = (pool.0 == Holds::Buffers).then_some(counts);
+         let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
+             continue;
+@@ -2666,7 +2672,7 @@ mod latency_tests {
+     }
+ 
+     #[test]
+-    fn image_spares_have_one_device_byte_budget() {
++    fn image_spares_age_and_give_room() {
+         let _serial = lock(&SERIAL);
+         FREED.store(0, Ordering::Relaxed);
+         let driver = driver();
+@@ -2675,13 +2681,15 @@ mod latency_tests {
+         for raw in 1..=5 {
+             memory.keep_spare(&driver, (Holds::Images, 0), block(raw, 64 << 20), now);
+         }
+-        assert_eq!(
+-            memory.spare.iter().map(|s| s.block.size).sum::<u64>(),
+-            SPARE_BYTES
+-        );
+-        assert_eq!(memory.retiring_bytes.load(Ordering::Relaxed), 64 << 20);
++        assert_eq!(memory.spare.len(), 5);
+         assert_eq!(FREED.load(Ordering::Relaxed), 0);
++        let room = memory.take_spare_for_room((Holds::Images, 0), 32 << 20).expect("spare");
++        assert_eq!(room.size, 64 << 20);
++        assert!(memory.take_spare_for_room((Holds::Images, 1), 1).is_none());
++        assert!(memory.take_spare_for_room((Holds::Images, 0), 128 << 20).is_none());
++        memory.keep_spare(&driver, (Holds::Images, 0), room, now);
++        memory.age_spare(&driver, now + SPARE_FOR);
++        assert!(memory.spare.is_empty());
+         drop(memory.destroy(&driver));
+-        assert_eq!(FREED.load(Ordering::Relaxed), 5);
+     }
+ }
