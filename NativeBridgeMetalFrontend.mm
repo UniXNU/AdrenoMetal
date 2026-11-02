@@ -316,7 +316,6 @@ static void detailDefinition(uint64_t key,const char *label) {
 static void detailPoint(uint64_t id,uint32_t kind,uint32_t phase,uint64_t command,uint64_t object,uint64_t function,
                         uint64_t began,uint64_t parent,uint64_t queued,uint32_t line=0,uint64_t ended=0) {
  const uint64_t now=ended?ended:nowUs();
- if(phase==2 && kind!=1 && kind!=3 && began && now-began<250)return;
  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  TraceRec rec{};rec.type=17;rec.t0=now;rec.t1=id;rec.t2=command;rec.t3=object;
  rec.a=kind|(phase<<16);rec.b=(uint32_t)tid;rec.c=(uint32_t)function;rec.d=(uint32_t)(function>>32);
@@ -333,13 +332,13 @@ struct DetailCommandScope {
  ~DetailCommandScope(){tDetailCommand=previous;}
 };
 struct DetailSpan {
- uint64_t id=0,began=0,command=0,object=0,function=0,parent=0;uint32_t kind=0;
- DetailSpan(uint32_t k,uint64_t o,uint64_t f=0,bool announce=false):object(o),function(f),kind(k) {
+ uint64_t id=0,began=0,command=0,object=0,function=0,parent=0;uint32_t kind=0;bool announced=false;
+ DetailSpan(uint32_t k,uint64_t o,uint64_t f=0,bool announce=false):object(o),function(f),kind(k),announced(announce) {
   if(!diagOn())return;
   id=++gDetailSequence;began=nowUs();command=tDetailCommand;parent=tDispatchItem;
   if(announce){detailPoint(id,kind,1,command,object,function,0,parent,0);began=nowUs();}
  }
- ~DetailSpan(){if(id)detailPoint(id,kind,2,command,object,function,began,parent,0);}
+ ~DetailSpan(){if(id){uint64_t end=nowUs();if(announced || end-began>=250)detailPoint(id,kind,2,command,object,function,began,parent,0,0,end);}}
 };
 static uint64_t encodeCommandOf(id);
 #include "NativeMetalDispatchTrace.h"
