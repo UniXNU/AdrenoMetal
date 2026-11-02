@@ -22,8 +22,8 @@ static void previousEnqueue(dispatch_queue_s *,dispatch_introspection_queue_item
 static void previousCreate(dispatch_introspection_queue_s *){}
 static void mockInstall(dispatch_introspection_hooks_s *hooks){auto previous=active;active=*hooks;*hooks=previous;}
 static void *mockDlsym(void *,const char *name){if(!strcmp(name,"dispatch_introspection_hooks_install"))return (void *)mockInstall;return &version;}
-int main(int argc,char **) {
- if(argc>1)version.hooks_version=3;
+int main(int argc,char **argv) {
+ if(argc>1){if(!strcmp(argv[1],"item-version"))version.item_version=2;else version.hooks_version=3;}
  active.queue_item_enqueue=previousEnqueue;active.queue_create=previousCreate;
  installDispatchTrace();
  if(argc>1){assert(active.queue_item_enqueue==previousEnqueue);assert(rows.back()[3]==2);return 0;}
