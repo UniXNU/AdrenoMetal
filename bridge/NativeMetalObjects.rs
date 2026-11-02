@@ -11,7 +11,7 @@ use metal2vulkan::metal::{
     BlendFactor, BlendOperation, ColorWriteMask, CompareFunction, CullMode, DataType, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, SamplerAddressMode, SamplerBorderColor, SamplerMinMagFilter, SamplerMipFilter, StencilOperation, TextureType,
     TessellationControlPointIndexType, TessellationFactorFormat, TessellationFactorStepFunction, TessellationPartitionMode, TextureUsage,
-    TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
+    TextureSwizzle, TextureSwizzleChannels, TriangleFillMode, VertexFormat, VertexStepFunction, Winding,
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource,
@@ -1060,8 +1060,18 @@ pub struct NmbTextureDescriptor {
     pub rotation: u64,
     pub framebuffer_only: u64,
     pub is_drawable: u64,
+    pub swizzle: u64,
 }
 
+// Bit 32 distinguishes an explicit all-zero swizzle from an omitted descriptor field.
+fn swizzle_of(packed: u64) -> Result<Option<TextureSwizzleChannels>, String> {
+    if packed == 0 { return Ok(None); }
+    let channel = |shift: u32| raw::<TextureSwizzle>((packed >> shift) & 0xff, "texture swizzle");
+    Ok(Some(TextureSwizzleChannels { red: channel(0)?, green: channel(8)?, blue: channel(16)?, alpha: channel(24)? }))
+}
+fn swizzle_packed(s: TextureSwizzleChannels) -> u64 {
+    (1u64 << 32) | s.red.as_raw() as u64 | (s.green.as_raw() as u64) << 8 | (s.blue.as_raw() as u64) << 16 | (s.alpha.as_raw() as u64) << 24
+}
 pub struct NmbTexture(Texture);
 
 fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
@@ -1080,6 +1090,7 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.rotation = d.rotation;
     out.framebuffer_only = d.framebuffer_only != 0;
     out.is_drawable = d.is_drawable != 0;
+    if let Some(swizzle) = swizzle_of(d.swizzle)? { out.swizzle = swizzle; }
     Ok(out)
 }
 
@@ -1200,6 +1211,7 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             rotation: t.rotation(),
             framebuffer_only: u64::from(t.framebuffer_only()),
             is_drawable: u64::from(t.is_drawable()),
+            swizzle: swizzle_packed(t.swizzle()),
         };
         Ok(())
     })
@@ -2894,4 +2906,148 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
         blit(encoder)?.generate_mipmaps(&get(texture)?.0).map_err(e("mipmaps"))?;
         Ok(true)
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_new_view_swizzle(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64,
+                                               swizzle: u64) -> *mut NmbTexture {
+    guard(std::ptr::null_mut(), || {
+        let t = &get(texture)?.0;
+        if levels.is_null() || slices.is_null() {
+            return Err("null levels or slices".into());
+        }
+        // SAFETY: the header's two words each.
+        let (l, s) = unsafe { (std::slice::from_raw_parts(levels, 2), std::slice::from_raw_parts(slices, 2)) };
+        let ranges = (l[0]..l[0].checked_add(l[1]).ok_or("levels overflow")?, s[0]..s[0].checked_add(s[1]).ok_or("slices overflow")?);
+        let channels = swizzle_of(swizzle)?.unwrap_or(TextureSwizzleChannels::DEFAULT);
+        let view = t.new_texture_view_with_swizzle(raw::<PixelFormat>(format, "pixel format")?, raw::<TextureType>(kind, "texture type")?,
+                                                   ranges.0, ranges.1, channels);
+        Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || {
+        get(texture)?.0.make_aliasable().map_err(e("make aliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_is_aliasable(texture: *const NmbTexture) -> bool {
+    guard(false, || Ok(get(texture)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_make_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || {
+        get(buffer)?.0.make_aliasable().map_err(e("make aliasable"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_is_aliasable(buffer: *const NmbBuffer) -> bool {
+    guard(false, || Ok(get(buffer)?.0.is_aliasable()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constant_count(function: *const NmbFunction) -> u32 {
+    guard(0, || Ok(get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?.len() as u32))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constant_at(function: *const NmbFunction, at: u32, name: *mut c_char, capacity: usize, index: *mut u64,
+                                           data_type: *mut u64, required: *mut bool) -> bool {
+    guard(false, || {
+        let constants = get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?;
+        let (key, constant) = constants.iter().nth(at as usize).ok_or("no such constant")?;
+        if name.is_null() || capacity == 0 || index.is_null() || data_type.is_null() || required.is_null() {
+            return Err("null out".into());
+        }
+        let bytes = key.as_bytes();
+        let n = bytes.len().min(capacity - 1);
+        // SAFETY: the caller gives `capacity` bytes at `name` and one word at each other pointer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), name as *mut u8, n);
+            *name.add(n) = 0;
+            *index = u64::from(constant.index());
+            *data_type = u64::from(constant.data_type().as_raw());
+            *required = constant.is_required();
+        }
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_constant_name_size(function: *const NmbFunction, at: u32) -> usize {
+    guard(0, || {
+        let constants = get(function)?.0.function_constants_dictionary().map_err(e("function constants"))?;
+        Ok(constants.iter().nth(at as usize).ok_or("no such constant")?.0.len() + 1)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_viewports(encoder: *mut NmbEncoder, values: *const f64, count: usize) -> bool {
+    guard(false, || {
+        if count == 0 || count > 16 || values.is_null() { return Err("invalid viewport array".into()); }
+        let v = unsafe { std::slice::from_raw_parts(values, count * 6) };
+        let viewports: Vec<_> = v.chunks_exact(6).map(|v| Viewport { origin_x:v[0], origin_y:v[1], width:v[2], height:v[3], znear:v[4], zfar:v[5] }).collect();
+        render(encoder)?.set_viewports(&viewports).map_err(e("viewports"))?;
+        Ok(true)
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_scissors(encoder: *mut NmbEncoder, values: *const u64, count: usize) -> bool {
+    guard(false, || {
+        if count == 0 || count > 16 || values.is_null() { return Err("invalid scissor array".into()); }
+        let v = unsafe { std::slice::from_raw_parts(values, count * 4) };
+        let rects: Vec<_> = v.chunks_exact(4).map(|v| ScissorRect::new(v[0],v[1],v[2],v[3])).collect();
+        render(encoder)?.set_scissor_rects(&rects).map_err(e("scissor rectangles"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_allocated_size(texture: *const NmbTexture) -> u64 {
+    guard(0, || Ok(get(texture)?.0.backing_allocation_size()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_current_allocated_size(device: *const NmbDevice) -> u64 {
+    guard(0, || {
+        let w = get(device)?.0.work_counts();
+        Ok(w.pooled_memory_bytes_live.saturating_add(w.empty_memory_bytes_live)
+            .saturating_add(w.dedicated_memory_bytes_live).saturating_add(w.imported_memory_bytes_live))
+    })
+}
+
+/// Set the link symbol while retaining the source definition and its constants.
+///
+/// # Safety
+/// `name` is null or a readable, NUL-terminated UTF-8 string; `function` is live and exclusively borrowed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_set_specialized_name(function: *mut NmbFunction, name: *const c_char) -> bool {
+    guard(false, || {
+        let name = if name.is_null() { None } else { Some(unsafe { CStr::from_ptr(name) }.to_str().map_err(|_| "invalid function alias")?.to_string()) };
+        let function = get_mut(function)?;
+        function.0 = function.0.clone().with_specialized_name(name);
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_queue_new_with_max_command_buffer_count(device: *mut NmbDevice, count: usize) -> *mut NmbQueue {
+    guard(std::ptr::null_mut(), || {
+        let queue = get(device)?.0.new_command_queue_with_max_command_buffer_count(count).map_err(e("command queue"))?;
+        Ok(Box::into_raw(Box::new(NmbQueue(queue))))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_diagnostic_id(buffer: *const NmbCommandBuffer) -> u64 {
+    guard(0, || Ok(get(buffer)?.0.diagnostic_id()))
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_gpu_diagnostic_hook(hook: extern "C" fn(u32,u64,u64,u64)) {
+    metal2vulkan_runtime::stage_trace::set_diagnostic_hook(hook);
 }

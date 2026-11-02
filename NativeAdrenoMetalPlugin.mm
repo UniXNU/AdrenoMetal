@@ -8,6 +8,7 @@
 // gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
 // own GPU plugin.
 #import <Foundation/Foundation.h>
+#include "SharedShaderCache.h"
 #include <pthread.h>
 #include <thread>
 #include <dlfcn.h>
@@ -242,15 +243,17 @@ static id clientDevice(unsigned port) {
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-    char candidates[2][512] = {};
+    char candidates[3][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
+    strlcpy(candidates[2], sharedShaderCacheDirectory().c_str(), sizeof candidates[2]);
     id device = nil;
     const char *lastError = "";
     unsigned usable = 0;
-    for (unsigned i = 0; i < 2 && !device; ++i) {
+    for (unsigned i : {2u, 0u, 1u}) {
+        if (device) break;
         if (!candidates[i][0]) continue;
-        strlcat(candidates[i], "m2v", sizeof candidates[i]);
+        if (i != 2) strlcat(candidates[i], "m2v", sizeof candidates[i]);
         mkdir(candidates[i], 0700);
         if (access(candidates[i], W_OK) != 0) continue;
         ++usable;
@@ -321,8 +324,11 @@ static id deviceForPort(unsigned port) {
         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
-        if (bootArgSet("sheng-diag=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (bootArgSet("sheng-gpu-pixels=1")) setenv("SHENG_GPU_PIXELS", "1", 1);
         else unsetenv("SHENG_DIAG");
+        if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
@@ -425,17 +431,12 @@ static id deviceForPort(unsigned port) {
                 pthread_detach(reader);
         }
 #endif
-        // On an iPad the render server's queue runs at a high GPU priority (CoreAnimation asks for it with setGPUPriority: when it makes
-        // its MetalContext). A Vulkan queue's priority is fixed when the device opens, before that call, so the render server asks the
-        // runtime for it here (patches/metal2vulkan/0012): where the host offers priorities, its frames no longer wait on the GPU behind
-        // an app's.
-        setenv("METAL2VULKAN_QUEUE_PRIORITY", "high", 0);
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
         // (sheng-diag=1).
         if (getenv("SHENG_DIAG")) setenv("METAL2VULKAN_LOG_PIPELINES", "1", 0);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-        char candidates[5][512] = {};
+        char candidates[6][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
         strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
@@ -448,17 +449,18 @@ static id deviceForPort(unsigned port) {
             mkdir(candidates[4], 0700);
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
-        static const unsigned order[] = {4, 0, 1, 2, 3};
+        strlcpy(candidates[5], sharedShaderCacheDirectory().c_str(), sizeof candidates[5]);
+        static const unsigned order[] = {5, 4, 0, 1, 2, 3};
         for (unsigned i : order) {
             if (device) break;
             if (!candidates[i][0]) continue;
-            strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            if (i != 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
             // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
-                if (!once) {once = true; removeHalfImported(candidates[i]);}
+                if (!once && i != 5) {once = true; removeHalfImported(candidates[i]);}
             }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.

@@ -1,0 +1,1081 @@
+diff --git a/crates/metal2vulkan-air/src/canon/devirt_tests.rs b/crates/metal2vulkan-air/src/canon/devirt_tests.rs
+index 4b23e82..dea08da 100644
+--- a/crates/metal2vulkan-air/src/canon/devirt_tests.rs
++++ b/crates/metal2vulkan-air/src/canon/devirt_tests.rs
+@@ -229,6 +229,7 @@ fn candidates() -> LinkedModule {
+             .into_iter()
+             .zip(2..)
+             .map(|(name, word)| LinkedName {
++                source_name: None,
+                 name: name.as_bytes().into(),
+                 constants: Ok(BTreeMap::new()),
+                 handle: Some(word),
+@@ -388,6 +389,7 @@ fn a_table_call_without_candidates_is_the_empty_switch() {
+ fn an_unimportable_candidate_is_refused_at_a_surviving_call() {
+     let broken = || LinkedModule {
+         functions: vec![LinkedName {
++            source_name: None,
+             name: b"inc".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+@@ -469,6 +471,7 @@ fn a_candidate_calling_through_its_table_recurses_on_a_call_stack() {
+     }];
+     let linked = LinkedModule {
+         functions: vec![LinkedName {
++            source_name: None,
+             name: b"rec".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+@@ -740,6 +743,7 @@ fn pointer_candidates() -> LinkedModule {
+             .into_iter()
+             .zip(2..)
+             .map(|(name, word)| LinkedName {
++                source_name: None,
+                 name: name.as_bytes().into(),
+                 constants: Ok(BTreeMap::new()),
+                 handle: Some(word),
+@@ -1404,6 +1408,7 @@ fn inlining_candidates_at_every_table_call_is_capped() {
+     }];
+     let linked = LinkedModule {
+         functions: vec![LinkedName {
++            source_name: None,
+             name: b"big".as_slice().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: Some(2),
+diff --git a/crates/metal2vulkan-air/src/canon/link.rs b/crates/metal2vulkan-air/src/canon/link.rs
+index 6dac3b0..87bdea7 100644
+--- a/crates/metal2vulkan-air/src/canon/link.rs
++++ b/crates/metal2vulkan-air/src/canon/link.rs
+@@ -74,6 +74,8 @@ pub struct LinkedModule {
+ /// index, or why those values do not apply to its module (refused only at a surviving call).
+ #[derive(Clone, Debug)]
+ pub struct LinkedName {
++    /// The definition in the source module. None uses the exported `name`.
++    pub source_name: Option<Box<[u8]>>,
+     /// The Metal function name it links under.
+     pub name: Box<[u8]>,
+     /// The function-constant values it was specialized with, by index, or why they do not apply
+@@ -517,7 +519,8 @@ fn link_in(
+                         Ok(def) => Ok(def),
+                         Err(error) => Err(Unimported {
+                             error,
+-                            ty: source_type(l, &f.name, m)?.map(|t| (i, t)),
++                            ty: source_type(l, f.source_name.as_deref().unwrap_or(&f.name), m)?
++                                .map(|t| (i, t)),
+                         }),
+                     };
+                     m.charge(std::mem::size_of::<Candidate>() + f.name.len())?;
+@@ -827,7 +830,7 @@ fn plan(
+         l.module
+             .func(v.func)
+             .and_then(|f| l.module.symbols().get(f.name))
+-            == Some(name)
++            == Some(f.source_name.as_deref().unwrap_or(name))
+     });
+     let Some(func) = visible.map(|v| v.func) else {
+         return Ok(Err(link_problem(name, LinkProblem::NotVisible)));
+diff --git a/crates/metal2vulkan-air/src/canon/link_tests.rs b/crates/metal2vulkan-air/src/canon/link_tests.rs
+index f669435..b24fa04 100644
+--- a/crates/metal2vulkan-air/src/canon/link_tests.rs
++++ b/crates/metal2vulkan-air/src/canon/link_tests.rs
+@@ -232,6 +232,7 @@ fn callee(name: &str, calls: &[&str]) -> LinkedModule {
+ fn linked(name: &str, module: Module, abi: AirAbi) -> LinkedModule {
+     LinkedModule {
+         functions: vec![LinkedName {
++            source_name: None,
+             name: name.as_bytes().into(),
+             constants: Ok(BTreeMap::new()),
+             handle: None,
+diff --git a/crates/metal2vulkan-runtime/src/library.rs b/crates/metal2vulkan-runtime/src/library.rs
+index 561af08..3be3f9e 100644
+--- a/crates/metal2vulkan-runtime/src/library.rs
++++ b/crates/metal2vulkan-runtime/src/library.rs
+@@ -88,6 +88,7 @@ pub struct Function {
+     /// The options the function was made with (`newFunctionWithDescriptor:`); none for the
+     /// other forms.
+     options: FunctionOptions,
++    specialized_name: Option<String>,
+     /// What the function object holds of the sampler IDs its function's pipeline states
+     /// numbered, shared with every function object of the same function of its library
+     /// (`resource_ids/numbered.rs`); held for its drop.
+@@ -100,6 +101,8 @@ pub struct Function {
+ pub struct FunctionDescriptor {
+     /// `name`.
+     pub name: String,
++    /// `specializedName`: the exported symbol; None retains the original name.
++    pub specialized_name: Option<String>,
+     /// `constantValues`: `None` for nil, the function as `newFunctionWithName:` makes it.
+     pub constant_values: Option<FunctionConstantValues>,
+     /// `options`. `COMPILE_TO_BINARY` makes a function a stage's `binary_functions` and a made
+@@ -114,6 +117,7 @@ impl FunctionDescriptor {
+     pub fn new(name: &str) -> FunctionDescriptor {
+         FunctionDescriptor {
+             name: name.to_string(),
++            specialized_name: None,
+             constant_values: None,
+             options: FunctionOptions::NONE,
+         }
+@@ -263,6 +267,7 @@ impl Library {
+             )?,
+         };
+         function.options = descriptor.options;
++        function.specialized_name = descriptor.specialized_name.clone();
+         Ok(function)
+     }
+ 
+@@ -289,6 +294,7 @@ impl Library {
+             properties: Arc::default(),
+             constants_dictionary: Arc::default(),
+             options: FunctionOptions::NONE,
++            specialized_name: None,
+             _holds: holds,
+         })
+     }
+@@ -320,6 +326,12 @@ impl Library {
+ }
+ 
+ impl Function {
++    /// Return the function with a new exported name, retaining its source and specialization.
++    pub fn with_specialized_name(mut self, name: Option<String>) -> Self {
++        self.specialized_name = name;
++        self
++    }
++
+     /// `device`.
+     pub fn device(&self) -> &Device {
+         &self.device
+@@ -327,7 +339,9 @@ impl Function {
+ 
+     /// `name`.
+     pub fn name(&self) -> &str {
+-        self.function.info().name
++        self.specialized_name
++            .as_deref()
++            .unwrap_or(self.function.info().name)
+     }
+ 
+     /// `options`: the options a [`FunctionDescriptor`] made the function with; none for a
+@@ -467,6 +481,7 @@ impl Function {
+     /// [`LinkedFunctions`]: metal2vulkan::pipeline::LinkedFunctions
+     pub fn linked_function(&self) -> LinkedFunction {
+         LinkedFunction::new(self.function.clone())
++            .with_specialized_name(self.specialized_name.clone())
+             .with_constants(self.constants.clone())
+             .with_precompiled(self.precompiled())
+     }
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 8baf3de..a6a0e92 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -4929,6 +4929,30 @@ impl Texture {
+         self.heap_place().map(|place| place.size)
+     }
+ 
++    /// The bytes placed for this texture's backing image, for a native frontend's
++    /// `MTLResource.allocatedSize` accounting. This reports Vulkan storage rather
++    /// than Apple's texture layout. Heap textures use their allocated range;
++    /// buffer textures share their buffer's length. Unowned and sparse images
++    /// return zero because their allocation is not owned by this texture.
++    pub fn backing_allocation_size(&self) -> u64 {
++        if let Some(size) = self.allocated_size() {
++            return size;
++        }
++        if let Some(texels) = self.buffer_texels() {
++            return texels.buffer.length();
++        }
++        let Ok(image) = self.image() else {
++            return 0;
++        };
++        match &image.owner {
++            Owner::Runtime { placement, .. } => placement.size(),
++            Owner::HeapShadow(shadow) => shadow.placement.size(),
++            Owner::HeapUnaliased(unaliased) => unaliased.placement.size(),
++            Owner::ViewShadow(shadow) => shadow.placement.size(),
++            _ => 0,
++        }
++    }
++
+     /// `makeAliasable`: a heap texture's bytes may be another resource's from now on. An
+     /// automatic heap gives its range to the next resource it places; a placement heap's texture
+     /// is aliasable from the start, so nothing changes. Using the texture after is the program's
+diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
+index 521db0f..4c01c9b 100644
+--- a/crates/metal2vulkan/src/cache/mod.rs
++++ b/crates/metal2vulkan/src/cache/mod.rs
+@@ -60,7 +60,7 @@ mod tests;
+ /// unchanged version, and its bless records the version. Independent of the crate's version and of
+ /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
+ /// history.
+-pub const SEMANTICS_VERSION: u32 = 1922;
++pub const SEMANTICS_VERSION: u32 = 1923;
+ 
+ /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
+ /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
+diff --git a/crates/metal2vulkan/src/lower/access/blob.rs b/crates/metal2vulkan/src/lower/access/blob.rs
+index 1ed5aed..130f80c 100644
+--- a/crates/metal2vulkan/src/lower/access/blob.rs
++++ b/crates/metal2vulkan/src/lower/access/blob.rs
+@@ -169,13 +169,45 @@ pub fn blob_ptr(cx: &SelectCx<'_>, v: Value) -> Result<LocalPtr, Error> {
+     let Value::Const(c) = v else {
+         return Ok(LocalPtr::Value(operand(cx, v)?));
+     };
+-    match cx.entry.module.consts().get(c).map(|k| &k.value) {
+-        Some(Const::GlobalAddr(g)) => {
+-            let off = global_offset(cx.memory, *g).ok_or_else(refuse)?;
+-            Ok(LocalPtr::Offset(u32::try_from(off).map_err(|_| refuse())?))
++    blob_const_offset(cx, c).map(LocalPtr::Offset)
++}
++
++/// Constant pointer expressions preserve the blob's byte offset through casts
++/// and constant GEPs. Walk the expression chain without recursive stack growth.
++fn blob_const_offset(cx: &SelectCx<'_>, mut c: crate::air::ir::ConstId) -> Result<u32, Error> {
++    use crate::air::ir::ConstExpr;
++    let mut displacement = 0i64;
++    for _ in 0..cx.entry.module.consts().len() {
++        match cx.entry.module.consts().get(c).map(|k| &k.value) {
++            Some(Const::GlobalAddr(g)) => {
++                let base = global_offset(cx.memory, *g).ok_or_else(refuse)?;
++                let base = i64::try_from(base).map_err(|_| refuse())?;
++                return u32::try_from(base.checked_add(displacement).ok_or_else(refuse)?)
++                    .map_err(|_| refuse());
++            }
++            Some(Const::Expr(ConstExpr::Cast {
++                op: CastOp::Bitcast | CastOp::AddrSpaceCast,
++                ops,
++            })) => {
++                c = *ops.first().ok_or_else(refuse)?;
++            }
++            Some(Const::Expr(ConstExpr::Gep { src_ty, ops, .. })) => {
++                let (base, indices) = ops.split_first().ok_or_else(refuse)?;
++                let indices: Vec<Value> = indices.iter().copied().map(Value::Const).collect();
++                let (delta, strides) = crate::memory::provenance::gep_displacement(
++                    cx.entry,
++                    &cx.memory.layouts,
++                    *src_ty,
++                    &indices,
++                )?;
++                let delta = delta.filter(|_| strides.is_empty()).ok_or_else(refuse)?;
++                displacement = displacement.checked_add(delta).ok_or_else(refuse)?;
++                c = *base;
++            }
++            _ => return Err(refuse()),
+         }
+-        _ => Err(refuse()),
+     }
++    Err(refuse())
+ }
+ 
+ /// A leaf load of AIR type `ty` with alignment `align` through blob pointer `ptr`.
+diff --git a/crates/metal2vulkan/src/memory/plan.rs b/crates/metal2vulkan/src/memory/plan.rs
+index 02a2386..2c02ee1 100644
+--- a/crates/metal2vulkan/src/memory/plan.rs
++++ b/crates/metal2vulkan/src/memory/plan.rs
+@@ -33,7 +33,8 @@
+ //!   lowered representation, an open one a buffer pointer as its 8-byte guest address.
+ //! - **Constant globals**: a closed, type-consistent constant is a `Private` variable with its
+ //!   initializer, unless its type would take the function's typed objects past
+-//!   `alloca::MAX_UNSHARED`; any other one is placed in the **constant blob**, the byte image the
++//!   `alloca::MAX_UNSHARED` or dynamic indexing reaches a table larger than 4 KiB. Other globals
++//!   are placed in the **constant blob**, the byte image the
+ //!   artifact carries (`WriteSource::ConstantBlob`).
+ //! - **Needs**: dynamic roots, the handle classes that need the handle table, and whether a guest
+ //!   base is needed.
+@@ -1059,28 +1060,39 @@ impl Planner<'_> {
+                 let closed = !u.merged && !u.escapes && !u.stored && !u.cross_compare && !u.write;
+                 // A type no typed object holds stays `Private`: selection refuses it, as before,
+                 // which only sends a typed object past the room to the blob.
+-                let form =
+-                    if closed && u.typed && self.fit(global.value_ty, room, m)? != Fit::OverRoom {
+-                        ConstGlobalForm::Private
+-                    } else {
+-                        let align = self.global_align(g, global.value_ty)?;
+-                        let size = self
+-                            .layouts
+-                            .alloc_size(global.value_ty)
+-                            .ok_or_else(not_lowered)?;
+-                        let offset = round_up(*len as u64, align).ok_or_else(not_lowered)?;
+-                        let end = offset.checked_add(size).ok_or_else(not_lowered)?;
+-                        let end = usize::try_from(end).map_err(|_| not_lowered())?;
+-                        // The initializer's refusals; its bytes and its writing's work are charged
+-                        // once every initializer is checked.
+-                        let nodes = self.blob_nodes(init, global.value_ty, m)?;
+-                        let at = usize::try_from(offset).map_err(|_| not_lowered())?;
+-                        grow(placed, 1, m)?;
+-                        placed.push((init, global.value_ty, at));
+-                        provenance::push_working(&mut costs, (end, nodes), &mut working, m)?;
+-                        *len = end;
+-                        ConstGlobalForm::Blob { offset }
+-                    };
++                // Dynamically indexed tables above 4 KiB are shared read-only data.
++                // Private storage would replicate the table in every shader invocation.
++                let large_indexed = u.indexed
++                    && self
++                        .layouts
++                        .alloc_size(global.value_ty)
++                        .ok_or_else(not_lowered)?
++                        > 4096;
++                let form = if closed
++                    && u.typed
++                    && !large_indexed
++                    && self.fit(global.value_ty, room, m)? != Fit::OverRoom
++                {
++                    ConstGlobalForm::Private
++                } else {
++                    let align = self.global_align(g, global.value_ty)?;
++                    let size = self
++                        .layouts
++                        .alloc_size(global.value_ty)
++                        .ok_or_else(not_lowered)?;
++                    let offset = round_up(*len as u64, align).ok_or_else(not_lowered)?;
++                    let end = offset.checked_add(size).ok_or_else(not_lowered)?;
++                    let end = usize::try_from(end).map_err(|_| not_lowered())?;
++                    // The initializer's refusals; its bytes and its writing's work are charged
++                    // once every initializer is checked.
++                    let nodes = self.blob_nodes(init, global.value_ty, m)?;
++                    let at = usize::try_from(offset).map_err(|_| not_lowered())?;
++                    grow(placed, 1, m)?;
++                    placed.push((init, global.value_ty, at));
++                    provenance::push_working(&mut costs, (end, nodes), &mut working, m)?;
++                    *len = end;
++                    ConstGlobalForm::Blob { offset }
++                };
+                 grow(out, 1, m)?;
+                 out.push(ConstGlobalPlan { global: g, form });
+             }
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index 678cb8a..6e5b7c6 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -281,6 +281,12 @@ pub struct LinkedSource<'a> {
+ }
+ 
+ impl<'a> LinkedSource<'a> {
++    /// Link the source definition under a distinct exported name.
++    pub fn with_specialized_name(mut self, name: &'a str) -> Self {
++        self.key.name = name;
++        self
++    }
++
+     /// The function `name` of `functions` (`MTLLinkedFunctions.functions`), defined in the module
+     /// `bitcode` (hashed here), specialized with `constants`.
+     pub fn new(
+@@ -292,6 +298,7 @@ impl<'a> LinkedSource<'a> {
+             key: LinkedKey {
+                 list: crate::pipeline::descriptor::LinkedList::Functions,
+                 name,
++                source_name: name,
+                 air_hash: container::sha256(bitcode),
+                 constants,
+             },
+@@ -308,7 +315,8 @@ pub(crate) fn linked_keys(linked: &LinkedFunctions) -> Vec<LinkedKey<'_>> {
+             let info = f.function.info();
+             LinkedKey {
+                 list,
+-                name: info.name,
++                name: f.specialized_name.as_deref().unwrap_or(info.name),
++                source_name: info.name,
+                 air_hash: info.air_hash,
+                 constants: &f.constants,
+             }
+@@ -1669,7 +1677,7 @@ pub(crate) fn linked_modules(
+     let keys: Vec<LinkedKey<'_>> = linked.iter().map(|s| s.key).collect();
+     let handles = crate::pipeline::table::handles(&keys);
+     let mut out: Vec<(Hash256, LinkedModule)> = Vec::new();
+-    let mut listed: Vec<(Hash256, &str, &FunctionConstantValues)> = Vec::new();
++    let mut listed: Vec<(Hash256, &str, &str, &FunctionConstantValues)> = Vec::new();
+     let mut seen: BTreeSet<Box<[u8]>> = BTreeSet::new();
+     let mut queue: VecDeque<Box<[u8]>> = VecDeque::new();
+     let tables = abi.entries.iter().any(|e| {
+@@ -1708,14 +1716,21 @@ pub(crate) fn linked_modules(
+                 continue;
+             }
+             // The same function listed twice (in two lists, or twice in one) is one function.
+-            if listed
+-                .iter()
+-                .any(|(h, n, c)| *h == key.air_hash && *n == key.name && *c == key.constants)
+-            {
++            if listed.iter().any(|(h, n, src, c)| {
++                *h == key.air_hash
++                    && *n == key.name
++                    && *src == key.source_name
++                    && *c == key.constants
++            }) {
+                 continue;
+             }
+-            m.charge(std::mem::size_of::<(Hash256, &str, &FunctionConstantValues)>())?;
+-            listed.push((key.air_hash, key.name, key.constants));
++            m.charge(std::mem::size_of::<(
++                Hash256,
++                &str,
++                &str,
++                &FunctionConstantValues,
++            )>())?;
++            listed.push((key.air_hash, key.name, key.source_name, key.constants));
+             let at = match out.iter().position(|(h, _)| *h == key.air_hash) {
+                 Some(at) => at,
+                 None => {
+@@ -1747,8 +1762,9 @@ pub(crate) fn linked_modules(
+                 // Refused for the module's code first.
+                 Err(_) => Ok(BTreeMap::new()),
+             };
+-            m.charge(std::mem::size_of::<LinkedName>())?;
++            m.charge(std::mem::size_of::<LinkedName>() + key.source_name.len())?;
+             l.functions.push(LinkedName {
++                source_name: Some(key.source_name.as_bytes().into()),
+                 name: name.clone(),
+                 constants,
+                 handle: handle.map(|h| h.word()),
+@@ -1762,9 +1778,9 @@ pub(crate) fn linked_modules(
+     for (s, handle) in linked.iter().zip(&handles) {
+         m.tick(1)?;
+         let key = &s.key;
+-        let reached = listed
+-            .iter()
+-            .any(|(h, n, c)| *h == key.air_hash && *n == key.name && *c == key.constants);
++        let reached = listed.iter().any(|(h, n, src, c)| {
++            *h == key.air_hash && *n == key.name && *src == key.source_name && *c == key.constants
++        });
+         if handle.is_none() || reached {
+             continue;
+         }
+@@ -1797,10 +1813,16 @@ pub(crate) fn linked_modules(
+             }
+             _ => continue,
+         };
+-        m.charge(std::mem::size_of::<(Hash256, &str, &FunctionConstantValues)>())?;
+-        listed.push((key.air_hash, key.name, key.constants));
+-        m.charge(std::mem::size_of::<LinkedName>() + key.name.len())?;
++        m.charge(std::mem::size_of::<(
++            Hash256,
++            &str,
++            &str,
++            &FunctionConstantValues,
++        )>())?;
++        listed.push((key.air_hash, key.name, key.source_name, key.constants));
++        m.charge(std::mem::size_of::<LinkedName>() + key.name.len() + key.source_name.len())?;
+         l.functions.push(LinkedName {
++            source_name: Some(key.source_name.as_bytes().into()),
+             name: key.name.as_bytes().into(),
+             constants,
+             handle: handle.map(|h| h.word()),
+diff --git a/crates/metal2vulkan/src/pipeline/compile/key.rs b/crates/metal2vulkan/src/pipeline/compile/key.rs
+index a02631d..c5362e0 100644
+--- a/crates/metal2vulkan/src/pipeline/compile/key.rs
++++ b/crates/metal2vulkan/src/pipeline/compile/key.rs
+@@ -34,6 +34,7 @@ use crate::pipeline::descriptor::{
+ pub struct LinkedKey<'a> {
+     pub list: LinkedList<'a>,
+     pub name: &'a str,
++    pub source_name: &'a str,
+     pub air_hash: Hash256,
+     pub constants: &'a FunctionConstantValues,
+ }
+@@ -480,6 +481,10 @@ pub fn function_key(
+                 LinkedList::Group(name) => h.u64(3).bytes(name.as_bytes()),
+             };
+             h.bytes(&l.air_hash).bytes(l.name.as_bytes());
++            if l.source_name != l.name {
++                h.bytes(b"specialized-source")
++                    .bytes(l.source_name.as_bytes());
++            }
+             constants(&mut h, l.constants);
+         }
+     }
+diff --git a/crates/metal2vulkan/src/pipeline/descriptor.rs b/crates/metal2vulkan/src/pipeline/descriptor.rs
+index 01b2814..c3218ff 100644
+--- a/crates/metal2vulkan/src/pipeline/descriptor.rs
++++ b/crates/metal2vulkan/src/pipeline/descriptor.rs
+@@ -246,6 +246,8 @@ impl LinkedList<'_> {
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub struct LinkedFunction {
+     pub function: Function,
++    /// The symbol exported for visible references and function tables. None keeps the library name.
++    pub specialized_name: Option<String>,
+     pub constants: FunctionConstantValues,
+     /// The function was made compiled to a binary (`MTLFunctionOptionCompileToBinary`), as
+     /// Metal requires of a function in `binary_functions` and of a binary function added to a
+@@ -255,10 +257,17 @@ pub struct LinkedFunction {
+ }
+ 
+ impl LinkedFunction {
++    /// Export this function under `name`, retaining its original definition and constants.
++    pub fn with_specialized_name(mut self, name: Option<String>) -> Self {
++        self.specialized_name = name;
++        self
++    }
++
+     /// `function` with no constant values, not compiled to a binary.
+     pub fn new(function: Function) -> LinkedFunction {
+         LinkedFunction {
+             function,
++            specialized_name: None,
+             constants: FunctionConstantValues::defaults(),
+             precompiled: false,
+         }
+diff --git a/crates/metal2vulkan/src/pipeline/table.rs b/crates/metal2vulkan/src/pipeline/table.rs
+index 4154b74..afbc64d 100644
+--- a/crates/metal2vulkan/src/pipeline/table.rs
++++ b/crates/metal2vulkan/src/pipeline/table.rs
+@@ -66,18 +66,18 @@ fn callable(list: LinkedList<'_>) -> bool {
+ /// numbered in order, one function (its AIR hash, name, and constants) listed twice having one
+ /// handle. A function no callable list has has none.
+ pub(crate) fn handles(keys: &[LinkedKey<'_>]) -> Vec<Option<FunctionHandle>> {
+-    let mut callable_keys: Vec<(&[u8; 32], &str, &FunctionConstantValues)> = Vec::new();
++    let mut callable_keys: Vec<(&[u8; 32], &str, &str, &FunctionConstantValues)> = Vec::new();
+     for k in keys.iter().filter(|k| callable(k.list)) {
+-        let id = (&k.air_hash, k.name, k.constants);
++        let id = (&k.air_hash, k.name, k.source_name, k.constants);
+         if !callable_keys.contains(&id) {
+             callable_keys.push(id);
+         }
+     }
+     keys.iter()
+         .map(|k| {
+-            let at = callable_keys
+-                .iter()
+-                .position(|&(h, n, c)| h == &k.air_hash && n == k.name && c == k.constants)?;
++            let at = callable_keys.iter().position(|&(h, n, src, c)| {
++                h == &k.air_hash && n == k.name && src == k.source_name && c == k.constants
++            })?;
+             FunctionHandle::nth(at)
+         })
+         .collect()
+@@ -94,7 +94,8 @@ impl LinkedFunctions {
+         let at = keys.iter().position(|k| {
+             callable(k.list)
+                 && k.air_hash == info.air_hash
+-                && k.name == info.name
++                && k.name == f.specialized_name.as_deref().unwrap_or(info.name)
++                && k.source_name == info.name
+                 && *k.constants == f.constants
+         })?;
+         handles(&keys).get(at).copied().flatten()
+@@ -115,6 +116,7 @@ mod tests {
+         LinkedKey {
+             list,
+             name,
++            source_name: name,
+             air_hash: [hash; 32],
+             constants,
+         }
+diff --git a/crates/metal2vulkan/src/tests/engine_arena.rs b/crates/metal2vulkan/src/tests/engine_arena.rs
+index d7666ed..8f68efa 100644
+--- a/crates/metal2vulkan/src/tests/engine_arena.rs
++++ b/crates/metal2vulkan/src/tests/engine_arena.rs
+@@ -1827,3 +1827,48 @@ fn an_integer_threadgroup_address_outside_the_static_objects_is_refused() {
+         }
+     }
+ }
++
++/// Indexed constant tables keep their values across the private/blob threshold,
++/// including a constant-expression pointer that enters halfway through the table.
++#[test]
++fn indexed_constant_tables_use_shared_storage_above_four_kib() {
++    for count in [1024, 1025, 4096] {
++        let values = (0..count)
++            .map(|i| format!("i32 {}", i * 3))
++            .collect::<Vec<_>>()
++            .join(", ");
++        let globals = format!(
++            "@table = internal addrspace(2) constant [{count} x i32] [{values}], align 4\n"
++        );
++        let body = format!(
++            r#"  %p = getelementptr i32, ptr addrspace(2) getelementptr ([{count} x i32], ptr addrspace(2) @table, i64 0, i64 128), i32 %t
++  %v0 = load volatile i32, ptr addrspace(2) %p, align 4
++  %v1 = load volatile i32, ptr addrspace(2) getelementptr ([{count} x i32], ptr addrspace(2) @table, i64 0, i64 7), align 4"#
++        );
++        let Some(bc) = assemble(
++            &format!("indexed_table_{count}"),
++            &two_word_kernel("table_read", &globals, &body),
++        ) else {
++            return;
++        };
++        let prof = p("lavapipe");
++        l3(&bc, "table_read", &prof, "indexed_table");
++        let (plan, module) = typed_module(&bc, "table_read", &prof).expect("indexed table");
++        let blob = plan.families.access.blob.as_ref();
++        assert_eq!(blob.is_some(), count > 1024);
++        let mut res = resources(&plan, 0, 64, 32, &[]);
++        if let Some(blob) = blob {
++            res.buffers.push(Buffer {
++                slot: Some(ResourceSlot {
++                    stage: Stage::Kernel,
++                    kind: ResourceKind::Synthetic(SyntheticBinding::ConstantBlob),
++                    index: 0,
++                }),
++                address: None,
++                bytes: blob.bytes.to_vec(),
++            });
++        }
++        let want: Vec<u32> = (0..32).flat_map(|t| [(128 + t) * 3, 21]).collect();
++        assert_eq!(run_both(&module, &res).expect("table output"), want);
++    }
++}
+diff --git a/crates/metal2vulkan/src/tests/engine_linking.rs b/crates/metal2vulkan/src/tests/engine_linking.rs
+index f8768e3..0296860 100644
+--- a/crates/metal2vulkan/src/tests/engine_linking.rs
++++ b/crates/metal2vulkan/src/tests/engine_linking.rs
+@@ -587,3 +587,86 @@ fn a_linked_function_s_constexpr_sampler_is_numbered() {
+     assert_eq!(e.interface.numbered_samplers, []);
+     assert!(!noted(&e), "{:?}", e.precision);
+ }
++
++/// Export aliases select their exact definition even when the same module contains
++/// several visible functions. The alias is part of the cache and function-table identity.
++#[test]
++fn specialized_names_resolve_exact_definitions_and_keys() {
++    let Some(caller) = fixture(CALLER) else {
++        return;
++    };
++    let Some(functions) = edited(FUNCTIONS, |text| {
++        text.replace("linked_scale", "source_scale")
++    }) else {
++        return;
++    };
++    let none = FunctionConstantValues::defaults();
++    let scale = LinkedSource::new("source_scale", &functions, &none);
++    let blend = LinkedSource::new("linked_blend", &functions, &none);
++    let offset = LinkedSource::new("linked_offset", &caller, &none);
++    assert_eq!(
++        compile_linked(&caller, &[scale, blend, offset], "moltenvk-m3").map(|_| ()),
++        Err(needs("linked_scale"))
++    );
++    let renamed = scale.with_specialized_name("linked_scale");
++    let p = profile("moltenvk-m3", DevicePolicy::default()).expect("profile");
++    let compiled =
++        compile_linked(&caller, &[renamed, blend, offset], "moltenvk-m3").expect("alias linked");
++    link_and_validate(&compiled, &p).expect("valid alias module");
++    let (_, module) =
++        typed_module_linked(&caller, CALLER, &p, &[renamed, blend, offset]).expect("module");
++    let buffer = |index| Buffer {
++        slot: Some(ResourceSlot {
++            stage: Stage::Kernel,
++            kind: ResourceKind::Buffer,
++            index,
++        }),
++        address: None,
++        bytes: vec![0; 32 * 4],
++    };
++    let out = run(
++        &module,
++        &Config {
++            workgroups: [32, 1, 1],
++            ..Config::default()
++        },
++        Resources {
++            buffers: vec![buffer(0), buffer(1)],
++            push: vec![0; 128],
++            spec: Default::default(),
++        },
++    )
++    .expect("execution");
++    for i in 0..32usize {
++        assert_eq!(
++            &out.buffers[0][i * 4..i * 4 + 4],
++            &(3 * i as u32 + (i as u32 & 7)).to_le_bytes()
++        );
++        assert_eq!(
++            &out.buffers[1][i * 4..i * 4 + 4],
++            &(i as f32 * 0.5 + 1.0).to_le_bytes()
++        );
++    }
++    let lib = Library::from_air(&functions).expect("library");
++    let f = LinkedFunction::new(lib.function("source_scale").expect("source"));
++    let a = f.clone().with_specialized_name(Some("a".into()));
++    let b = f.clone().with_specialized_name(Some("b".into()));
++    let linked = LinkedFunctions::new()
++        .with_function(a.clone())
++        .with_function(b.clone());
++    assert_ne!(linked.function_handle(&a), linked.function_handle(&b));
++    assert_eq!(linked.function_handle(&f), None);
++    let dev = device("moltenvk-m3");
++    let entry = Library::from_air(&caller)
++        .expect("caller")
++        .function(CALLER)
++        .expect("entry");
++    let key = |f| {
++        dev.function_compile_key(
++            &FunctionDescriptor::new(entry.clone())
++                .with_linked(LinkedFunctions::new().with_function(f)),
++            &LowerInputs::new(),
++        )
++    };
++    assert_ne!(key(a), key(b));
++}
+diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
+index b407dd9..7ef3de8 100644
+--- a/crates/metal2vulkan/src/tests/fast_paths.rs
++++ b/crates/metal2vulkan/src/tests/fast_paths.rs
+@@ -78,7 +78,7 @@ fn choices() -> Vec<Choice> {
+         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
+         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
+         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
+-        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
++        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow, InPlaceWrites }),
+         choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
+         choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
+     ]
+diff --git a/crates/metal2vulkan/tests/api_signatures.tsv b/crates/metal2vulkan/tests/api_signatures.tsv
+index 1a23395..145fa90 100644
+--- a/crates/metal2vulkan/tests/api_signatures.tsv
++++ b/crates/metal2vulkan/tests/api_signatures.tsv
+@@ -1292,6 +1292,7 @@ enum	metal2vulkan-runtime::VisibilityProblem	#[derive(Clone, Debug, PartialEq, E
+ enum	metal2vulkan-runtime::VisibilityResultMode	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum VisibilityResultMode
+ enum	metal2vulkan-runtime::WrappedBufferProblem	#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[non_exhaustive] pub enum WrappedBufferProblem
+ enum	metal2vulkan-runtime::WrappedImageProblem	#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[non_exhaustive] pub enum WrappedImageProblem
++enum	metal2vulkan-runtime::stage_trace::Stage	#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[repr(u16)] pub enum Stage
+ enum	metal2vulkan::bind::AccessClass	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum AccessClass
+ enum	metal2vulkan::bind::ArgumentLayoutError	#[derive(Clone, Debug, PartialEq, Eq)] #[non_exhaustive] pub enum ArgumentLayoutError
+ enum	metal2vulkan::bind::ArgumentType	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub enum ArgumentType
+@@ -1531,6 +1532,7 @@ field	metal2vulkan-air::LinkedModule.functions	pub functions: Vec<LinkedName>
+ field	metal2vulkan-air::LinkedName.constants	pub constants: Result<BTreeMap<u32, ConstValue>, Error>
+ field	metal2vulkan-air::LinkedName.handle	pub handle: Option<u32>
+ field	metal2vulkan-air::LinkedName.name	pub name: Box<[u8]>
++field	metal2vulkan-air::LinkedName.source_name	pub source_name: Option<Box<[u8]>>
+ field	metal2vulkan-air::LinkedSamplerGroup.kept	pub kept: usize
+ field	metal2vulkan-air::LinkedSamplerGroup.library	pub library: bool
+ field	metal2vulkan-air::LinkedSamplerGroup.states	pub states: Vec<SamplerState>
+@@ -1935,6 +1937,9 @@ field	metal2vulkan-air::tensor_ops::RunForm.single_thread	pub single_thread: boo
+ field	metal2vulkan-air::tensor_ops::RunForm.v2	pub v2: bool
+ field	metal2vulkan-runtime::AddressRange.length	pub length: u64
+ field	metal2vulkan-runtime::AddressRange.start	pub start: GpuAddress
++field	metal2vulkan-runtime::AllocationSite.bytes	pub bytes: u64
++field	metal2vulkan-runtime::AllocationSite.count	pub count: u64
++field	metal2vulkan-runtime::AllocationSite.frames	pub frames: [usize; SITE_FRAMES]
+ field	metal2vulkan-runtime::BinaryArchiveDescriptor.url	pub url: Option<PathBuf>
+ field	metal2vulkan-runtime::BinaryArchiveMiss.function	pub function: String
+ field	metal2vulkan-runtime::BinaryArchiveMiss.pipeline	pub pipeline: ArchivedPipeline
+@@ -2070,6 +2075,7 @@ field	metal2vulkan-runtime::FailedPipeline.variant	pub variant: metal2vulkan::ca
+ field	metal2vulkan-runtime::FunctionDescriptor.constant_values	pub constant_values: Option<FunctionConstantValues>
+ field	metal2vulkan-runtime::FunctionDescriptor.name	pub name: String
+ field	metal2vulkan-runtime::FunctionDescriptor.options	pub options: FunctionOptions
++field	metal2vulkan-runtime::FunctionDescriptor.specialized_name	pub specialized_name: Option<String>
+ field	metal2vulkan-runtime::HeapDescriptor.heap_type	pub heap_type: HeapType
+ field	metal2vulkan-runtime::HeapDescriptor.placement	pub placement: AddressPlacement
+ field	metal2vulkan-runtime::HeapDescriptor.resource_options	pub resource_options: ResourceOptions
+@@ -2487,6 +2493,7 @@ field	metal2vulkan-runtime::WorkCounts.creation_render_pipelines_drawn	pub creat
+ field	metal2vulkan-runtime::WorkCounts.creation_render_pipelines_made	pub creation_render_pipelines_made: u64
+ field	metal2vulkan-runtime::WorkCounts.creations_left_making	pub creations_left_making: u64
+ field	metal2vulkan-runtime::WorkCounts.dedicated_memory_blocks_live	pub dedicated_memory_blocks_live: u64
++field	metal2vulkan-runtime::WorkCounts.dedicated_memory_bytes_live	pub dedicated_memory_bytes_live: u64
+ field	metal2vulkan-runtime::WorkCounts.depth_attachments_moved	pub depth_attachments_moved: u64
+ field	metal2vulkan-runtime::WorkCounts.depth_instances_held	pub depth_instances_held: u64
+ field	metal2vulkan-runtime::WorkCounts.descriptor_keys_built	pub descriptor_keys_built: u64
+@@ -2524,6 +2531,7 @@ field	metal2vulkan-runtime::WorkCounts.draws_pushing_set_zero	pub draws_pushing_
+ field	metal2vulkan-runtime::WorkCounts.draws_settled	pub draws_settled: u64
+ field	metal2vulkan-runtime::WorkCounts.driver_diagnostics_withheld	pub driver_diagnostics_withheld: u64
+ field	metal2vulkan-runtime::WorkCounts.empty_memory_blocks_live	pub empty_memory_blocks_live: u64
++field	metal2vulkan-runtime::WorkCounts.empty_memory_bytes_live	pub empty_memory_bytes_live: u64
+ field	metal2vulkan-runtime::WorkCounts.encoder_command_buffers_begun	pub encoder_command_buffers_begun: u64
+ field	metal2vulkan-runtime::WorkCounts.encoder_primaries_begun_ahead	pub encoder_primaries_begun_ahead: u64
+ field	metal2vulkan-runtime::WorkCounts.encoders_reencoded	pub encoders_reencoded: u64
+@@ -2637,6 +2645,7 @@ field	metal2vulkan-runtime::WorkCounts.host_textures_in_place	pub host_textures_
+ field	metal2vulkan-runtime::WorkCounts.idle_submits	pub idle_submits: u64
+ field	metal2vulkan-runtime::WorkCounts.image_blits_recorded	pub image_blits_recorded: u64
+ field	metal2vulkan-runtime::WorkCounts.images_started_on_the_host	pub images_started_on_the_host: u64
++field	metal2vulkan-runtime::WorkCounts.imported_memory_bytes_live	pub imported_memory_bytes_live: u64
+ field	metal2vulkan-runtime::WorkCounts.in_place_checks_failed	pub in_place_checks_failed: u64
+ field	metal2vulkan-runtime::WorkCounts.in_place_checks_passed	pub in_place_checks_passed: u64
+ field	metal2vulkan-runtime::WorkCounts.in_place_checks_recalled	pub in_place_checks_recalled: u64
+@@ -2704,6 +2713,8 @@ field	metal2vulkan-runtime::WorkCounts.pitched_host_images	pub pitched_host_imag
+ field	metal2vulkan-runtime::WorkCounts.pooled_backings_made	pub pooled_backings_made: u64
+ field	metal2vulkan-runtime::WorkCounts.pooled_memory_blocks_freed	pub pooled_memory_blocks_freed: u64
+ field	metal2vulkan-runtime::WorkCounts.pooled_memory_blocks_made	pub pooled_memory_blocks_made: u64
++field	metal2vulkan-runtime::WorkCounts.pooled_memory_bytes_live	pub pooled_memory_bytes_live: u64
++field	metal2vulkan-runtime::WorkCounts.pooled_memory_bytes_used	pub pooled_memory_bytes_used: u64
+ field	metal2vulkan-runtime::WorkCounts.predicated_loop_runs_again	pub predicated_loop_runs_again: u64
+ field	metal2vulkan-runtime::WorkCounts.prefixed_starts	pub prefixed_starts: u64
+ field	metal2vulkan-runtime::WorkCounts.primaries_begun_ahead	pub primaries_begun_ahead: u64
+@@ -2905,6 +2916,11 @@ field	metal2vulkan-runtime::WorkCounts.ycbcr_planes_images_kept_memory	pub ycbcr
+ field	metal2vulkan-runtime::WorkCounts.ycbcr_refreshes	pub ycbcr_refreshes: u64
+ field	metal2vulkan-runtime::WorkCounts.ycbcr_textures_in_place	pub ycbcr_textures_in_place: u64
+ field	metal2vulkan-runtime::WorkCounts.ycbcr_whole_conversions	pub ycbcr_whole_conversions: u64
++field	metal2vulkan-runtime::stage_trace::StageRecord.arg	pub arg: u16
++field	metal2vulkan-runtime::stage_trace::StageRecord.id	pub id: u64
++field	metal2vulkan-runtime::stage_trace::StageRecord.sequence	pub sequence: u32
++field	metal2vulkan-runtime::stage_trace::StageRecord.stage	pub stage: u16
++field	metal2vulkan-runtime::stage_trace::StageRecord.when	pub when: u64
+ field	metal2vulkan::Budget.cancel	pub cancel: Option<CancelToken>
+ field	metal2vulkan::Budget.deadline	pub deadline: Option<Instant>
+ field	metal2vulkan::bind::ArgumentBufferLayout.alignment	pub alignment: u64
+@@ -4105,6 +4121,7 @@ field	metal2vulkan::pipeline::InputAttachmentUse.input_attachment_index	pub inpu
+ field	metal2vulkan::pipeline::LinkedFunction.constants	pub constants: FunctionConstantValues
+ field	metal2vulkan::pipeline::LinkedFunction.function	pub function: Function
+ field	metal2vulkan::pipeline::LinkedFunction.precompiled	pub precompiled: bool
++field	metal2vulkan::pipeline::LinkedFunction.specialized_name	pub specialized_name: Option<String>
+ field	metal2vulkan::pipeline::LinkedFunctions.binary_functions	pub binary_functions: Vec<LinkedFunction>
+ field	metal2vulkan::pipeline::LinkedFunctions.functions	pub functions: Vec<LinkedFunction>
+ field	metal2vulkan::pipeline::LinkedFunctions.groups	pub groups: BTreeMap<String, Vec<LinkedFunction>>
+@@ -4489,9 +4506,12 @@ fn	metal2vulkan-air::intrinsics::undecoded_feature	pub fn undecoded_feature(name
+ fn	metal2vulkan-air::specialize	pub fn specialize(d: Decoded, r: &SpecRequest, m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-air::specialize_dynamic	pub fn specialize_dynamic(d: Decoded, r: &SpecRequest, (linked, dynamic): (&[LinkedModule], &DynamicLinks), m: &mut Meter) -> Result<Entry, Error>
+ fn	metal2vulkan-air::specialize_linked	pub fn specialize_linked(d: Decoded, r: &SpecRequest, linked: &[LinkedModule], m: &mut Meter) -> Result<Entry, Error>
++fn	metal2vulkan-runtime::allocation_sites	pub fn allocation_sites() -> Vec<AllocationSite>
+ fn	metal2vulkan-runtime::host_time	pub fn host_time() -> f64
+ fn	metal2vulkan-runtime::process_exiting	pub fn process_exiting() -> bool
+ fn	metal2vulkan-runtime::sampler_border_color	pub fn sampler_border_color(raw: u64) -> SamplerBorderColor
++fn	metal2vulkan-runtime::stage_trace::now_nanos	pub fn now_nanos() -> u64
++fn	metal2vulkan-runtime::stage_trace::read	pub fn read(from: u64, out: &mut [StageRecord]) -> (usize, u64)
+ fn	metal2vulkan::ash_interop::sampler_create_info	pub fn sampler_create_info<'a>(desc: &vk::SamplerDesc, reduction: &'a mut ash::vk::SamplerReductionModeCreateInfo<'static>, border: &'a mut ash::vk::SamplerBorderColorComponentMappingCreateInfoEXT<'static>) -> ash::vk::SamplerCreateInfo<'a>
+ fn	metal2vulkan::bind::astc_decode_module	pub fn astc_decode_module(device: &Device, decode: AstcDecode, texels: AstcTexels) -> Result<BlockDecodeModule, Error>
+ fn	metal2vulkan::bind::chroma_decode_module	pub fn chroma_decode_module(device: &Device, decode: ChromaDecode) -> Result<BlockDecodeModule, Error>
+@@ -7667,8 +7687,10 @@ method	metal2vulkan-runtime::Device::pixel_format_info	pub fn pixel_format_info(
+ method	metal2vulkan-runtime::Device::private_properties	pub fn private_properties(&self) -> PrivateProperties
+ method	metal2vulkan-runtime::Device::properties	pub fn properties(&self) -> &DeviceProperties
+ method	metal2vulkan-runtime::Device::raw	pub unsafe fn raw(&self) -> DeviceHandles<'_>
++method	metal2vulkan-runtime::Device::refuse_rebinds	pub fn refuse_rebinds(&self)
+ method	metal2vulkan-runtime::Device::registry_id	pub fn registry_id(&self) -> u64
+ method	metal2vulkan-runtime::Device::registry_ids_with	pub fn registry_ids_with(options: &DeviceOptions) -> Result<Vec<u64>, Error>
++method	metal2vulkan-runtime::Device::release_kept_memory	pub fn release_kept_memory(&self) -> usize
+ method	metal2vulkan-runtime::Device::reserve_address_pool	pub fn reserve_address_pool(&self, placement: AddressPlacement, length: u64) -> Result<AddressPool, Error>
+ method	metal2vulkan-runtime::Device::reserve_resource_ids	pub fn reserve_resource_ids(&self, kind: ResourceIdKind, ids: &[ResourceId]) -> Result<(), Error>
+ method	metal2vulkan-runtime::Device::sampler_id_pool_size	pub fn sampler_id_pool_size(&self) -> u64
+@@ -7741,6 +7763,7 @@ method	metal2vulkan-runtime::Function::patch_control_point_count	pub fn patch_co
+ method	metal2vulkan-runtime::Function::patch_type	pub fn patch_type(&self) -> Result<PatchType, Error>
+ method	metal2vulkan-runtime::Function::stage_input_attributes	pub fn stage_input_attributes(&self) -> Result<Option<Vec<Attribute>>, Error>
+ method	metal2vulkan-runtime::Function::vertex_attributes	pub fn vertex_attributes(&self) -> Result<Option<Vec<Attribute>>, Error>
++method	metal2vulkan-runtime::Function::with_specialized_name	pub fn with_specialized_name(mut self, name: Option<String>) -> Self
+ method	metal2vulkan-runtime::FunctionDescriptor::new	pub fn new(name: &str) -> FunctionDescriptor
+ method	metal2vulkan-runtime::FunctionHandle::device	pub fn device(&self) -> &Device
+ method	metal2vulkan-runtime::FunctionHandle::name	pub fn name(&self) -> &str
+@@ -8140,6 +8163,7 @@ method	metal2vulkan-runtime::Texture::allow_gpu_optimized_contents	pub fn allow_
+ method	metal2vulkan-runtime::Texture::alpha_reads_one	pub fn alpha_reads_one(&self) -> bool
+ method	metal2vulkan-runtime::Texture::array_length	pub fn array_length(&self) -> u64
+ method	metal2vulkan-runtime::Texture::as_resource	pub fn as_resource(&self) -> ResourceRef<'_>
++method	metal2vulkan-runtime::Texture::backing_allocation_size	pub fn backing_allocation_size(&self) -> u64
+ method	metal2vulkan-runtime::Texture::cpu_cache_mode	pub fn cpu_cache_mode(&self) -> CpuCacheMode
+ method	metal2vulkan-runtime::Texture::depth	pub fn depth(&self) -> u64
+ method	metal2vulkan-runtime::Texture::device	pub fn device(&self) -> &Device
+@@ -8193,6 +8217,8 @@ method	metal2vulkan-runtime::TextureSwizzleChannels::compose	pub fn compose(self
+ method	metal2vulkan-runtime::TextureSwizzleChannels::is_default	pub fn is_default(self) -> bool
+ method	metal2vulkan-runtime::TextureSwizzleChannels::new	pub fn new(red: TextureSwizzle, green: TextureSwizzle, blue: TextureSwizzle, alpha: TextureSwizzle) -> TextureSwizzleChannels
+ method	metal2vulkan-runtime::Unproven::new	pub fn new(call: &'static str, problem: Problem) -> Unproven
++method	metal2vulkan-runtime::UsedResources::references_heap	pub fn references_heap(&self, heap: &Heap) -> bool
++method	metal2vulkan-runtime::UsedResources::references_resource	pub fn references_resource(&self, resource: super::resource::ResourceRef<'_>) -> bool
+ method	metal2vulkan-runtime::VertexAmplificationViewMapping::new	pub fn new(viewport_array_index_offset: u32, render_target_array_index_offset: u32) -> VertexAmplificationViewMapping
+ method	metal2vulkan-runtime::Viewport::new	pub fn new(origin_x: f64, origin_y: f64, width: f64, height: f64, znear: f64, zfar: f64) -> Viewport
+ method	metal2vulkan-runtime::VisibilityResultMode::from_raw	pub fn from_raw(raw: u64) -> Result<VisibilityResultMode, Error>
+@@ -8893,6 +8919,7 @@ method	metal2vulkan::pipeline::InputAttachmentUse::new	pub fn new(color_index: u
+ method	metal2vulkan::pipeline::LinkedFunction::new	pub fn new(function: Function) -> LinkedFunction
+ method	metal2vulkan::pipeline::LinkedFunction::with_constants	pub fn with_constants(mut self, constants: FunctionConstantValues) -> LinkedFunction
+ method	metal2vulkan::pipeline::LinkedFunction::with_precompiled	pub fn with_precompiled(mut self, precompiled: bool) -> LinkedFunction
++method	metal2vulkan::pipeline::LinkedFunction::with_specialized_name	pub fn with_specialized_name(mut self, name: Option<String>) -> Self
+ method	metal2vulkan::pipeline::LinkedFunctions::function_handle	pub fn function_handle(&self, f: &LinkedFunction) -> Option<FunctionHandle>
+ method	metal2vulkan::pipeline::LinkedFunctions::is_empty	pub fn is_empty(&self) -> bool
+ method	metal2vulkan::pipeline::LinkedFunctions::new	pub fn new() -> LinkedFunctions
+@@ -8900,6 +8927,7 @@ method	metal2vulkan::pipeline::LinkedFunctions::with_function	pub fn with_functi
+ method	metal2vulkan::pipeline::LinkedFunctions::with_private_function	pub fn with_private_function(mut self, f: impl Into<LinkedFunction>) -> LinkedFunctions
+ method	metal2vulkan::pipeline::LinkedList::resolves_references	pub fn resolves_references(self) -> bool
+ method	metal2vulkan::pipeline::LinkedSource::new	pub fn new(name: &'a str, bitcode: &'a [u8], constants: &'a FunctionConstantValues) -> LinkedSource<'a>
++method	metal2vulkan::pipeline::LinkedSource::with_specialized_name	pub fn with_specialized_name(mut self, name: &'a str) -> Self
+ method	metal2vulkan::pipeline::LoweringInputs::new	pub fn new() -> LoweringInputs
+ method	metal2vulkan::pipeline::MeshPipelineDescriptor::fragment_writes_depth_unattached	pub fn fragment_writes_depth_unattached(&self, budget: &crate::Budget, entries: &StageEntries) -> Result<bool, Error>
+ method	metal2vulkan::pipeline::MeshPipelineDescriptor::new	pub fn new(mesh: StageSource) -> MeshPipelineDescriptor
+@@ -9204,6 +9232,7 @@ struct	metal2vulkan-air::tensor_ops::RunForm	#[derive(Clone, Copy, Debug, Partia
+ struct	metal2vulkan-runtime::AddressModeMap	#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))] #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] pub struct AddressModeMap
+ struct	metal2vulkan-runtime::AddressPool	pub struct AddressPool
+ struct	metal2vulkan-runtime::AddressRange	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub struct AddressRange
++struct	metal2vulkan-runtime::AllocationSite	#[derive(Clone, Copy, Debug, Default)] pub struct AllocationSite
+ struct	metal2vulkan-runtime::ArgumentEncoder	#[derive(Clone, Debug)] pub struct ArgumentEncoder
+ struct	metal2vulkan-runtime::BinaryArchive	#[derive(Clone)] pub struct BinaryArchive(Arc<Shared>)
+ struct	metal2vulkan-runtime::BinaryArchiveDescriptor	#[derive(Clone, Debug, Default, PartialEq, Eq)] #[non_exhaustive] pub struct BinaryArchiveDescriptor
+@@ -9328,6 +9357,7 @@ struct	metal2vulkan-runtime::VkBufferMemory	#[derive(Clone, Copy, Debug, Partial
+ struct	metal2vulkan-runtime::VkImageLayouts	#[derive(Clone, Copy, Debug, PartialEq, Eq)] #[non_exhaustive] pub struct VkImageLayouts
+ struct	metal2vulkan-runtime::VkResultCode	#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct VkResultCode(pub i32)
+ struct	metal2vulkan-runtime::WorkCounts	#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)] pub struct WorkCounts
++struct	metal2vulkan-runtime::stage_trace::StageRecord	#[derive(Clone, Copy, Debug, Default)] #[repr(C)] pub struct StageRecord
+ struct	metal2vulkan::Budget	#[derive(Clone, Debug, Default)] #[non_exhaustive] pub struct Budget
+ struct	metal2vulkan::CancelToken	#[derive(Clone, Debug, Default)] pub struct CancelToken(Arc<AtomicBool>)
+ struct	metal2vulkan::bind::ArgumentBufferLayout	#[derive(Clone, Debug, PartialEq, Eq, Hash)] #[non_exhaustive] pub struct ArgumentBufferLayout
+@@ -10476,6 +10506,7 @@ variant	metal2vulkan-air::intrinsics::LlvmFloatOp::Log2	Log2
+ variant	metal2vulkan-air::intrinsics::LlvmFloatOp::MaxNum	MaxNum
+ variant	metal2vulkan-air::intrinsics::LlvmFloatOp::MinNum	MinNum
+ variant	metal2vulkan-air::intrinsics::LlvmFloatOp::Sqrt	Sqrt
++variant	metal2vulkan-air::intrinsics::LlvmIntOp::Bitreverse	Bitreverse
+ variant	metal2vulkan-air::intrinsics::LlvmIntOp::Bswap	Bswap
+ variant	metal2vulkan-air::intrinsics::LlvmIntOp::Ctpop	Ctpop
+ variant	metal2vulkan-air::intrinsics::LlvmIntOp::Fshl	Fshl
+@@ -11660,6 +11691,7 @@ variant	metal2vulkan-runtime::RateMapProblem::NotCompiled	NotCompiled
+ variant	metal2vulkan-runtime::RateMapProblem::ScreenSize	ScreenSize { width: u32, height: u32 }
+ variant	metal2vulkan-runtime::RebindProblem::EncodedUses	EncodedUses
+ variant	metal2vulkan-runtime::RebindProblem::NotHostMemory	NotHostMemory
++variant	metal2vulkan-runtime::RebindProblem::Refused	Refused
+ variant	metal2vulkan-runtime::RecordsRead::Commit	Commit
+ variant	metal2vulkan-runtime::RecordsRead::Gpu	Gpu
+ variant	metal2vulkan-runtime::RecordsRead::HostStep	HostStep
+@@ -11880,6 +11912,27 @@ variant	metal2vulkan-runtime::WrappedImageProblem::Samples	Samples { image: Samp
+ variant	metal2vulkan-runtime::WrappedImageProblem::Tiling	Tiling { image: ImageTiling }
+ variant	metal2vulkan-runtime::WrappedImageProblem::Untracked	Untracked
+ variant	metal2vulkan-runtime::WrappedImageProblem::Usage	Usage { missing: ImageUsageFlags }
++variant	metal2vulkan-runtime::stage_trace::Stage::CommitCall	CommitCall = 1
++variant	metal2vulkan-runtime::stage_trace::Stage::CommitQueued	CommitQueued = 2
++variant	metal2vulkan-runtime::stage_trace::Stage::CommitRun	CommitRun = 3
++variant	metal2vulkan-runtime::stage_trace::Stage::Finished	Finished = 15
++variant	metal2vulkan-runtime::stage_trace::Stage::Handed	Handed = 5
++variant	metal2vulkan-runtime::stage_trace::Stage::Held	Held = 7
++variant	metal2vulkan-runtime::stage_trace::Stage::PassBegin	PassBegin = 23
++variant	metal2vulkan-runtime::stage_trace::Stage::PassEnd	PassEnd = 24
++variant	metal2vulkan-runtime::stage_trace::Stage::PollArmed	PollArmed = 12
++variant	metal2vulkan-runtime::stage_trace::Stage::PollDone	PollDone = 13
++variant	metal2vulkan-runtime::stage_trace::Stage::Prepared	Prepared = 4
++variant	metal2vulkan-runtime::stage_trace::Stage::SchedulerResumed	SchedulerResumed = 22
++variant	metal2vulkan-runtime::stage_trace::Stage::SchedulerSleep	SchedulerSleep = 20
++variant	metal2vulkan-runtime::stage_trace::Stage::SchedulerWake	SchedulerWake = 21
++variant	metal2vulkan-runtime::stage_trace::Stage::Seen	Seen = 14
++variant	metal2vulkan-runtime::stage_trace::Stage::StepBegin	StepBegin = 10
++variant	metal2vulkan-runtime::stage_trace::Stage::StepEnd	StepEnd = 11
++variant	metal2vulkan-runtime::stage_trace::Stage::SubmitBegin	SubmitBegin = 8
++variant	metal2vulkan-runtime::stage_trace::Stage::SubmitEnd	SubmitEnd = 9
++variant	metal2vulkan-runtime::stage_trace::Stage::SubmitStep	SubmitStep = 16
++variant	metal2vulkan-runtime::stage_trace::Stage::Taken	Taken = 6
+ variant	metal2vulkan::bind::AccessClass::Attachment	Attachment
+ variant	metal2vulkan::bind::AccessClass::Index	Index
+ variant	metal2vulkan::bind::AccessClass::Indirect	Indirect
+@@ -12373,6 +12426,7 @@ variant	metal2vulkan::device::HandleDomain::Table	Table
+ variant	metal2vulkan::device::HeapCompressionPolicy::Compressed	Compressed
+ variant	metal2vulkan::device::HeapCompressionPolicy::Uncompressed	Uncompressed
+ variant	metal2vulkan::device::HostPageTexturePolicy::InPlace	InPlace
++variant	metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites	InPlaceWrites
+ variant	metal2vulkan::device::HostPageTexturePolicy::Shadow	Shadow
+ variant	metal2vulkan::device::Independence::All	All
+ variant	metal2vulkan::device::Independence::None	None
+diff --git a/docs/API.md b/docs/API.md
+index 33a3305..1193c27 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -3672,3 +3672,15 @@ each item named states the rule in full.
+ - **A pass over a map of a zero screen extent is refused**, `RegionError::RegionExtent` on that
+   axis: the layer has no physical pixel there, so no attachment of the map's physical size can be
+   made, and what Metal rasterizes in such a pass is not measured.
++
++### Specialized link names and native texture accounting
++
++`pipeline::LinkedFunction::with_specialized_name` exports a function under an alias while
++retaining its source definition and constant values. The alias and source name both enter
++compile keys and function-table identities. `pipeline::LinkedSource::with_specialized_name`
++provides the same behavior for bitcode inputs. The runtime's `FunctionDescriptor.specialized_name`
++and `Function::with_specialized_name` preserve that alias through `linked_function()`.
++
++`Texture::backing_allocation_size` reports the Vulkan backing allocation for a native frontend.
++Heap textures report their reserved range; buffer textures report their buffer length. Unowned
++and sparse images report zero. `Texture::allocated_size` retains its Metal heap-layout semantics.
+diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
+index 4c48539..dad1620 100644
+--- a/docs/FAST-PATHS.md
++++ b/docs/FAST-PATHS.md
+@@ -108,6 +108,11 @@ known. The rest of the differences are docs/API.md section 9's precision notes.
+ 
+ ## Costs of matching Metal
+ 
++Dynamically indexed constant tables larger than 4 KiB use the pipeline's shared constant
++buffer. Smaller typed tables stay in private storage while they fit the private-memory limit.
++Constant GEP and pointer-cast expressions retain their byte offsets in either representation.
++This storage choice preserves values and avoids a private copy of a large table per invocation.
++
+ Where matching what Metal observably does costs time, the runtime matches it and the cost is
+ recorded here.
+ 
+diff --git a/docs/METAL-COVERAGE.md b/docs/METAL-COVERAGE.md
+index f14d3d4..61047e5 100644
+--- a/docs/METAL-COVERAGE.md
++++ b/docs/METAL-COVERAGE.md
+@@ -10,12 +10,12 @@ Every public item of the macOS 27.0 SDK (Xcode 27.0, 27A266a)'s Metal headers, b
+ 
+ | Status | Items | Of which deprecated |
+ |---|---|---|
+-| implemented | 958 | 36 |
+-| missing | 828 | 27 |
++| implemented | 959 | 36 |
++| missing | 827 | 27 |
+ | out of scope | 349 | 5 |
+ | all | 2135 | 68 |
+ 
+-Implemented by the runtime: 635; by the translator's values: 323. Missing by size: S 145, M 147, L 160, XL 376.
++Implemented by the runtime: 636; by the translator's values: 323. Missing by size: S 144, M 147, L 160, XL 376.
+ 
+ ## Missing, in build order
+ 
+@@ -32,7 +32,6 @@ Cheap items a plain app calls first, then medium pieces by how often a plain app
+ | `textureBarrier` and queue-stage barriers | S/M | 2 | `MTLCommandEncoder.barrierAfterQueueStages:beforeStages:`, `MTLRenderCommandEncoder.textureBarrier` |
+ | a pipeline state's reflection after creation | S | 2 | `MTLComputePipelineState.reflection`, `MTLRenderPipelineState.reflection` |
+ | function handles by name, and a handle's type and ID | S | 4 | `MTLComputePipelineState.functionHandleWithName:`, `MTLFunctionHandle.functionType`, `MTLFunctionHandle.gpuResourceID`, ... |
+-| a specialized function's name | S | 1 | `MTLFunctionDescriptor.specializedName` |
+ | more binary archive entries | S | 4 | `MTLBinaryArchive.addMeshRenderPipelineFunctionsWithDescriptor:error:`, `MTLBinaryArchive.addLibraryWithDescriptor:error:`, `MTLBinaryArchive.addFunctionWithDescriptor:library:error:`, ... |
+ | the shared event listener | S | 1 | `MTLSharedEventListener.sharedListener` |
+ | accumulated visibility results | S | 1 | `MTLRenderPassDescriptor.visibilityResultType` |
+@@ -1590,7 +1589,7 @@ Cheap items a plain app calls first, then medium pieces by how often a plain app
+ | `MTLFunctionDescriptor` | class | implemented | `FunctionDescriptor` (runtime) |
+ | `MTLFunctionDescriptor.functionDescriptor` | class method | implemented | `FunctionDescriptor::new` (runtime) |
+ | `MTLFunctionDescriptor.name` | property | implemented | `FunctionDescriptor.name` (runtime) |
+-| `MTLFunctionDescriptor.specializedName` | property | missing | S: a specialized function's own name |
++| `MTLFunctionDescriptor.specializedName` | property | implemented | `FunctionDescriptor.specialized_name` (runtime) |
+ | `MTLFunctionDescriptor.constantValues` | property | implemented | `FunctionDescriptor.constant_values` (runtime) |
+ | `MTLFunctionDescriptor.options` | property | implemented | `FunctionDescriptor.options` (runtime) |
+ | `MTLFunctionDescriptor.binaryArchives` | property | missing | S: binary archives searched for one function's compile (`PipelineOptions.binary_archives` serves pipelines) |
+diff --git a/docs/REFUSALS.md b/docs/REFUSALS.md
+index 7b8781b..36c2a4b 100644
+--- a/docs/REFUSALS.md
++++ b/docs/REFUSALS.md
+@@ -35,7 +35,7 @@ Columns:
+ | Rate maps the compile layer does not compile | 5 | 5 | 0 | 0 | 4 | 1 | 0 |
+ | The translation deadline | 1 | 1 | 0 | 0 | 0 | 1 | 0 |
+ | What a call did wrong | 63 | 63 | 0 | 0 | 0 | 0 | 0 |
+-| What a call did wrong, in detail | 164 | 149 | 0 | 0 | 0 | 0 | 0 |
++| What a call did wrong, in detail | 165 | 150 | 0 | 0 | 0 | 0 | 0 |
+ 
+ ## Totals by basis
+ 
+@@ -49,7 +49,7 @@ Columns:
+ | Rate maps the compile layer does not compile | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 5 |
+ | The translation deadline | 0 | 0 | 0 | 0 | 1 | 0 | 0 | 0 |
+ | What a call did wrong | 20 | 3 | 5 | 0 | 10 | 8 | 17 | 0 |
+-| What a call did wrong, in detail | 57 | 27 | 23 | 0 | 31 | 26 | 0 | 0 |
++| What a call did wrong, in detail | 57 | 27 | 23 | 0 | 32 | 26 | 0 | 0 |
+ 
+ ## 1. Translator and front-end refusals (`Unsupported`: a `Feature` and its `Needs`)
+ 
+@@ -372,7 +372,7 @@ Columns:
+ | `RequiredThreads` | A pipeline's `requiredThreadsPerThreadgroup` that Metal refuses at creation, or a dispatch whose threadgroup size is not it | every device (a public call's own check of its arguments) | `delegated`: RequiredThreadsProblem, section 9 | 1: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (check_kernel)` | `-` |
+ | `BinaryFunctions` | A pipeline's binary functions that Metal refuses | every device (a public call's own check of its arguments) | `delegated`: BinaryFunctionProblem, section 9 | 4: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added, 2 sites)`, `crates/metal2vulkan-runtime/src/pipeline/additions.rs (new_compute_pipeline_state_with_additional_binary_functions)` (+1) | `-` |
+ | `DynamicLibraryFunction` | A function made by name from a dynamic library (`newFunctionWithName:` and its forms) | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max and an M4, plain and under API validation: Metal asserts "type is not a valid MTLFunctionType" | 1: `crates/metal2vulkan-runtime/src/library.rs (function)` | `-` |
+-| `Rebind` | `rebind_bytes_no_copy` of a buffer or heap the runtime cannot rebind as asked (a runtime extension; `rebind.rs`) | every device (a public call's own check of its arguments) | `ours`: a runtime extension: Metal rebinds no bytes under a buffer | 5: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)`, `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)` (+1) | `-` |
++| `Rebind` | `rebind_bytes_no_copy` of a buffer or heap the runtime cannot rebind as asked (a runtime extension; `rebind.rs`) | every device (a public call's own check of its arguments) | `ours`: a runtime extension: Metal rebinds no bytes under a buffer | 7: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)`, `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)` (+1) | `-` |
+ | `IndirectCommandsDirectArgument` | `new_render_pipeline_state`, `new_mesh_render_pipeline_state` or `new_compute_pipeline_state` of a descriptor with `supportIndirectCommandBuffers`... | every device (a public call's own check of its arguments) | `metal-measured`: an M3 Max under macOS 26.7 and an M4 under 27.0.1: plain Metal answers nil with an NSError | 1: `crates/metal2vulkan-runtime/src/pipeline/indirect_arguments.rs (refusal)` | `-` |
+ | `UnrasterizedVertexReturn` | `new_render_pipeline_state` of a descriptor with rasterization disabled whose vertex function's return type is not `void` | every device (a public call's own check of its arguments) | `metal-measured`: an M4, macOS 27.0.1: plain Metal answers nil with an NSError | 1: `crates/metal2vulkan-runtime/src/pipeline/unrasterized.rs (check)` | `-` |
+ | `IndirectCommandsDirectArgumentUnproven` | `new_render_pipeline_state` (a render or mesh state) of a descriptor with `supportIndirectCommandBuffers` whose function of `stage`, the first in... | every device (a public call's own check of its arguments) | `unknown`: Metal's answer for a use only this rule keeps is unmeasured, so the state is refused as unproven | 1: `crates/metal2vulkan-runtime/src/pipeline/indirect_arguments.rs (check_render)` | `-` |
+@@ -551,6 +551,7 @@ Columns:
+ | `BinaryFunctionProblem::CompiledStage` | Functions added to a stage the compile layer already compiled (`StageSource::Compiled`), whose linked functions are fixed | every device (a public call's own check of its arguments) | `ours`: this crate's already-compiled stage: Metal's descriptor takes a function, so it has no such call | 1: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added)` | `-` |
+ | `RebindProblem::NotHostMemory` | The buffer is not a no-copy buffer of its own (a buffer of the runtime's memory, one over the caller's `VkBuffer`, or a heap's buffer, whose heap... | every device (a public call's own check of its arguments) | `ours`: from `Problem::Rebind` | 4: `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)`, `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 2 sites)` | `-` |
+ | `RebindProblem::EncodedUses` | A command buffer that is not yet committed has encoded a use of the buffer or heap, or of a resource placed in it, or has an encoder open that... | every device (a public call's own check of its arguments) | `ours`: from `Problem::Rebind` | 1: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)` | `-` |
++| `RebindProblem::Refused` | The device refuses every rebind (`Device::refuse_rebinds`) | every device (a public call's own check of its arguments) | `ours`: from `Problem::Rebind` | 2: `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 2 sites)` | `-` |
+ 
+ ## Appendix: every site
+ 
+@@ -838,7 +839,7 @@ Each refusal's sites, with the function that builds it.
+ - `invalid::RequiredThreads`: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (check_kernel)`
+ - `invalid::BinaryFunctions`: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added, 2 sites)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (new_compute_pipeline_state_with_additional_binary_functions)`; `crates/metal2vulkan-runtime/src/pipeline/additions.rs (not_precompiled)`
+ - `invalid::DynamicLibraryFunction`: `crates/metal2vulkan-runtime/src/library.rs (function)`
+-- `invalid::Rebind`: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)`; `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)`; `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 2 sites)`
++- `invalid::Rebind`: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)`; `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)`; `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 4 sites)`
+ - `invalid::IndirectCommandsDirectArgument`: `crates/metal2vulkan-runtime/src/pipeline/indirect_arguments.rs (refusal)`
+ - `invalid::UnrasterizedVertexReturn`: `crates/metal2vulkan-runtime/src/pipeline/unrasterized.rs (check)`
+ - `invalid::IndirectCommandsDirectArgumentUnproven`: `crates/metal2vulkan-runtime/src/pipeline/indirect_arguments.rs (check_render)`
+@@ -997,4 +998,5 @@ Each refusal's sites, with the function that builds it.
+ - `subproblem::BinaryFunctionProblem::CompiledStage`: `crates/metal2vulkan-runtime/src/pipeline/additions.rs (added)`
+ - `subproblem::RebindProblem::NotHostMemory`: `crates/metal2vulkan-runtime/src/detach.rs (detach_backing, 2 sites)`; `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 2 sites)`
+ - `subproblem::RebindProblem::EncodedUses`: `crates/metal2vulkan-runtime/src/buffer_descriptor.rs (rebind_host_pages)`
++- `subproblem::RebindProblem::Refused`: `crates/metal2vulkan-runtime/src/rebind.rs (rebind_bytes_no_copy, 2 sites)`
+ 
+diff --git a/scripts/metal-coverage/coverage.tsv b/scripts/metal-coverage/coverage.tsv
+index f8082d9..22c3cfd 100644
+--- a/scripts/metal-coverage/coverage.tsv
++++ b/scripts/metal-coverage/coverage.tsv
+@@ -1231,7 +1231,7 @@ MTLFunctionConstantValues.h	MTLFunctionConstantValues	method	reset		I	translator
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	class	MTLFunctionDescriptor		I	runtime	FunctionDescriptor			
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	class method	functionDescriptor		I	runtime	FunctionDescriptor::new			
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	name		I	runtime	FunctionDescriptor.name			
+-MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	specializedName		M			a specialized function's own name	S	functions
++MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	specializedName		I	runtime	FunctionDescriptor.specialized_name			functions
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	constantValues		I	runtime	FunctionDescriptor.constant_values			
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	options		I	runtime	FunctionDescriptor.options			
+ MTLFunctionDescriptor.h	MTLFunctionDescriptor	property	binaryArchives		M			binary archives searched for one function's compile (`PipelineOptions.binary_archives` serves pipelines)	S	archive
