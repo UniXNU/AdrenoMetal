@@ -514,6 +514,15 @@ static void noteProblem(NSString *what) {
    if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
   }
  }
+ // With sheng-gpu-trace=1 each distinct refusal text reaches the kernel GPU ring (event 65, 88 characters a part), for the processes
+ // whose crash follows a nil Metal object (iconservicesagent in untagged-102cb4a069).
+ if(gpuTraceOn() && gFrameTransport) {
+  const char *text=what.UTF8String?:"?";const size_t length=strlen(text);
+  for(uint64_t part=0;part<2 && part*88<length;++part) {
+   NativeGpuTraceRecord rec{};rec.event=GpuTraceProblem;rec.value[0]=part;
+   strncpy((char *)&rec.value[1],text+part*88,88);(void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));
+  }
+ }
  memcpy(gLastProblems[1],gLastProblems[0],sizeof gLastProblems[0]);
  strlcpy(gLastProblems[0],what.UTF8String?:"?",sizeof gLastProblems[0]);
 }
