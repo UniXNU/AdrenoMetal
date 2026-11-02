@@ -44,6 +44,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include "bridge/NativeMetalObjects.h"
+#include "SharedShaderCache.h"
 #include "NativeBridgeMetalFrontend.h"
 
 extern "C" void sys_dcache_flush(void *start, size_t length);
@@ -743,7 +744,7 @@ static void onLargeStack(void (^body)(void)) {
  pthread_attr_destroy(&attr);
  if(made)pthread_join(thread,nullptr);else body();
 }
-// A request's reply depends only on its bytes and the compiler, so a compiled one is kept in the process's Caches directory
+// A request's reply depends only on its bytes and the compiler, so writable same-user caches share it
 // (Library/Caches/native-metal-shaders/SHA256.reply, SHA-256 of MTLCompiler's LC_UUID, the request type and its bytes): an
 // app that compiles its shaders from source at every launch (GFXBench spends minutes of Clang and LLVM loading a test)
 // compiles each one once. A file is the magic, the warning and metallib lengths and the SHA-256 of both, then both; it is
@@ -756,7 +757,8 @@ static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,cons
  static dispatch_once_t once;
  dispatch_once(&once,^{
   if(getenv("NATIVE_METAL_NO_SHADER_CACHE"))return;
-  NSString *caches=NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject;
+  const std::string shared=sharedShaderCacheDirectory();
+  NSString *caches=shared.empty()?NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject:@(shared.c_str());
   NSString *path=caches?[caches stringByAppendingPathComponent:@"native-metal-shaders"]:nil;
   if(path && [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil])directory=path;
  });
@@ -997,7 +999,6 @@ static void waitForResource(id resource);
 #define NB_RESOURCE_SPI \
 - (uint64_t)protectionOptions {return 0;} \
 - (id<MTLHeap>)heap {return _parentHeap;} \
-- (BOOL)isAliasable {return NO;} \
 - (int)setOwnerWithIdentity:(unsigned)identity {(void)identity;return 46; /* KERN_NOT_SUPPORTED */} \
 - (void)waitUntilComplete {waitForResource(self);}
 @interface NBBuffer : NBObject
@@ -1035,6 +1036,8 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
 }
 static void releaseSurface(void *context,void *,uint64_t) {gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
 @implementation NBBuffer
+- (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
+- (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
 - (void)dealloc {
  nmb_buffer_release(_handle);
 }
@@ -1217,10 +1220,29 @@ static size_t pvrtcLevelBytes(uint32_t width,uint32_t height,bool twoBit) {
  while(down*4u<height)down<<=1;
  return (size_t)across*down*8;
 }
+// Poster rendering uses one sample. The override also allows host qualification.
+static bool singleSample() {
+ static const bool enabled=[] {
+  if(const char *value=getenv("NATIVE_METAL_SINGLE_SAMPLE"))return strcmp(value,"0")!=0;
+  const char *name=getprogname();return name && strstr(name,"Poster");
+ }();
+ return enabled;
+}
+static uint64_t packedSwizzle(MTLTextureSwizzleChannels s) {
+ return (1ull<<32)|(uint64_t)s.red|((uint64_t)s.green<<8)|((uint64_t)s.blue<<16)|((uint64_t)s.alpha<<24);
+}
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
-       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable")};
+       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle)};
+ if(singleSample() && out->samples>1) {
+  out->samples=1;
+  if(out->type==MTLTextureType2DMultisample)out->type=MTLTextureType2D;
+  if(out->type==MTLTextureType2DMultisampleArray)out->type=MTLTextureType2DArray;
+  // A preserved attachment may be copied to its resolve target after the pass.
+  if((out->options&MTLResourceStorageModeMask)==MTLResourceStorageModeMemoryless)
+   out->options=(out->options&~MTLResourceStorageModeMask)|MTLResourceStorageModePrivate;
+ }
  if(isPvrtc(out->format)) {
   static std::atomic<bool> told;
   if(!told.exchange(true)){const char *note="native-metal: PVRTC textures are made RGBA8 and decoded on the CPU\n";(void)!write(2,note,strlen(note));}
@@ -1229,6 +1251,13 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  return true;
 }
 @implementation NBTexture
+- (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
+- (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
+- (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable: %@",lastError());}
+- (MTLTextureSwizzleChannels)swizzle {
+ const uint64_t s=_descriptor.swizzle;
+ return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(s&255),(MTLTextureSwizzle)((s>>8)&255),(MTLTextureSwizzle)((s>>16)&255),(MTLTextureSwizzle)((s>>24)&255));
+}
 - (void)dealloc {nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
@@ -1273,6 +1302,11 @@ NB_RESOURCE_SPI
  const uint64_t l[2]={levels.location,levels.length},s[2]={slices.location,slices.length};
  if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
  return [self view:nmb_texture_new_view(_handle,format,type,l,s,false)];
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
+ const uint64_t l[2]={levels.location,levels.length},r[2]={slices.location,slices.length};
+ if(isPvrtc(format))format=(MTLPixelFormat)pvrtcCarrier(format);
+ return [self view:nmb_texture_new_view_swizzle(_handle,format,type,l,r,packedSwizzle(swizzle))];
 }
 - (void)replaceRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)row bytesPerImage:(NSUInteger)image {
  const uint64_t region[6]={r.origin.x,r.origin.y,r.origin.z,r.size.width,r.size.height,r.size.depth};
@@ -1427,6 +1461,7 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
+@property(nonatomic,copy) NSString *sourceName;
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLFunctionType functionType;
 @property(nonatomic) std::string constantsText;   // name:type:hex of each constant value it was specialized with (the journal's)
@@ -1434,7 +1469,27 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @property(nonatomic,strong) NSData *bitCodeHashData;
 @property(nonatomic,strong) MTLFunctionConstantValues *constantValues;   // specialized with (nil: none), for the zero-rest rebuild of a refused pipeline
 @end
+@interface NBFunctionConstant : NSObject
+@property(nonatomic,copy) NSString *name;
+@property(nonatomic) MTLDataType type;
+@property(nonatomic) NSUInteger index;
+@property(nonatomic,getter=isRequired) BOOL required;
+@end
+@implementation NBFunctionConstant
+@end
 @implementation NBFunction
+- (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
+ NSMutableDictionary *result=[NSMutableDictionary dictionary];
+ if(!_handle)return result;
+ for(uint32_t i=0,n=nmb_function_constant_count(_handle);i<n;i++) {
+  const size_t size=nmb_function_constant_name_size(_handle,i);if(!size)return nil;
+  std::vector<char> name(size);uint64_t index=0,type=0;bool required=false;
+  if(!nmb_function_constant_at(_handle,i,name.data(),name.size(),&index,&type,&required))return nil;
+  NBFunctionConstant *c=[NBFunctionConstant new];c.name=@(name.data());c.index=index;c.type=(MTLDataType)type;c.required=required;
+  result[c.name]=c;
+ }
+ return result;
+}
 - (void)dealloc {if(_handle)nmb_function_release(_handle);}
 // _MTLFunction's bitCodeHash (32 bytes), read by the stitched-library path (createStitchingScriptHash): a digest naming this function
 // object, its name and a serial no other function in the process has.
@@ -1469,20 +1524,24 @@ static bool methodABI(id object,SEL selector,const char *encoding) {
  Method method=class_getInstanceMethod(object_getClass(object),selector);
  return method && !strcmp(method_getTypeEncoding(method),encoding);
 }
-// Bytes of a function constant of MTLDataType `type` (scalars and 2/4-wide vectors; 3-wide vectors are not qualified).
+// Packed bytes of scalar and vector function constants.
 static uint64_t constantBytes(uint64_t type) {
  switch(type) {
   case 3:case 29:case 33:return 4;
   case 4:case 30:case 34:return 8;
+  case 5:case 31:case 35:return 12;
   case 6:case 32:case 36:return 16;
-  case 16:case 37:case 41:return 2;
-  case 17:case 38:case 42:return 4;
-  case 19:case 40:case 44:return 8;
+  case 16:case 37:case 41:case 121:return 2;
+  case 17:case 38:case 42:case 122:return 4;
+  case 18:case 39:case 43:case 123:return 6;
+  case 19:case 40:case 44:case 124:return 8;
   case 45:case 49:case 53:return 1;
   case 46:case 50:case 54:return 2;
+  case 47:case 51:case 55:return 3;
   case 48:case 52:case 56:return 4;
   case 81:case 85:return 8;
   case 82:case 86:return 16;
+  case 83:case 87:return 24;
   case 84:case 88:return 32;
   default:return 0;
  }
@@ -1543,7 +1602,7 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
   if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
  }
- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
 }
 - (void)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
@@ -1551,14 +1610,22 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  handler(function,error);
 }
 - (MTLLibraryType)type {return MTLLibraryTypeExecutable;}
-// The descriptor's name and constants; its specialized name only labels Metal's function and its options ask for compile-time work the
-// runtime does when the function is made.
+// A specialized name is the exported link symbol; sourceName keeps library lookup exact.
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
- if(d.constantValues)return [self newFunctionWithName:d.name constantValues:d.constantValues error:error];
- id<MTLFunction> function=[self newFunctionWithName:d.name];
- if(!function){if(error)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
- if(error)*error=nil;return function;
+ NBFunction *function=(NBFunction *)(d.constantValues?[self newFunctionWithName:d.name constantValues:d.constantValues error:error]:[self newFunctionWithName:d.name]);
+ if(!function){if(error && !d.constantValues)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+ if(d.specializedName) {
+  if(function.handle && !nmb_function_set_specialized_name(function.handle,d.specializedName.UTF8String)) {
+   if(error)*error=nbError(lastError());return nil;
+  }
+  function.name=d.specializedName;
+ }
+ if(error)*error=nil;return (id<MTLFunction>)function;
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d completionHandler:(void (^)(id<MTLFunction>,NSError *))handler {
+ NSError *error=nil;id<MTLFunction> function=[self newFunctionWithDescriptor:d error:&error];
+ if(handler)handler(function,error);
 }
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
@@ -1589,14 +1656,14 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
   if(told.fetch_add(1)<64)NBLOG(@"native-metal: function %@ refused: %@",name,lastError());
   return nil;
  }
- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.library=self;return (id<MTLFunction>)function;
 }
 // Shader priming (PrimeShaders.h): the function with each of its function constants set to zero, or nil.
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
  NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
  if(!handle)return nil;
- NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  return (id<MTLFunction>)function;
 }
 @end
@@ -1605,7 +1672,7 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
 // length and the bytes, up to ENDT).
 static NSData *functionBitcode(NBFunction *function) {
  NBLibrary *library=function.library;const uint8_t *file=library.bytes;const size_t length=library.length;
- const char *wanted=function.name.UTF8String;
+ const char *wanted=(function.sourceName?:function.name).UTF8String;
  if(!file || !wanted || length<88 || memcmp(file,"MTLB",4))return nil;
  uint64_t listAt,bitcodeAt,bitcodeSize;memcpy(&listAt,file+24,8);memcpy(&bitcodeAt,file+72,8);memcpy(&bitcodeSize,file+80,8);
  if(listAt>length-4 || bitcodeAt>length || bitcodeSize>length-bitcodeAt)return nil;
@@ -1666,7 +1733,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
  forEachLibraryEntry(library,[&](const std::string &entry,int type) {
   if(entry!=wanted)return true;
   if(type==5) {
-   found=[NBFunction new];found.name=name;found.functionType=(MTLFunctionType)4;found.library=library;
+   found=[NBFunction new];found.name=name;found.sourceName=name;found.functionType=(MTLFunctionType)4;found.library=library;
   }
   return false;
  });
@@ -1876,9 +1943,15 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
 @end
+struct SingleSampleCopy {
+ NmbTexture *source,*destination;
+ uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
+ std::array<uint64_t,3> sourceOrigin,destinationOrigin,size;
+};
 @interface NBEncoder : NBObject
 @property(nonatomic) NmbEncoder *handle;
 @property(nonatomic,strong) NBCommandBuffer *commandBuffer;
+@property(nonatomic) std::vector<SingleSampleCopy> resolveCopies;
 @property(nonatomic,strong) NSMutableArray *dumpEntries;   // its NATIVE_METAL_DUMP_CB targets, given its label at endEncoding
 // NATIVE_METAL_DUMP_CB: what is bound (stage << 8 | index: an [buffer, offset] pair or the bytes), the pipeline and depth/stencil state
 // set, and how many draws so far.
@@ -2155,7 +2228,16 @@ static void writeDrawStats() {
                            (unsigned long)([run[2] unsignedIntegerValue]+[run[3] unsignedIntegerValue]-1),run[0],run[1]]);
  ENCODE(NmbEncoder *handle=self->_handle;self->_handle=nullptr;
         if(!handle){[self->_commandBuffer refuse:@"endEncoding twice"];return;}
-        [self check:nmb_encoder_end(handle) what:"endEncoding"]);
+        if(![self check:nmb_encoder_end(handle) what:"endEncoding"])return;
+        if(!self->_resolveCopies.empty()) {
+         NmbEncoder *blit=nmb_blit_encoder_new(self->_commandBuffer.handle);
+         if(!blit){[self check:false what:"single-sample resolve"];return;}
+         for(const auto &c:self->_resolveCopies)
+          [self check:nmb_blit_copy_texture(blit,c.source,c.sourceSlice,c.sourceLevel,c.sourceOrigin.data(),c.size.data(),
+            c.destination,c.destinationSlice,c.destinationLevel,c.destinationOrigin.data()) what:"single-sample resolve"];
+         [self check:nmb_encoder_end(blit) what:"single-sample resolve end"];
+         self->_resolveCopies.clear();
+        });
  encodeFlush();
 }
 - (void)insertDebugSignpost:(NSString *)s {(void)s;}
@@ -2375,6 +2457,18 @@ static void writeDrawStats() {
  if(gDrawStats)[self noteState:kDSViewport key:0 object:nullptr value:hashBytes(values.data(),sizeof values)];
  ENCODE([self check:nmb_render_set_viewport(self.handle,values.data()) what:"setViewport"]);
 }
+- (void)setViewports:(const MTLViewport *)v count:(NSUInteger)count {
+ if(!v || !count || count>16){[self.commandBuffer refuse:@"invalid viewport array"];return;}
+ std::vector<double> values;values.reserve(count*6);
+ for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{v[i].originX,v[i].originY,v[i].width,v[i].height,v[i].znear,v[i].zfar});
+ ENCODE([self check:nmb_render_set_viewports(self.handle,values.data(),count) what:"setViewports"]);
+}
+- (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)count {
+ if(!r || !count || count>16){[self.commandBuffer refuse:@"invalid scissor array"];return;}
+ std::vector<uint64_t> values;values.reserve(count*4);
+ for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{r[i].x,r[i].y,r[i].width,r[i].height});
+ ENCODE([self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
+}
 - (void)setScissorRect:(MTLScissorRect)r {
  const std::array<uint64_t,4> values={r.x,r.y,r.width,r.height};
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
@@ -2555,6 +2649,19 @@ static void writeDrawStats() {
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
+}
+- (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
+ destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)ns levelCount:(NSUInteger)nl {
+ if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ auto slices=[](id<MTLTexture> t)->NSUInteger {return t.arrayLength*((t.textureType==MTLTextureTypeCube || t.textureType==MTLTextureTypeCubeArray)?6:1);};
+ if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
+    ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
+ for(NSUInteger slice=0;slice<ns;slice++)for(NSUInteger level=0;level<nl;level++) {
+  const NSUInteger mip=sl+level;
+  MTLSize size=MTLSizeMake(MAX(s.width>>mip,(NSUInteger)1),MAX(s.height>>mip,(NSUInteger)1),MAX(s.depth>>mip,(NSUInteger)1));
+  [self copyFromTexture:s sourceSlice:ss+slice sourceLevel:mip sourceOrigin:MTLOriginMake(0,0,0) sourceSize:size
+    toTexture:d destinationSlice:ds+slice destinationLevel:dl+level destinationOrigin:MTLOriginMake(0,0,0)];
+ }
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
@@ -2874,6 +2981,7 @@ static char kUserDictionaryKey;
 }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
  NmbRenderPassDescriptor pass={};
+ std::vector<SingleSampleCopy> resolveCopies;
  _dumpPasses++;
  if(dumpMaybe(self)) {
   if(!_dumpTargets)_dumpTargets=[NSMutableArray array];
@@ -2921,8 +3029,26 @@ static char kUserDictionaryKey;
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
    [_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
-   out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;
-   out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
+   if(singleSample()) {
+    if(resolves) {
+     if(a.loadAction!=MTLLoadActionLoad && a.storeAction==MTLStoreActionMultisampleResolve) {
+      // The source is discarded, so draw into the final attachment directly.
+      out.texture=resolve.handle;out.level=a.resolveLevel;out.slice=a.resolveSlice;out.depth_plane=a.resolveDepthPlane;
+     } else {
+      // Load and StoreAndResolve retain the source's contents across passes.
+      const uint64_t width=std::max<uint64_t>(1,texture.width>>a.level),height=std::max<uint64_t>(1,texture.height>>a.level);
+      const uint64_t layers=d.renderTargetArrayLength?d.renderTargetArrayLength:1;
+      for(uint64_t layer=0;layer<layers;layer++)
+       resolveCopies.push_back({texture.handle,resolve.handle,a.level,a.slice+layer,a.resolveLevel,a.resolveSlice+layer,
+          {0,0,a.depthPlane},{0,0,a.resolveDepthPlane},{width,height,1}});
+     }
+     out.store=MTLStoreActionStore;
+    }
+   } else {
+    out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;
+    out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
+   }
   }
   return true;
  };
@@ -2934,7 +3060,7 @@ static char kUserDictionaryKey;
  if(!attachment(d.depthAttachment,pass.depth) || !attachment(d.stencilAttachment,pass.stencil)){[self refuse:@"foreign depth/stencil attachment"];return nil;}
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;
- pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=d.defaultRasterSampleCount;
+ pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=singleSample() && d.defaultRasterSampleCount?1:d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
   [_resourceOwners addObject:d.visibilityResultBuffer];
@@ -2943,6 +3069,7 @@ static char kUserDictionaryKey;
  NmbCommandBuffer *handle=_handle;
  id<MTLRenderCommandEncoder> made=[self encoder:[NBRenderEncoder new] make:^{return nmb_render_encoder_new(handle,&pass);} what:@"renderCommandEncoder"];
  if(made) {
+  ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
   id<MTLTexture> t0=d.colorAttachments[0].texture;
   const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
   ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
@@ -3342,7 +3469,7 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
   p->colors[i]={(uint64_t)a.pixelFormat,(uint64_t)a.writeMask,(uint64_t)a.blendingEnabled,(uint64_t)a.sourceRGBBlendFactor,(uint64_t)a.destinationRGBBlendFactor,
       (uint64_t)a.rgbBlendOperation,(uint64_t)a.sourceAlphaBlendFactor,(uint64_t)a.destinationAlphaBlendFactor,(uint64_t)a.alphaBlendOperation};
  }
- p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=d.rasterSampleCount;
+ p->depth_format=d.depthAttachmentPixelFormat;p->stencil_format=d.stencilAttachmentPixelFormat;p->samples=singleSample()?1:d.rasterSampleCount;
  p->topology=d.inputPrimitiveTopology;p->rasterization=d.rasterizationEnabled;
  if(MTLVertexDescriptor *v=d.vertexDescriptor) {
   for(unsigned i=0;i<31;i++) {
@@ -3772,8 +3899,14 @@ static unsigned gZeroRest;
 static NBFunction *zeroRestFunction(NBFunction *f) {
  NSString *why=lastError();
  if(!f.library || ![why containsString:@"FunctionConstant"])return nil;
- NBFunction *rebuilt=(NBFunction *)[f.library nb_newFunctionWithName:f.name constantValues:f.constantValues zeroRest:YES error:nil];
- if(rebuilt)gZeroRest++;
+ NBFunction *rebuilt=(NBFunction *)[f.library nb_newFunctionWithName:f.sourceName?:f.name constantValues:f.constantValues zeroRest:YES error:nil];
+ if(rebuilt) {
+  if(![f.name isEqualToString:rebuilt.name]) {
+   if(rebuilt.handle && !nmb_function_set_specialized_name(rebuilt.handle,f.name.UTF8String))return nil;
+   rebuilt.name=f.name;
+  }
+  gZeroRest++;
+ }
  return rebuilt;
 }
 // The handles `p` points at live in `linked` and `privateLinked`, which outlive its use.
@@ -3917,6 +4050,13 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NmbFence *handle=nmb_fence_new(gDevice);if(!handle)return nil;
  NBFence *fence=[NBFence new];fence.handle=handle;return (id<MTLFence>)fence;
 }
+- (NSUInteger)currentAllocatedSize {return nmb_device_current_allocated_size(gDevice);}
+- (NSUInteger)recommendedMaxWorkingSetSize {
+ // A process's cache budget is a quarter of the RAM exposed by the selected board.
+ uint64_t bytes=0;size_t size=sizeof bytes;
+ if(sysctlbyname("hw.memsize",&bytes,&size,nullptr,0))return 256ull<<20;
+ return (NSUInteger)std::min<uint64_t>(bytes/4,2ull<<30);
+}
 - (id<MTLCommandQueue>)newCommandQueue {
  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
@@ -3949,6 +4089,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 // (DVMLinearTextureLayout); any other format is refused, with the reason, rather than answered with a guessed shape.
 - (id<MTLTexture>)newTextureWithBytesNoCopy:(void *)bytes length:(NSUInteger)length descriptor:(MTLTextureDescriptor *)d deallocator:(void (^)(void *,NSUInteger))deallocator {
  DVMLinearTextureLayout *layout=[DVMLinearTextureLayout layoutWithDescriptor:d];
+ if(layout && length==0)length=layout.size;
  if(!layout||!bytes||length<layout.size){
   NBLOG(@"native-metal: newTextureWithBytesNoCopy:length:descriptor:deallocator: is made only over DroidVM's layout of a block-compressed format (format %lu, %lu bytes)",
         (unsigned long)d.pixelFormat,(unsigned long)length);
@@ -3969,7 +4110,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  if(!layout)NBLOG(@"native-metal: newTextureLayoutWithDescriptor:isHeapOrBufferBacked: has no layout for format %lu (Apple's is not known)",(unsigned long)d.pixelFormat);
  return layout;
 }
-- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {(void)count;return [(id<MTLDevice>)self newCommandQueue];}
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {
+ NmbQueue *handle=nmb_queue_new_with_max_command_buffer_count(gDevice,count);
+ if(!handle){NBLOG(@"native-metal: command queue refused: %@",lastError());return nil;}
+ NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
+}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
  NmbBuffer *handle=nmb_buffer_new(gDevice,length,options,nullptr);
  if(!handle){NBLOG(@"native-metal: buffer refused: %@",lastError());return nil;}
@@ -4184,6 +4329,11 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 // iPadOS 27's QuartzCore builds its backdrop compute pipelines (Liquid Glass luma, backdrop capture) with this short form: unanswered, the
 // render server got nil and aborted with "Metal failed to build compute pipeline" on the first backdrop (a respring).
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d completionHandler:(void (^)(id<MTLComputePipelineState>,NSError *))handler {
+ NSError *error=nil;
+ id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:&error];
+ if(handler)handler(state,error);
+}
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d error:(NSError **)error {
  return [(id<MTLDevice>)self newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error];
 }
@@ -4361,11 +4511,12 @@ static void installAnswers(Class cls) {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
+ if(cache && *cache)configureShaderDiskCache(cache);
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
- if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines.log";gJournalBegan=nowUs();}
+ if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);

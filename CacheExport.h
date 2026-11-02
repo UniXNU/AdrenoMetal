@@ -58,7 +58,8 @@ static void scan(const std::string &root, const std::string &relative, std::vect
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
         // A concurrent import or cache writer has not published these entries yet.
         const std::string leaf = entry->d_name;
-        if (leaf.find(".import.") != std::string::npos || leaf.rfind(".write-", 0) == 0) continue;
+        if (leaf.front() == '.' || leaf.find(".import.") != std::string::npos ||
+            (leaf.size() >= 4 && leaf.compare(leaf.size()-4, 4, ".tmp") == 0)) continue;
         const std::string path = relative.empty() ? std::string(entry->d_name) : relative + "/" + entry->d_name;
         struct stat st = {};
         if (lstat((root + "/" + path).c_str(), &st) != 0) continue;
