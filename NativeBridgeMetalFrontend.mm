@@ -254,6 +254,32 @@ static void tracePush(const TraceRec &rec) {
  gTrace[at%16384]=rec;
  gTrace[at%16384].idx=rec.type==1?rec.idx:at;
 }
+static thread_local uint64_t tEncodeBatchId;
+static void traceThread(uint32_t role) {
+ if(!diagOn())return;
+ uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+ static std::atomic<uint64_t> seen[128];const uint64_t key=(tid<<2)|role;
+ for(auto &slot:seen) {
+  uint64_t value=slot.load();if(value==key)return;
+  if(!value && slot.compare_exchange_strong(value,key)) {
+   char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);uint64_t words[4]={};memcpy(words,name,sizeof name);
+   frameEvent(63,tid,role,words[0],words[1],words[2],words[3]);return;
+  }
+ }
+}
+// Types 14/15 persist CPU-side phases beside runtime stages in frames.trace.
+static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t bytes=0,uint32_t surfaces=0) {
+ if(!diagOn())return;
+ uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
+ TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
+ rec.a=phase;rec.b=(uint32_t)tid;rec.c=surfaces;rec.d=(uint32_t)(bytes>>10);tracePush(rec);
+ frameEvent(62,command,commit,phase,tEncodeBatchId,tid,surfaces,bytes);
+}
+static void batchStage(uint64_t batch,uint32_t phase,uint64_t queuedUs,uint32_t tasks,uint32_t depth) {
+ if(!diagOn())return;
+ TraceRec rec={};rec.type=14;rec.t0=nowUs();rec.t1=batch;rec.t2=queuedUs;rec.a=phase;rec.b=tasks;rec.c=depth;rec.tid=threadIdLow();tracePush(rec);
+ frameEvent(61,batch,phase,queuedUs,tasks,depth,rec.tid);
+}
 static void traceStartWriter();
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
@@ -1389,8 +1415,8 @@ static constexpr bool kSurfaceFlush=true;
 #endif
 // Diagnostic: while /private/var/ngpu/debug/no-surface-flush exists when the process starts, no surface is flushed here either.
 static const bool gSkipSurfaceFlush=access("/private/var/ngpu/debug/no-surface-flush",F_OK)==0;
-static void flushSurfaces(NSMutableSet *surfaces) {
- if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return;
+static uint64_t flushSurfaces(NSMutableSet *surfaces) {
+ if(!kSurfaceFlush || !surfaces.count || gSkipSurfaceFlush)return 0;
  std::vector<std::pair<uintptr_t,size_t>> ranges;
  ranges.reserve(surfaces.count);
  for(NBTexture *texture in surfaces)if(texture.surface)
@@ -1398,11 +1424,13 @@ static void flushSurfaces(NSMutableSet *surfaces) {
  std::sort(ranges.begin(),ranges.end());
  const auto last=std::unique(ranges.begin(),ranges.end());
  gSurfaceFlushDuplicates+=(uint64_t)(ranges.end()-last);
+ uint64_t flushed=0;
  for(auto it=ranges.begin();it!=last;++it) {
   const uint64_t began=nowUs();
   sys_dcache_flush(reinterpret_cast<void *>(it->first),it->second);
-  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);
+  gSurfaceFlushBytes+=it->second;gTimeSurfaceFlush.add(began);flushed+=it->second;
  }
+ return flushed;
 }
 static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUInteger offset,NSUInteger row,bool surface) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -2107,6 +2135,7 @@ class EncodeBatch {
  std::vector<Chunk> chunks;
  size_t at=0;
 public:
+ uint64_t serial=0,enqueuedUs=0;
  size_t count=0;
  template<class F> void add(F &&work) {
   using Closure=std::decay_t<F>;
@@ -2152,13 +2181,16 @@ static EncodeThread &encodeThread() {
   pthread_attr_set_qos_class_np(&attr,QOS_CLASS_USER_INTERACTIVE,0);
   pthread_create(&id,&attr,[](void *arg)->void * {
    EncodeThread &t=*(EncodeThread *)arg;tOnEncodeThread=true;
-   pthread_setname_np("native-metal-encode");
+   pthread_setname_np("native-metal-encode");traceThread(2);
    std::unique_lock<std::mutex> lock(t.lock);
    for(;;) {
     t.work.wait(lock,[&]{return !t.batches.empty();});
     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
-    lock.unlock();
+    const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
+    lock.unlock();tEncodeBatchId=batch->serial;
+    batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     @autoreleasepool {batch->run();}
+    batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
     lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
    }
    return nullptr;
@@ -2172,7 +2204,13 @@ static bool onEncodeQueue() {return tOnEncodeThread;}
 static void encodeFlush() {
  if(!tBatch || !tBatch->count)return;
  EncodeThread &t=encodeThread();
- {std::lock_guard<std::mutex> lock(t.lock);t.batches.push_back(tBatch);t.queued++;tBatch=nullptr;}
+ uint64_t serial,queuedUs;uint32_t tasks,depth;
+ {std::lock_guard<std::mutex> lock(t.lock);
+  tBatch->serial=serial=++t.queued;tBatch->enqueuedUs=queuedUs=nowUs();
+  tasks=(uint32_t)tBatch->count;depth=(uint32_t)t.batches.size();
+  t.batches.push_back(tBatch);tBatch=nullptr;
+ }
+ batchStage(serial,1,queuedUs,tasks,depth);
  t.work.notify_one();
 }
 // A closure takes what it uses by value (C arrays as std::array) or strongly (the objects whose handles it passes), as the call made it.
@@ -3020,7 +3058,7 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();sampleWindowOpen();}
+ if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);sampleWindowOpen();}
  return self;
 }
 - (void)dealloc {nmb_command_buffer_release(_handle);}
@@ -3210,6 +3248,12 @@ static char kUserDictionaryKey;
   }
   frameEvent(33,traceNumber,_dumpPasses,attachmentIndex,(uintptr_t)texture.handle,(uintptr_t)out.texture,
       (uintptr_t)out.resolve_texture,a.texture.sampleCount,texture.descriptor.samples,a.loadAction,a.storeAction,out.load,out.store);
+  if(diagOn()) {
+   TraceRec rec{};rec.type=16;rec.t0=nowUs();rec.t1=traceNumber;rec.t2=(uintptr_t)out.texture;rec.t3=(uintptr_t)out.resolve_texture;
+   rec.a=_dumpPasses;rec.b=attachmentIndex;rec.c=(uint32_t)out.load|((uint32_t)out.store<<8)|((uint32_t)texture.descriptor.samples<<16);
+   rec.d=(uint32_t)a.texture.pixelFormat;rec.tid=(uint32_t)texture.width;rec.cpu0=texture.height;
+   rec.cpu1=texture.surface?IOSurfaceGetID(texture.surface):0;rec.tid2=(uint32_t)a.texture.sampleCount;tracePush(rec);
+  }
   frameEvent(34,traceNumber,_dumpPasses,attachmentIndex,(uintptr_t)[(NBTexture *)a.resolveTexture handle],
       a.texture.pixelFormat,a.resolveTexture.pixelFormat,texture.descriptor.swizzle,resolveCopies.size(),
       singleSample(),a.level,a.slice,a.depthPlane);
@@ -3289,7 +3333,9 @@ static char kUserDictionaryKey;
 }
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
- flushSurfaces(_surfaces);
+ frontStage(traceNumber,self.commitIndex,8);
+ const uint64_t flushed=flushSurfaces(_surfaces);
+ frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
  if(freezeWallpaperOn() && !self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
     self.wallpaperOutput && encodedWork.draws) {
   std::lock_guard<std::recursive_mutex> guard(gWallpaperLock);
@@ -3304,11 +3350,13 @@ static char kUserDictionaryKey;
  if(!self.failedLocally && self.status==MTLCommandBufferStatusCompleted)captureFrameSurfaces(self);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
+ frontStage(traceNumber,self.commitIndex,10);
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
  self.wallpaperOutput=nil;
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
  trimHeldImports(false);
+ frontStage(traceNumber,self.commitIndex,11);
  // A local refusal never reaches the runtime's completion: its runtime command buffer, which holds every resource its encoders
  // recorded, goes now, as Metal releases a failed command buffer's resources once it completes with its error, however long the
  // caller keeps the command buffer object. Every later answer of it is the frontend's (failedLocally).
@@ -3338,12 +3386,15 @@ static char kUserDictionaryKey;
  // The runtime reports Vulkan's DeviceLost as Metal's code 11 (see -error).
  const bool lost=!self.failedLocally && nmb_command_buffer_metal_error_code(_handle)==11;
  void (^run)(void)=^{
+  frontStage(self->traceNumber,self.commitIndex,12);
   for(MTLCommandBufferHandler block in completedHandlers)block((id<MTLCommandBuffer>)self);
+  frontStage(self->traceNumber,self.commitIndex,13);
   dispatch_group_leave(self->_handlers);
   if(lost)endRenderServerAfterGpuLoss();
  };
  dispatch_queue_t queue=_queue.completionQueue;
  if(queue)dispatch_async(queue,run);else run();
+ frontStage(traceNumber,self.commitIndex,14);
 }
 - (void)commit {
  if(self.committed){NBLOG(@"native-metal: commit twice");return;}
@@ -3360,11 +3411,13 @@ static char kUserDictionaryKey;
  dispatch_group_enter(_handlers);
  dispatch_group_enter(_schedulingHandlers);
  @synchronized(gInFlight){[gInFlight addObject:self];}
+ frontStage(traceNumber,self.commitIndex,2);
  ENCODE([self submit]);
  encodeFlush();
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
+ frontStage(traceNumber,self.commitIndex,3);
  std::unique_lock<std::recursive_mutex> wallpaperLock(gWallpaperLock,std::defer_lock);
  if(freezeWallpaperOn()) {
   wallpaperLock.lock();
@@ -3380,14 +3433,18 @@ static char kUserDictionaryKey;
  }
  [self tracePhase:1];
  if(!self.encodeFailure) {
-  flushSurfaces(_surfaces);
+  frontStage(traceNumber,self.commitIndex,4);
+  const uint64_t flushed=flushSurfaces(_surfaces);
+  frontStage(traceNumber,self.commitIndex,5,flushed,(uint32_t)_surfaces.count);
   if(gLogTextures)dumpSurfacesOnce(_surfaces,_resourceOwners);
   for(WatchedSource &source:watched){source.hash=hashSource(source.bytes,source.length);gSourcesWatched[source.surface]++;}
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
+  frontStage(traceNumber,self.commitIndex,6);
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
+   frontStage(traceNumber,self.commitIndex,7);
    const auto range=dumpRange();
    self.submitted=YES;
    if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
