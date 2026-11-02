@@ -1,0 +1,15 @@
+--- a/crates/metal2vulkan-runtime/src/stage_trace.rs
++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
+@@ -163,6 +163,12 @@
+ 
+ /// Record `stage` of `id` with `arg`, now, where the diagnostics are on ([`diagnostics`]).
+ pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
++    // Per-command handoff and completion stages retain scheduler latency.
++    // Idle scheduler turns have no command identity and add no causal link.
++    if matches!(stage, Stage::SchedulerSleep | Stage::SchedulerWake
++        | Stage::SchedulerResumed | Stage::PassBegin | Stage::PassEnd) {
++        return;
++    }
+     if !diagnostics() {
+         return;
+     }
