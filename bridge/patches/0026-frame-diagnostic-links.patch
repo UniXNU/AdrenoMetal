@@ -1,0 +1,51 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+@@ -1778,6 +1778,9 @@
+ }
+ 
+ impl CommandBuffer {
++    /// Stable trace identity for this command buffer until its completion.
++    pub fn diagnostic_id(&self) -> u64 { Arc::as_ptr(&self.0) as u64 }
++
+     /// A new command buffer of `queue`, holding `slot` of it.
+     pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
+         CommandBuffer(Arc::new(CommandBufferShared {
+diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+--- a/crates/metal2vulkan-runtime/src/stage_trace.rs
++++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
+@@ -129,6 +129,7 @@
+     if !diagnostics() {
+         return;
+     }
++    if let Some(hook)=DIAGNOSTIC_HOOK.get() { hook(39,id as u64,stage as u64,arg as u64); }
+     let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+     let slot = &SLOTS[(sequence as usize) & (RING - 1)];
+     slot.word.store(0, Ordering::Release);
+@@ -184,3 +185,13 @@
+     }
+     (written, sequence)
+ }
++
++/// Optional host hook. The installed function must remain loaded for the process lifetime.
++pub type DiagnosticHook = extern "C" fn(u32,u64,u64,u64);
++static DIAGNOSTIC_HOOK: std::sync::OnceLock<DiagnosticHook> = std::sync::OnceLock::new();
++/// Install once before creating command queues. It never changes rendering state.
++pub fn set_diagnostic_hook(hook: DiagnosticHook) { let _ = DIAGNOSTIC_HOOK.set(hook); }
++/// Link a command buffer to its Vulkan work, including batches later grouped by the scheduler.
++pub(crate) fn diagnostic_link(id:u64, command:u64, batch:u64) {
++    if let Some(hook)=DIAGNOSTIC_HOOK.get() { hook(45,id,command,batch); }
++}
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -897,6 +897,9 @@
+                 false => work.insert(0, lead),
+             }
+         }
++        for command in work.iter().chain(finale.iter()) {
++            crate::stage_trace::diagnostic_link(Arc::as_ptr(self) as u64, ash::vk::Handle::as_raw(*command), index as u64);
++        }
+         let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
+             .wait_semaphore_values(wait_values)
+             .signal_semaphore_values(work_signal_values);

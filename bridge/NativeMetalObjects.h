@@ -347,6 +347,8 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
                                 const uint64_t size[3], NmbBuffer *destination, uint64_t offset, uint64_t bytes_per_row,
                                 uint64_t bytes_per_image);
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
+uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
+void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
 #ifdef __cplusplus
 }
 #endif
