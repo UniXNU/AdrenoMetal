@@ -57,28 +57,12 @@ static NmbDevice *gDevice;
 static std::string gLoaderPath;   // the Turnip library the runtime loaded (its own handle is local to it)
 static id gDeviceObject;
 static bool (*gFrameTransport)(uint32_t,const void *,uint32_t);
-static std::atomic<uint64_t> gFrameNumber{0},gFrameLost{0};
-static bool frameTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}
-template<typename... T> static void frameEvent(uint32_t event,T... args) {
- if(!frameTraceOn() || !gFrameTransport)return;
- NativeGpuTraceRecord rec{};rec.event=event;const uint64_t values[]={uint64_t(args)...};
- static_assert(sizeof...(args)<=12,"frame event fields");
- if(!native_gpu_latency_event(event,values,sizeof...(args)))return;
- memcpy(rec.value,values,sizeof(values));
- if(!gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec)))++gFrameLost;
- else if(uint64_t lost=gFrameLost.exchange(0)) {
-  NativeGpuTraceRecord dropped{};dropped.event=41;dropped.value[0]=lost;
-  if(!gFrameTransport(NativeGpuTraceMethod,&dropped,sizeof(dropped)))gFrameLost+=lost;
- }
-}
+static std::atomic<uint64_t> gFrameNumber{0};
+// The kernel trace (sheng-gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
+// CPU sampler follows. Everything else of this process goes to the frame trace file.
+static bool gpuTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}
 static void traceRuntimeWide(uint64_t,uint32_t,uint32_t);
-static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && !native_gpu_latency_stage((uint32_t)a))return;if(event==39 && a>=40)traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);frameEvent(event,id,a,b);}
-static void frameText(uint32_t event,const char *text) {
- if(!frameTraceOn() || !gFrameTransport || !text)return;
- NativeGpuTraceRecord rec{};rec.event=event;strlcpy((char *)rec.value,text,sizeof(rec.value));
- (void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));
-}
-
+static void frameRuntime(uint32_t event,uint64_t id,uint64_t a,uint64_t b){if(event==39 && a>=40 && native_gpu_latency_stage((uint32_t)a))traceRuntimeWide(id,(uint32_t)a,(uint32_t)b);}
 
 // DEBUG (the guest's memory corruption, 2026-10-26): with NATIVE_METAL_ABORT_PROBE=1 in its environment, a process that aborts
 // (a __stack_chk_fail among them) or faults (SIGSEGV, SIGBUS) first writes to its standard error whether the stack guard changed
@@ -223,20 +207,6 @@ static_assert(sizeof(TraceRec)==72,"trace record");
 static TraceRec gTrace[16384];
 static std::atomic<uint32_t> gTraceHead{0};
 static std::atomic<bool> gTraceStarted{false};
-/* The slowest render pass this process's Turnip recorded, with the size, format and draw count that identify it, and all of them summed:
- * the line the frontend streams to the kernel log. A process whose jobs each took 77 ms showed only that; which pass, at what size and in
- * which mode, is what says whether the cost is ours. Written by the trace writer alone, read by the streaming thread. */
-struct SlowPass {
- uint64_t us=0,totalUs=0,whenUs=0;
- uint64_t passes=0;
- uint32_t width=0,height=0,mode=0,format=0,flags=0,swap=0,draws=0,kpx=0;
- uint64_t over20=0,recentUs=0;   // passes of 20 ms or more, and the slowest since the stream last read it
- // The slowest pass's shader and geometry figures (Turnip's pass record): heaviest fragment shader's ir3 instructions and texture fetches,
- // its estimated stalls on (sy) and (ss), waves per core and highest GPR, samples, depth/stencil, bandwidth per sample, vertices.
- uint32_t fsInstrs=0,fsTex=0,fsSy=0,fsSs=0,samples=0,ds=0,bandwidth=0,verts=0;
- int32_t fsWaves=0,fsRegs=0;
-};
-static SlowPass gSlowPass;
 // What this process's queues asked for with setGPUPriority:/setBackgroundGPUPriority: and how many of those reached the driver.
 static std::atomic<uint32_t> gAskFg{0xffffffffu},gAskBg{0xffffffffu},gAskCount{0},gAskSent{0};
 static bool nbForwardPriority(uint32_t foreground,uint32_t background);
@@ -267,14 +237,14 @@ static void traceRuntimeWide(uint64_t id,uint32_t stage,uint32_t argument) {
 }
 static thread_local uint64_t tEncodeBatchId;
 static void traceThread(uint32_t role) {
- if(!diagOn())return;
+ if(!diagOn() || !gpuTraceOn() || !gFrameTransport)return;
  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  static std::atomic<uint64_t> seen[128];const uint64_t key=(tid<<2)|role;
  for(auto &slot:seen) {
   uint64_t value=slot.load();if(value==key)return;
   if(!value && slot.compare_exchange_strong(value,key)) {
-   char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);uint64_t words[4]={};memcpy(words,name,sizeof name);
-   frameEvent(63,tid,role,words[0],words[1],words[2],words[3]);return;
+   NativeGpuTraceRecord rec{};rec.event=GpuTraceThread;rec.value[0]=tid;rec.value[1]=role;
+   pthread_getname_np(pthread_self(),(char *)&rec.value[2],32);(void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));return;
   }
  }
 }
@@ -284,15 +254,12 @@ static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t 
  uint64_t tid=0;pthread_threadid_np(nullptr,&tid);
  TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
  rec.a=phase;rec.b=(uint32_t)tid;rec.c=surfaces;rec.d=(uint32_t)(bytes>>10);tracePush(rec);
- frameEvent(62,command,commit,phase,tEncodeBatchId,tid,surfaces,bytes);
 }
 static void batchStage(uint64_t batch,uint32_t phase,uint64_t queuedUs,uint32_t tasks,uint32_t depth) {
  if(!diagOn())return;
  TraceRec rec={};rec.type=14;rec.t0=nowUs();rec.t1=batch;rec.t2=queuedUs;rec.a=phase;rec.b=tasks;rec.c=depth;rec.tid=threadIdLow();tracePush(rec);
- frameEvent(61,batch,phase,queuedUs,tasks,depth,rec.tid);
 }
 static thread_local uint64_t tDetailCommand;
-static thread_local uint64_t tDispatchItem;
 static std::atomic<uint64_t> gDetailSequence{0};
 static uint64_t blockInvoke(id block) {
  if(!block)return 0;
@@ -306,7 +273,7 @@ static void detailDefinition(uint64_t key,const char *label) {
   if(!old && slot.compare_exchange_strong(old,key)) {
    char text[64]={};strncpy(text,label,sizeof text-1);
    for(unsigned part=0;part<2;++part) {
-    uint64_t words[4]={};memcpy(words,text+part*32,32);frameEvent(67,key,part,words[0],words[1],words[2],words[3]);
+    uint64_t words[4]={};memcpy(words,text+part*32,32);
     TraceRec rec{};rec.type=19;rec.t0=key;rec.a=part;memcpy(&rec.t1,words,24);memcpy(&rec.b,(char *)words+24,8);tracePush(rec);
    }
    return;
@@ -324,7 +291,6 @@ static void detailPoint(uint64_t id,uint32_t kind,uint32_t phase,uint64_t comman
   TraceRec link{};link.type=18;link.t0=now;link.t1=id;link.t2=parent;link.t3=queued;
   link.a=(uint32_t)began;link.b=(uint32_t)(began>>32);tracePush(link);
  }
- frameEvent(64,id,kind,phase,command,object,function,parent,tid,began,began?now-began:0,line,queued);
 }
 struct DetailCommandScope {
  uint64_t previous;
@@ -335,13 +301,12 @@ struct DetailSpan {
  uint64_t id=0,began=0,command=0,object=0,function=0,parent=0;uint32_t kind=0;bool announced=false;
  DetailSpan(uint32_t k,uint64_t o,uint64_t f=0,bool announce=false):object(o),function(f),kind(k),announced(announce) {
   if(!diagOn())return;
-  id=++gDetailSequence;began=nowUs();command=tDetailCommand;parent=tDispatchItem;
+  id=++gDetailSequence;began=nowUs();command=tDetailCommand;
   if(announce){detailPoint(id,kind,1,command,object,function,0,parent,0);began=nowUs();}
  }
  ~DetailSpan(){if(id){uint64_t end=nowUs();if(announced || end-began>=250)detailPoint(id,kind,2,command,object,function,began,parent,0,0,end);}}
 };
 static uint64_t encodeCommandOf(id);
-#include "NativeMetalDispatchTrace.h"
 static void traceStartWriter();
 // type 5 swap served by the scanout client: {idx, t0 offer arrived, t1 GPU copy returned, t2 swap completed, a sequence, b result}
 extern "C" void NBTraceSwap(uint64_t offered,uint64_t copied,uint64_t completed,uint32_t sequence,uint32_t result) {
@@ -354,31 +319,6 @@ static void traceNote(uint32_t tid) {
  TraceRec rec={};rec.type=4;rec.tid=tid;pthread_getname_np(pthread_self(),(char *)&rec.t0,24);tracePush(rec);
 }
 
-/* The process's slowest pass and its pass total, for a line of the kernel log: "R pass <us> us <w>x<h> mode <m> fmt <f> draws <d> flags <x>
- * swap <s> | <passes> passes <total> us". Zero characters before any pass with GPU times was recorded. */
-extern "C" size_t nmb_slowest_pass(char *out,size_t size) {
- if(!out || !size)return 0;
- const SlowPass p=gSlowPass;
- if(!p.passes && !gAskCount.load()) {out[0]=0;return 0;}
- // One 63-character row per process (the kernel keeps that much of a client's text), three kinds in turn at the 5 s tick: the timing of its
- // passes, the shader and geometry figures of the slowest one, and what its queues asked the GPU priority to be.
- static unsigned turn=0;
- const unsigned kind=turn++%3;
- int n;
- if(kind==0) {
-  gSlowPass.recentUs=0;
-  n=snprintf(out,size,"slow %lluus %ux%u d%u m%u|n%llu >20ms %llu now %llu",
-   (unsigned long long)p.us,p.width,p.height,p.draws,p.mode,
-   (unsigned long long)p.passes,(unsigned long long)p.over20,(unsigned long long)p.recentUs);
- } else if(kind==1) {
-  n=snprintf(out,size,"fs i%u t%u sy%u ss%u w%d r%d|smp%u ds%u bw%u v%u",
-   p.fsInstrs,p.fsTex,p.fsSy,p.fsSs,p.fsWaves,p.fsRegs,p.samples,p.ds,p.bandwidth,p.verts);
- } else {
-  n=snprintf(out,size,"ask fg%d bg%d n%u sent%u",
-   gAskFg.load()==0xffffffffu?-1:(int)gAskFg.load(),gAskBg.load()==0xffffffffu?-1:(int)gAskBg.load(),gAskCount.load(),gAskSent.load());
- }
- return n>0?(size_t)n:0;
-}
 // The runtime loads Turnip after this process may have started; its handle is local to it, so the exported setter is found by the path.
 static bool nbForwardPriority(uint32_t foreground,uint32_t background) {
  typedef bool (*SetPriority)(uint32_t,uint32_t);
@@ -397,45 +337,12 @@ static bool nbForwardPriority(uint32_t foreground,uint32_t background) {
  if(!fn(foreground,background))return false;
  gAskSent.fetch_add(1);gAskFg.store(foreground);gAskBg.store(background);return true;
 }
-// A note for the kernel's log (Turnip's tu_darwin_note, NativeAdrenoMethodNote): the board's export writes it as a row of kernel.rings.txt, the one
-// place a process that has no file of its own (a sandboxed extension) can leave more than its 63-character text row. Kind 1 is a slow render pass
-// (row G), kind 2 a pipeline made or refused (row L). Only with the diagnostics on.
-static bool nbNote(uint32_t kind,const uint32_t *words,uint32_t count) {
- typedef bool (*Note)(uint32_t,const uint32_t *,uint32_t);
- static std::atomic<Note> note{nullptr};
- Note fn=note.load();
- if(!fn) {
-  if(gLoaderPath.empty())return false;
-  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-  if(!turnip)return false;
-  fn=(Note)dlsym(turnip,"tu_darwin_note");
-  if(!fn)return false;
-  note.store(fn);
- }
- return fn(kind,words,count);
-}
-// The shader hashes of the pipeline this thread just asked Turnip for (tu_darwin_last_program reads and clears them).
-static void nbLastProgram(uint32_t *vs,uint32_t *fs) {
- typedef void (*Last)(uint32_t *,uint32_t *);
- static std::atomic<Last> last{nullptr};
- *vs=*fs=0;
- Last fn=last.load();
- if(!fn) {
-  if(gLoaderPath.empty())return;
-  void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-  if(!turnip)return;
-  fn=(Last)dlsym(turnip,"tu_darwin_last_program");
-  if(!fn)return;
-  last.store(fn);
- }
- fn(vs,fs);
-}
 static void traceStartWriter() {
  // The file is the render server's: SpringBoard, which runs as the same user, opened the same path with O_TRUNC and the two processes'
  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
- // Every process with the diagnostics on reads its own Turnip's pass ring (the slowest-pass row); only the render server writes the file.
- if(!diagOn())return;
+ // Only the render server writes the file; no other process reads its Turnip rings.
  static const bool render=!strcmp(getprogname(),"backboardd");
+ if(!diagOn() || !render)return;
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
  std::thread([]{
@@ -495,27 +402,6 @@ static void traceStartWriter() {
        tracePush(detail);
       }
       passFrom=p.seq+1;
-      if(p.gpuEnd>p.gpuBegin) {
-       const uint64_t us=(p.gpuEnd-p.gpuBegin)/1000;
-       if(!render && us>=3000) {
-        // Row G of the kernel log (this process has no trace file): the pass, its shader figures and its heaviest fragment shader's hash.
-        const uint64_t at=p.ns/1000,began=p.gpuBegin/1000;
-        const uint32_t words[16]={p.seq,(uint32_t)at,(uint32_t)(at>>32),(uint32_t)began,(uint32_t)(began>>32),(uint32_t)us,
-         (uint32_t)p.width|(uint32_t)p.height<<16,(uint32_t)p.mode|(uint32_t)p.colors<<8|(uint32_t)p.flags<<16|(uint32_t)p.swap<<24,
-         (uint32_t)p.draws|(uint32_t)p.format<<16,p.kpx,(uint32_t)p.fsInstrs|(uint32_t)p.fsTex<<16,(uint32_t)p.fsSy|(uint32_t)p.fsSs<<16,
-         (uint8_t)p.fsWaves|(uint32_t)(uint8_t)p.fsRegs<<8|(uint32_t)p.samples<<16|(uint32_t)p.ds<<24,p.bandwidth,p.verts,p.fsHash};
-        nbNote(1,words,16);
-       }
-       if(us>=20000)++gSlowPass.over20;
-       if(us>gSlowPass.recentUs)gSlowPass.recentUs=us;
-       if(us>gSlowPass.us) {
-        gSlowPass.us=us;gSlowPass.width=p.width;gSlowPass.height=p.height;gSlowPass.mode=p.mode;gSlowPass.format=p.format;
-        gSlowPass.draws=p.draws;gSlowPass.kpx=p.kpx;gSlowPass.flags=p.flags;gSlowPass.swap=p.swap;gSlowPass.whenUs=p.ns/1000;
-        gSlowPass.fsInstrs=p.fsInstrs;gSlowPass.fsTex=p.fsTex;gSlowPass.fsSy=p.fsSy;gSlowPass.fsSs=p.fsSs;gSlowPass.fsWaves=p.fsWaves;gSlowPass.fsRegs=p.fsRegs;
-        gSlowPass.samples=p.samples;gSlowPass.ds=p.ds;gSlowPass.bandwidth=p.bandwidth;gSlowPass.verts=p.verts;
-       }
-       ++gSlowPass.passes;gSlowPass.totalUs+=us;
-      }
      }
      if(n<64 || taken<n)break;
     }
@@ -608,21 +494,6 @@ void (*native_bridge_metal_problem_hook)(const char *);
 // reported, so the first problem and the last ones stay the clients' own.
 static thread_local bool tQuietProblems;
 extern "C" void native_bridge_metal_quiet_problems(bool quiet) {tQuietProblems=quiet;}
-// Row L of the kernel log: a pipeline creation. Words: 0 flags (1 made, 2 compute), 1 microseconds it took, 2 when (microseconds since boot,
-// low 32 bits), 3 vertex and 4 fragment shader hash (Turnip's tu_hash32; 0 for compute and refusals before a shader), 5 the first colour pixel
-// format, then 96 bytes of text "fragment|vertex|why" (names cut to 36 and 24 characters). Not for shader priming, which has its own log.
-static void nbNotePipeline(bool made,bool compute,uint64_t tookUs,uint32_t vsHash,uint32_t fsHash,uint32_t format,const char *fragment,const char *vertex,const char *why) {
- if(!diagOn() || tQuietProblems)return;
- static const bool renderServer=!strcmp(getprogname(),"backboardd");
- if(renderServer)return;   // its 122 of 256 rows pushed the poster's out of the kernel's ring; its pipelines are in the shader cache journal
- uint32_t words[30]={};
- words[0]=(made?1u:0u)|(compute?2u:0u);words[1]=(uint32_t)tookUs;words[2]=(uint32_t)nowUs();words[3]=vsHash;words[4]=fsHash;words[5]=format;
- char text[97]={};
- snprintf(text,sizeof text,"%.36s|%.24s|%.30s",fragment?:"-",vertex?:"-",why?:"");
- for(char *c=text;*c;++c)if(*c=='\n')*c=' ';
- memcpy(&words[6],text,96);
- nbNote(2,words,30);
-}
 // Notes every process makes and that change nothing it draws: they must not stand in the one line a client's failure is reported on.
 static bool harmlessProblem(NSString *what) {
  for(NSString *prefix in @[@"native-metal: no device answer",@"native-metal: setGPUPriority",@"native-metal: setBackgroundGPUPriority",
@@ -1295,7 +1166,6 @@ NB_RESOURCE_SPI
 - (id<MTLTexture>)view:(NmbTexture *)handle {
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
- frameEvent(35,(uintptr_t)handle,(uintptr_t)_handle,descriptor.format,descriptor.swizzle,descriptor.samples,descriptor.type,descriptor.usage,_surface?IOSurfaceGetPixelFormat(_surface):0);
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
  if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
  return (id<MTLTexture>)view;
@@ -1389,7 +1259,6 @@ static NBTexture *textureOnBuffer(NBBuffer *buffer,MTLTextureDescriptor *d,NSUIn
  NmbTexture *handle=nmb_texture_new_on_buffer(buffer.handle,&descriptor,offset,row,surface);
  if(!handle){NBLOG(@"native-metal: texture over buffer refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- frameEvent(49,(uintptr_t)handle,d.sampleCount,descriptor.samples,d.pixelFormat,descriptor.format,d.width,d.height,packedSwizzle(d.swizzle));
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
 // myron: a two-plane extended-range surface ('b3a8', RGB10A8_2P_XR10) whose planes report no row bytes. IOSurfaceGetBytesPerRowOfPlane
@@ -1420,7 +1289,6 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
   IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);
  if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- frameEvent(49,(uintptr_t)handle,d.sampleCount,descriptor.samples,d.pixelFormat,descriptor.format,d.width,d.height,packedSwizzle(d.swizzle));
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;
 }
 // Textures over host pages whose rows or offset are not whole 64-byte steps, which no linear image of this GPU lays out (fd6_layout: a
@@ -1456,7 +1324,6 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
  NmbTexture *handle=nmb_texture_new_linear(self.handle,&descriptor,offset,row,image);
  if(!handle){NBLOG(@"native-metal: linear texture refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- frameEvent(49,(uintptr_t)handle,d.sampleCount,descriptor.samples,d.pixelFormat,descriptor.format,d.width,d.height,packedSwizzle(d.swizzle));
  texture.buffer=self;texture.offset=offset;texture.rowBytes=row;return (id<MTLTexture>)texture;
 }
 @end
@@ -1816,8 +1683,8 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 static void notified(void *context,uint64_t value);
 @implementation NBSharedEvent
 - (uint64_t)signaledValue {return nmb_shared_event_value(self.handle);}
-- (void)setSignaledValue:(uint64_t)value {frameEvent(52,(uintptr_t)self.handle,value,1);nmb_shared_event_set_value(self.handle,value);}
-- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds {frameEvent(52,(uintptr_t)self.handle,value,2,milliseconds);BOOL result=nmb_shared_event_wait(self.handle,value,milliseconds);frameEvent(52,(uintptr_t)self.handle,value,3,milliseconds,result);return result;}
+- (void)setSignaledValue:(uint64_t)value {nmb_shared_event_set_value(self.handle,value);}
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds {BOOL result=nmb_shared_event_wait(self.handle,value,milliseconds);return result;}
 // The block runs on the listener's dispatch queue (Metal's contract); the bridge's listener thread only forwards it there.
 - (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block {
  if(!block)return;
@@ -1830,7 +1697,6 @@ static void notified(void *context,uint64_t value);
 }
 // A handle for another process needs a kernel-backed event this bridge does not have yet: refused, never a handle that could not work.
 - (MTLSharedEventHandle *)newSharedEventHandle {
- frameEvent(53,(uintptr_t)self.handle);
  if(gMissing)gMissing("NBSharedEvent","newSharedEventHandle (cross-process)");
  return nil;
 }
@@ -1939,9 +1805,6 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic) uint32_t commitIndex;
 @property(nonatomic,strong) NSMutableArray *scheduledHandlers,*completedHandlers;
 @property(nonatomic,strong) NSMutableSet *surfaces;
-@property(nonatomic,strong) NSMutableDictionary *traceUsage;
-- (void)traceTexture:(NBTexture *)texture usage:(uint32_t)usage;
-- (void)tracePhase:(uint32_t)phase;
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
@@ -1974,9 +1837,6 @@ static bool freezeWallpaperOn() {
 static std::recursive_mutex gWallpaperLock;
 static uint64_t gWallpaperFrozenCommand,gWallpaperFrozenAt,gWallpaperAllowed,gWallpaperParked;
 static NBTexture *gWallpaperFrozenOutput;
-static void wallpaperNote(unsigned phase,uint64_t command,uint64_t surface) {
- frameEvent(60,phase,command,surface,gWallpaperFrozenCommand,gWallpaperFrozenAt,gWallpaperAllowed,gWallpaperParked);
-}
 struct SingleSampleCopy {
  NmbTexture *source,*destination;
  uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
@@ -2202,7 +2062,7 @@ template<class F> static void encodeLater(F &&work,const char *label,uint32_t li
  if(!diagOn()){encodeLaterRaw(std::forward<F>(work));return;}
  using Closure=std::decay_t<F>;
  encodeLaterRaw(TracedEncodeCall<Closure>{std::optional<Closure>(std::forward<F>(work)),label,line,
-                ++gDetailSequence,command,tDispatchItem,nowUs()});
+                ++gDetailSequence,command,0,nowUs()});
 }
 #define ENCODE(...) encodeLater([=]{__VA_ARGS__;},__func__,__LINE__,diagOn()?encodeCommandOf(self):0)
 // Held while a resource wait reads an in-flight command buffer's runtime handle and while a locally refused command buffer frees it.
@@ -2381,7 +2241,7 @@ static uint64_t encodeCommandOf(id object) {
            [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
- if(texture){[_commandBuffer.resourceOwners addObject:texture];[_commandBuffer traceTexture:(NBTexture *)texture usage:stage==0 && (texture.usage&MTLTextureUsageShaderWrite)?9:1];}
+ if(texture){[_commandBuffer.resourceOwners addObject:texture];}
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
@@ -2407,7 +2267,6 @@ static uint64_t encodeCommandOf(id object) {
  ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
- frameEvent(51,_commandBuffer->traceNumber,(uintptr_t)(__bridge void *)fence,stages,update);
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
  ENCODE(NmbFence *handle=[(NBFence *)fence handle];
         [self check:update?nmb_encoder_update_fence(self->_handle,handle,stages):nmb_encoder_wait_fence(self->_handle,handle,stages)
@@ -2701,7 +2560,6 @@ static uint64_t encodeCommandOf(id object) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer.resourceOwners addObject:o];
-  [self.commandBuffer traceTexture:(NBTexture *)o usage:4];
   if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
  }
  return true;
@@ -2717,7 +2575,6 @@ static uint64_t encodeCommandOf(id object) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
- [self.commandBuffer traceTexture:(NBTexture *)s usage:1];[self.commandBuffer traceTexture:(NBTexture *)d usage:2];
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
@@ -2725,7 +2582,6 @@ static uint64_t encodeCommandOf(id object) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
  destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)ns levelCount:(NSUInteger)nl {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
- [self.commandBuffer traceTexture:(NBTexture *)s usage:1];[self.commandBuffer traceTexture:(NBTexture *)d usage:2];
  auto slices=[](id<MTLTexture> t)->NSUInteger {return t.arrayLength*((t.textureType==MTLTextureTypeCube || t.textureType==MTLTextureTypeCubeArray)?6:1);};
  if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
     ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
@@ -2738,7 +2594,6 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
- [self.commandBuffer traceTexture:(NBTexture *)s usage:1];[self.commandBuffer traceTexture:(NBTexture *)d usage:2];
  const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
  for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
   MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
@@ -2952,75 +2807,6 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
 }
 
 // Retain the surface's colour-space description and serialized-property hash with each sample.
-static void captureColour(IOSurfaceRef surface,uint64_t capture) {
- for(unsigned kind=0;kind<2;++kind) {
-  CFTypeRef property=IOSurfaceCopyValue(surface,kind?kIOSurfaceICCProfile:kIOSurfaceColorSpace);
-  NativeGpuTraceRecord rec{};rec.event=56;rec.value[0]=IOSurfaceGetID(surface);rec.value[1]=capture;rec.value[2]=kind;
-  if(property) {
-   CFStringRef description=CFCopyDescription(property);
-   if(description) {
-    rec.value[3]=CFStringGetLength(description);
-    char *text=(char *)&rec.value[4];CFIndex used=0;
-    CFStringGetBytes(description,CFRangeMake(0,CFStringGetLength(description)),kCFStringEncodingUTF8,'?',false,(UInt8 *)text,63,&used);
-    CFRelease(description);
-   }
-   CFDataRef data=kind && CFGetTypeID(property)==CFDataGetTypeID()?(CFDataRef)CFRetain(property):
-       CFPropertyListCreateData(kCFAllocatorDefault,property,kCFPropertyListBinaryFormat_v1_0,0,nullptr);
-   if(data) {
-    NativeGpuTraceRecord digest{};digest.event=57;digest.value[0]=rec.value[0];digest.value[1]=capture;digest.value[2]=kind;
-    digest.value[3]=CFDataGetLength(data);
-    CC_SHA256(CFDataGetBytePtr(data),(CC_LONG)CFDataGetLength(data),(unsigned char *)&digest.value[4]);
-    (void)gFrameTransport(NativeGpuTraceMethod,&digest,sizeof(digest));CFRelease(data);
-   }
-   CFRelease(property);
-  }
-  (void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));
- }
-}
-// Samples retain the IOSurface owner through the real completion callback.
-static void captureFrameSurfaces(NBCommandBuffer *cb) {
- if(!frameTraceOn() || !gFrameTransport || !getenv("SHENG_GPU_PIXELS"))return;
- const char *name=getprogname();const uint32_t stage=name && strstr(name,"Poster")?1:name && !strcmp(name,"backboardd")?2:0;
- if(!stage)return;
- static std::mutex gate;static unsigned taken;static uint64_t last;
- std::unique_lock<std::mutex> lock(gate,std::try_to_lock);if(!lock.owns_lock())return;
- const uint64_t now=nowUs();if(taken>=3 || (last && now-last<30000000))return;
- NBTexture *chosen=nil;uint64_t pixels=0;
- for(NBTexture *t in cb.surfaces) {
-  const uint32_t usage=[cb.traceUsage[[NSValue valueWithPointer:t.handle]] unsignedIntValue];
-  if(!(usage&2) || !t.surface || IOSurfaceGetPlaneCount(t.surface)>1)continue;
-  if(t.descriptor.width*t.descriptor.height>pixels){chosen=t;pixels=t.descriptor.width*t.descriptor.height;}
- }
- if(!chosen)return;
- const auto td=chosen.descriptor;const uint32_t bpp=td.format==115?8:(td.format==70 || td.format==71 || td.format==80 || td.format==81)?4:0;
- IOSurfaceRef surface=chosen.surface;const uint64_t stride=chosen.rowBytes,allocation=IOSurfaceGetAllocSize(surface);
- const uint8_t *base=(const uint8_t *)IOSurfaceGetBaseAddress(surface);
- if(!bpp || !base || !td.width || !td.height || td.width>16384 || td.height>16384 ||
-    td.width!=IOSurfaceGetWidth(surface) || td.height!=IOSurfaceGetHeight(surface) ||
-    stride<td.width*bpp || chosen.offset>allocation || stride*(td.height-1)+td.width*bpp>allocation-chosen.offset) {
-  frameEvent(40,cb->traceNumber,stage,1,td.format,IOSurfaceGetID(surface));last=now;return;
- }
- const uint32_t gw=(uint32_t)std::min<uint64_t>(64,td.width),gh=(uint32_t)std::min<uint64_t>(64,td.height);
- std::vector<uint8_t> data(gw*gh*bpp),check(data.size());
- auto sample=[&](std::vector<uint8_t> &out) {
-  for(uint32_t y=0;y<gh;++y)for(uint32_t x=0;x<gw;++x)
-   memcpy(out.data()+(y*gw+x)*bpp,base+chosen.offset+(uint64_t(y)*td.height/gh)*stride+(uint64_t(x)*td.width/gw)*bpp,bpp);
- };
- sample(data);sample(check);
- NativeGpuPixelPiece piece{};auto &h=piece.header;
- h.magic=0x31585047;h.version=1;h.stage=stage;h.capture=cb->traceNumber;h.us=now;h.command=cb->traceNumber;
- h.surface=IOSurfaceGetID(surface);h.width=(uint32_t)td.width;h.height=(uint32_t)td.height;h.format=(uint32_t)td.format;
- h.colour_space=td.format==71 || td.format==81?2:1;h.source_stride=stride;h.grid_width=gw;h.grid_height=gh;
- h.row_bytes=gw*bpp;h.bytes_per_pixel=bpp;h.flags=1|8|(data!=check?4:0);h.bytes=(uint32_t)data.size();
- bool ok=true;
- for(uint32_t at=0;at<h.bytes && ok;at+=piece.bytes) {
-  piece.offset=at;piece.bytes=std::min<uint32_t>(NativeGpuPixelChunk,h.bytes-at);memcpy(piece.data,data.data()+at,piece.bytes);
-  ok=gFrameTransport(NativeGpuPixelMethod,&piece,sizeof(piece));
- }
- frameEvent(40,h.command,stage,ok?0:2,h.surface,h.format,h.bytes,h.flags);
- if(ok){++taken;captureColour(surface,h.capture);}last=now;
-}
-
 @implementation NBCommandBuffer
 // IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
 static char kUserDictionaryKey;
@@ -3035,30 +2821,10 @@ static char kUserDictionaryKey;
 - (void)setResponsibleTaskIDs:(const void *)ids count:(NSUInteger)count {(void)ids;(void)count;}
 - (instancetype)init {
  if((self=[super init])){_scheduledHandlers=[NSMutableArray array];_completedHandlers=[NSMutableArray array];_surfaces=[NSMutableSet set];_resourceOwners=[NSMutableSet set];_handlers=dispatch_group_create();_schedulingHandlers=dispatch_group_create();}
- if(self){traceNumber=++gFrameNumber;if(frameTraceOn())_traceUsage=[NSMutableDictionary dictionary];createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();installDispatchTrace();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);}
+ if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible)traceThread(1);frontStage(traceNumber,0,1);}
  return self;
 }
 - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
-- (void)traceTexture:(NBTexture *)texture usage:(uint32_t)usage {
- if(!frameTraceOn() || !texture)return;
- NSValue *key=[NSValue valueWithPointer:texture.handle];_traceUsage[key]=@([_traceUsage[key] unsignedIntValue]|usage);
- const auto td=texture.descriptor;IOSurfaceRef surface=texture.surface;
- frameEvent(31,traceNumber,(uintptr_t)texture.handle,surface?IOSurfaceGetID(surface):0,
-    surface?(uintptr_t)IOSurfaceGetBaseAddress(surface):0,surface?IOSurfaceGetAllocSize(surface):0,
-    td.width,td.height,texture.rowBytes,td.format,0,usage,texture.offset);
- frameEvent(35,(uintptr_t)texture.handle,(uintptr_t)[(NBTexture *)texture.parentTexture handle],td.format,td.swizzle,
-    td.samples,td.type,td.usage,surface?IOSurfaceGetPixelFormat(surface):0);
-}
-- (void)tracePhase:(uint32_t)phase {
- if(!frameTraceOn())return;
- const uint64_t runtime=_handle?nmb_command_buffer_diagnostic_id(_handle):0;
- frameEvent(30,traceNumber,runtime,phase,self.status,_dumpPasses,self.commitIndex,(uintptr_t)_handle);
- for(NBTexture *t in _surfaces)frameEvent(31,traceNumber,(uintptr_t)t.handle,t.surface?IOSurfaceGetID(t.surface):0,
-    t.surface?(uintptr_t)IOSurfaceGetBaseAddress(t.surface):0,t.surface?IOSurfaceGetAllocSize(t.surface):0,
-    t.descriptor.width,t.descriptor.height,t.rowBytes,t.descriptor.format,phase,
-    [_traceUsage[[NSValue valueWithPointer:t.handle]] unsignedIntValue],t.offset);
-}
-
 - (void)watchTexture:(NBTexture *)texture {
  const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
  const size_t length=(size_t)texture.rowBytes*(size_t)texture.descriptor.height;
@@ -3189,13 +2955,13 @@ static char kUserDictionaryKey;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
-  [_resourceOwners addObject:texture];[self traceTexture:texture usage:4];
+  [_resourceOwners addObject:texture];
   const size_t copiesBefore=resolveCopies.size();
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [_resourceOwners addObject:resolve];[self traceTexture:resolve usage:4];if(resolve.surface)[_surfaces addObject:resolve];
+   [_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
@@ -3217,23 +2983,12 @@ static char kUserDictionaryKey;
     out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    }
   }
-  [self traceTexture:texture usage:out.texture==texture.handle?(a.loadAction==MTLLoadActionLoad?3:2):0];
-  if(a.resolveTexture) {
-   NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   if(out.texture==resolve.handle || out.resolve_texture==resolve.handle || resolveCopies.size()>copiesBefore)
-    [self traceTexture:resolve usage:2];
-  }
-  frameEvent(33,traceNumber,_dumpPasses,attachmentIndex,(uintptr_t)texture.handle,(uintptr_t)out.texture,
-      (uintptr_t)out.resolve_texture,a.texture.sampleCount,texture.descriptor.samples,a.loadAction,a.storeAction,out.load,out.store);
   if(diagOn()) {
    TraceRec rec{};rec.type=16;rec.t0=nowUs();rec.t1=traceNumber;rec.t2=(uintptr_t)out.texture;rec.t3=(uintptr_t)out.resolve_texture;
    rec.a=_dumpPasses;rec.b=attachmentIndex;rec.c=(uint32_t)out.load|((uint32_t)out.store<<8)|((uint32_t)texture.descriptor.samples<<16);
    rec.d=(uint32_t)a.texture.pixelFormat;rec.tid=(uint32_t)texture.width;rec.cpu0=texture.height;
    rec.cpu1=texture.surface?IOSurfaceGetID(texture.surface):0;rec.tid2=(uint32_t)a.texture.sampleCount;tracePush(rec);
   }
-  frameEvent(34,traceNumber,_dumpPasses,attachmentIndex,(uintptr_t)[(NBTexture *)a.resolveTexture handle],
-      a.texture.pixelFormat,a.resolveTexture.pixelFormat,texture.descriptor.swizzle,resolveCopies.size(),
-      singleSample(),a.level,a.slice,a.depthPlane);
   if(freezeWallpaperOn() && attachmentIndex<8) {
    auto output=[&](NBTexture *written) {
     if(written.surface && written.width*written.height>=2000000 &&
@@ -3280,7 +3035,6 @@ static char kUserDictionaryKey;
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
  if(self.committed){[self refuse:@"event encoded after commit"];return;}
- frameEvent(32,traceNumber,(uintptr_t)[(NBEvent *)event handle],value,signal);
  ENCODE(NmbEvent *handle=[(NBEvent *)event handle];
         if(!(signal?nmb_command_buffer_signal_event(self->_handle,handle,value):nmb_command_buffer_wait_event(self->_handle,handle,value)))
          [self refuse:[NSString stringWithFormat:@"%s: %@",signal?"encodeSignalEvent":"encodeWaitForEvent",lastError()]]);
@@ -3289,7 +3043,6 @@ static char kUserDictionaryKey;
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
 // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
 - (void)didSchedule {
- [self tracePhase:2];
  {
   const uint64_t took=nowUs()-self.committedUs;
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -3311,6 +3064,7 @@ static char kUserDictionaryKey;
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  DetailCommandScope commandScope(traceNumber);
+ traceThread(3);
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
@@ -3319,13 +3073,10 @@ static char kUserDictionaryKey;
   std::lock_guard<std::recursive_mutex> guard(gWallpaperLock);
   if(!gWallpaperFrozenCommand) {
    gWallpaperFrozenOutput=self.wallpaperOutput;gWallpaperFrozenCommand=traceNumber;gWallpaperFrozenAt=nowUs();
-   wallpaperNote(2,traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
    GLOG(@"native-metal: wallpaper frozen after completed command %llu surface %u; later GPU commits remain pending",
         (unsigned long long)traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
   }
  }
- [self tracePhase:3];
- if(!self.failedLocally && self.status==MTLCommandBufferStatusCompleted)captureFrameSurfaces(self);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  frontStage(traceNumber,self.commitIndex,10);
@@ -3403,15 +3154,12 @@ static char kUserDictionaryKey;
   wallpaperLock.lock();
   if(gWallpaperFrozenCommand) {
    ++gWallpaperParked;
-   wallpaperNote(3,traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
    // gInFlight and the runtime queue lease retain this pending command and its
    // resources. No GPU commit, scheduled callback or completed callback is made.
    return;
   }
   ++gWallpaperAllowed;
-  wallpaperNote(1,traceNumber,self.wallpaperOutput?IOSurfaceGetID(self.wallpaperOutput.surface):0);
  }
- [self tracePhase:1];
  if(!self.encodeFailure) {
   frontStage(traceNumber,self.commitIndex,4);
   const uint64_t flushed=flushSurfaces(_surfaces);
@@ -3559,7 +3307,6 @@ static void completed(void *context) {
  if(background)_priority.background=(uint32_t)value;else _priority.foreground=(uint32_t)value;
  gQueuePriorities.add(_priority);const auto effective=gQueuePriorities.aggregate();
  const bool accepted=nbForwardPriority(effective.foreground,effective.background);
- frameEvent(55,(uintptr_t)_handle,value,background,effective.foreground,effective.background,accepted);
  if(accepted)return YES;
  gQueuePriorities.remove(_priority);_priority=old;gQueuePriorities.add(old);return NO;
 }
@@ -4120,7 +3867,6 @@ static char dvmMemoryReleaseKey;
   if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
  }
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- frameEvent(49,(uintptr_t)handle,d.sampleCount,descriptor.samples,d.pixelFormat,descriptor.format,d.width,d.height,packedSwizzle(d.swizzle));
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  texture.parentHeap=(id<MTLHeap>)self;texture.heapOffset=offset==UINT64_MAX?0:offset;return (id<MTLTexture>)texture;
 }
@@ -4395,7 +4141,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
         (unsigned long long)descriptor.usage,(unsigned long long)descriptor.options,handle?"made":"REFUSED");
  if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
- frameEvent(49,(uintptr_t)handle,d.sampleCount,descriptor.samples,d.pixelFormat,descriptor.format,d.width,d.height,packedSwizzle(d.swizzle));
  if(isPvrtc(d.pixelFormat))texture.pvrtc=(uint32_t)d.pixelFormat;
  return (id<MTLTexture>)texture;
 }
@@ -4420,7 +4165,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
- frameEvent(49,(uintptr_t)texture.handle,d.sampleCount,texture.descriptor.samples,d.pixelFormat,texture.descriptor.format,d.width,d.height,packedSwizzle(d.swizzle),plane);
  gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
@@ -4541,7 +4285,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  gTimePipeline.add(pipelineBegan);
  if(!handle) {
   NBFunction *f=(NBFunction *)function;
-  nbNotePipeline(false,true,nowUs()-pipelineBegan,0,0,0,f.name.UTF8String,"-",lastError().UTF8String);
   noteProblem([NSString stringWithFormat:@"compute %@ k=%s: %@",f.name,f.constantsText.c_str(),lastError()]);
   return failWith<id<MTLComputePipelineState>>(error,@"compute pipeline",nil);
  }
@@ -4549,7 +4292,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   NmbComputePipelineDescriptor p={};p.function=built.handle;p.max_call_stack_depth=1;
   *reflection=(MTLComputePipelineReflection *)computeReflection(&p);
  }
- nbNotePipeline(true,true,nowUs()-pipelineBegan,0,0,0,((NBFunction *)function).name.UTF8String,"-","");
  NBComputePipeline *state=[NBComputePipeline new];state.handle=handle;gPipelines++;if(error)*error=nil;return (id<MTLComputePipelineState>)state;
 }
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)d options:(MTLPipelineOption)options
@@ -4604,8 +4346,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   static std::atomic<int> told{0};
   if(told.fetch_add(1)<64)NBLOG(@"native-metal: render pipeline descriptor refused (vertex %@, fragment %@): %@",d.vertexFunction.name,
                                d.fragmentFunction.name,error?(*error).localizedDescription:@"?");
-  nbNotePipeline(false,false,0,0,0,(uint32_t)d.colorAttachments[0].pixelFormat,d.fragmentFunction.name.UTF8String,d.vertexFunction.name.UTF8String,
-                 [(error?(*error).localizedDescription:@"descriptor") UTF8String]);
   delete p;return nil;
  }
  std::vector<NmbBinaryArchive *> archives;
@@ -4613,9 +4353,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
- uint32_t programVs=0,programFs=0;nbLastProgram(&programVs,&programFs);   // clear what an earlier creation on this thread left
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
- nbLastProgram(&programVs,&programFs);
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
  std::string cost=gJournalPath.empty()?std::string():NBCost::now().since(costBegan);
@@ -4626,8 +4364,6 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
   cost+=text;
  }
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),cost);
- nbNotePipeline(handle!=nullptr,false,nowUs()-pipelineBegan,programVs,programFs,(uint32_t)d.colorAttachments[0].pixelFormat,d.fragmentFunction.name.UTF8String,
-                d.vertexFunction.name.UTF8String,handle?"":lastError().UTF8String);
  if(!handle) {
   // The tail of the text (what a client's problem row keeps) names the fragment function, the linked functions given and the compiler's
   // state: a missing linked function there is RenderBox's stitched custom_blend, which needs the compiler.
@@ -4764,17 +4500,10 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(cache && *cache)configureShaderDiskCache(cache);
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
- if(frameTraceOn() && loader) {
-  void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD);
-  if(library)gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
+ if(diagOn() && loader) {
+  if(gpuTraceOn())if(void *library=dlopen(loader,RTLD_NOW|RTLD_NOLOAD))
+   gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
   nmb_gpu_diagnostic_hook(frameRuntime);
-  frameText(46,getprogname());frameEvent(48,singleSample(),getenv("SHENG_GPU_PIXELS")!=nullptr);
-  if(freezeWallpaperOn())wallpaperNote(0,0,0);
-  if(library)if(auto build=(const char *(*)())dlsym(library,"tu_darwin_frame_build_id"))frameText(58,build());
-  frameText(59,getenv("TU_DEBUG")?getenv("TU_DEBUG"):"default");
-#ifdef NATIVE_METAL_BUILD_ID
-  frameText(47,NATIVE_METAL_BUILD_ID);
-#endif
  }
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
