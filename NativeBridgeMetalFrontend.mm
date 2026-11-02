@@ -1976,9 +1976,27 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
 @property(nonatomic) uint32_t dumpPasses,dumpKernels;
 @property(nonatomic) BOOL dumpReadback;
+@property(nonatomic,strong) NBTexture *wallpaperOutput;
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
 @end
+// Diagnostic isolation: a completed wallpaper output remains visible while later
+// commands stay committed but unscheduled. PosterBoard is the manager, not a renderer.
+static bool freezeWallpaperOn() {
+ static const bool enabled=[] {
+  const char *value=getenv("NATIVE_METAL_FREEZE_WALLPAPER"),*name=getprogname();
+  return value && !strcmp(value,"1") && name && strstr(name,"Poster") && strcmp(name,"PosterBoard");
+ }();
+ return enabled;
+}
+// Serializes admission with the completion transition. Recursive because an empty
+// or immediately completed runtime commit may deliver its callback on this thread.
+static std::recursive_mutex gWallpaperLock;
+static uint64_t gWallpaperFrozenCommand,gWallpaperFrozenAt,gWallpaperAllowed,gWallpaperParked;
+static NBTexture *gWallpaperFrozenOutput;
+static void wallpaperNote(unsigned phase,uint64_t command,uint64_t surface) {
+ frameEvent(60,phase,command,surface,gWallpaperFrozenCommand,gWallpaperFrozenAt,gWallpaperAllowed,gWallpaperParked);
+}
 struct SingleSampleCopy {
  NmbTexture *source,*destination;
  uint64_t sourceLevel,sourceSlice,destinationLevel,destinationSlice;
@@ -3195,6 +3213,16 @@ static char kUserDictionaryKey;
   frameEvent(34,traceNumber,_dumpPasses,attachmentIndex,(uintptr_t)[(NBTexture *)a.resolveTexture handle],
       a.texture.pixelFormat,a.resolveTexture.pixelFormat,texture.descriptor.swizzle,resolveCopies.size(),
       singleSample(),a.level,a.slice,a.depthPlane);
+  if(freezeWallpaperOn() && attachmentIndex<8) {
+   auto output=[&](NBTexture *written) {
+    if(written.surface && written.width*written.height>=2000000 &&
+       (!self.wallpaperOutput || written.width*written.height>self.wallpaperOutput.width*self.wallpaperOutput.height))
+     self.wallpaperOutput=written;
+   };
+   if(out.store==MTLStoreActionStore || out.store==MTLStoreActionStoreAndMultisampleResolve)
+    output(out.texture==texture.handle?texture:(NBTexture *)a.resolveTexture);
+   if(out.resolve_texture || resolveCopies.size()>copiesBefore)output((NBTexture *)a.resolveTexture);
+  }
   return true;
  };
  for(unsigned i=0;i<8;i++) {
@@ -3262,11 +3290,22 @@ static char kUserDictionaryKey;
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  flushSurfaces(_surfaces);
+ if(freezeWallpaperOn() && !self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
+    self.wallpaperOutput && encodedWork.draws) {
+  std::lock_guard<std::recursive_mutex> guard(gWallpaperLock);
+  if(!gWallpaperFrozenCommand) {
+   gWallpaperFrozenOutput=self.wallpaperOutput;gWallpaperFrozenCommand=traceNumber;gWallpaperFrozenAt=nowUs();
+   wallpaperNote(2,traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
+   GLOG(@"native-metal: wallpaper frozen after completed command %llu surface %u; later GPU commits remain pending",
+        (unsigned long long)traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
+  }
+ }
  [self tracePhase:3];
  if(!self.failedLocally && self.status==MTLCommandBufferStatusCompleted)captureFrameSurfaces(self);
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ self.wallpaperOutput=nil;
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
  trimHeldImports(false);
@@ -3326,6 +3365,19 @@ static char kUserDictionaryKey;
 }
 // The runtime's half of a commit, on the encoding thread after the command buffer's encoders.
 - (void)submit {
+ std::unique_lock<std::recursive_mutex> wallpaperLock(gWallpaperLock,std::defer_lock);
+ if(freezeWallpaperOn()) {
+  wallpaperLock.lock();
+  if(gWallpaperFrozenCommand) {
+   ++gWallpaperParked;
+   wallpaperNote(3,traceNumber,IOSurfaceGetID(gWallpaperFrozenOutput.surface));
+   // gInFlight and the runtime queue lease retain this pending command and its
+   // resources. No GPU commit, scheduled callback or completed callback is made.
+   return;
+  }
+  ++gWallpaperAllowed;
+  wallpaperNote(1,traceNumber,self.wallpaperOutput?IOSurfaceGetID(self.wallpaperOutput.surface):0);
+ }
  [self tracePhase:1];
  if(!self.encodeFailure) {
   flushSurfaces(_surfaces);
@@ -4679,6 +4731,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
   if(library)gFrameTransport=(bool (*)(uint32_t,const void *,uint32_t))dlsym(library,"tu_darwin_frame_diagnostic");
   nmb_gpu_diagnostic_hook(frameRuntime);
   frameText(46,getprogname());frameEvent(48,singleSample(),getenv("SHENG_GPU_PIXELS")!=nullptr);
+  if(freezeWallpaperOn())wallpaperNote(0,0,0);
   if(library)if(auto build=(const char *(*)())dlsym(library,"tu_darwin_frame_build_id"))frameText(58,build());
   frameText(59,getenv("TU_DEBUG")?getenv("TU_DEBUG"):"default");
 #ifdef NATIVE_METAL_BUILD_ID
