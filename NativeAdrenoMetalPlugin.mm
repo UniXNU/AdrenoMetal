@@ -23,6 +23,8 @@
 #include <libkern/OSCacheControl.h>
 #include <objc/message.h>
 #include "NativeAdrenoUserTest.h"
+#include "NativeTurnipSwapTest.h"
+#include "NativeGpuTrace.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
 #include "PrimeShaders.h"
@@ -437,6 +439,28 @@ static id deviceForPort(unsigned port) {
                 return nullptr;
             }, nullptr);
         pthread_attr_destroy(&attributes);
+        // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
+        // kernel's GPU trace as a problem record (event 65).
+        if (bootArgSet("sheng-swaptest=1") && !strcmp(getprogname(), "backboardd")) {
+            pthread_t tester;
+            pthread_create(&tester, nullptr, [](void *) -> void * {
+                    sleep(20);
+                    char path[1024];
+                    if (!turnip::libraryPath(path, sizeof path)) return nullptr;
+                    void *lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+                    auto send = lib ? reinterpret_cast<bool (*)(uint32_t, const void *, uint32_t)>(dlsym(lib, "tu_darwin_frame_diagnostic"))
+                                    : nullptr;
+                    turnip::swaptest::run(path, [&](const char *text) {
+                        if (!send) return;
+                        NativeGpuTraceRecord record = {};
+                        record.event = GpuTraceProblem;
+                        strlcpy(reinterpret_cast<char *>(&record.value[1]), text, 11 * sizeof(uint64_t));
+                        send(NativeGpuTraceMethod, &record, sizeof record);
+                    });
+                    return nullptr;
+                }, nullptr);
+            pthread_detach(tester);
+        }
         gpu->mark(0x6803);
         return device;
     }
