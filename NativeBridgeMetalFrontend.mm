@@ -492,6 +492,17 @@ static char gFirstProblem[200];
 void (*native_bridge_metal_problem_hook)(const char *);
 // Shader priming's thread: its refusals (a vertex function primed without the vertex descriptor its app gives it) are counted, not
 // reported, so the first problem and the last ones stay the clients' own.
+// Process-local evidence in a diagnostic boot, carried in the existing kernel text channel.
+// Only the selected client emits these notifications. They do not schedule GPU work.
+static bool iconMetalTrace() {
+ return gpuTraceOn() && gFrameTransport && !strcmp(getprogname(), "iconservicesagent");
+}
+static void iconMetalText(const char *line) {
+ NativeGpuTraceRecord rec{};
+ rec.event=GpuTraceProblem;
+ strlcpy((char *)&rec.value[1],line,sizeof(rec.value)-sizeof(rec.value[0]));
+ (void)gFrameTransport(NativeGpuTraceMethod,&rec,sizeof(rec));
+}
 static thread_local bool tQuietProblems;
 extern "C" void native_bridge_metal_quiet_problems(bool quiet) {tQuietProblems=quiet;}
 // Notes every process makes and that change nothing it draws: they must not stand in the one line a client's failure is reported on.
@@ -3266,6 +3277,18 @@ static void scheduled(void *context) {[(__bridge NBCommandBuffer *)context didSc
 static void completed(void *context) {
  gCompleted++;
  NBCommandBuffer *commandBuffer=(__bridge_transfer NBCommandBuffer *)context;
+ if(iconMetalTrace() && !commandBuffer.failedLocally &&
+    (commandBuffer->encodedWork.draws || commandBuffer->encodedWork.dispatches)) {
+  static std::atomic<unsigned> sampled{0};
+  if(sampled.load(std::memory_order_relaxed)<8 && sampled.fetch_add(1,std::memory_order_relaxed)<8) {
+   const auto &work=commandBuffer->encodedWork;
+   char text[88];
+   snprintf(text,sizeof(text),"metal-work cb=%u st=%llu pass=%u draw=%u dispatch=%u px=%llu",
+     (unsigned)commandBuffer.commitIndex,(unsigned long long)nmb_command_buffer_status(commandBuffer.handle),
+     work.passes,work.draws,work.dispatches,(unsigned long long)work.pixels);
+   iconMetalText(text);
+  }
+ }
  {
   const uint64_t took=nowUs()-commandBuffer.committedUs;
   {
@@ -4079,6 +4102,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 }
 - (id<MTLCommandQueue>)newCommandQueue {
  NmbQueue *handle=nmb_queue_new(gDevice);if(!handle)return nil;
+ if(iconMetalTrace()) {static std::atomic<bool> seen{false};if(!seen.exchange(true))iconMetalText("metal-queue allocated from client MTLDevice");}
  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
 }
 - (id<MTLHeap>)newHeapWithDescriptor:(MTLHeapDescriptor *)d {
@@ -4133,6 +4157,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 - (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:(NSUInteger)count {
  NmbQueue *handle=nmb_queue_new_with_max_command_buffer_count(gDevice,count);
  if(!handle){NBLOG(@"native-metal: command queue refused: %@",lastError());return nil;}
+ if(iconMetalTrace()) {static std::atomic<bool> seen{false};if(!seen.exchange(true))iconMetalText("metal-queue allocated from client MTLDevice");}
  NBQueue *queue=[NBQueue new];queue.handle=handle;return (id<MTLCommandQueue>)queue;
 }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
@@ -4572,6 +4597,11 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
   for(const auto &c:conformances){Class k=objc_getClass(c[0]);Protocol *pr=objc_getProtocol(c[1]);if(k&&pr)class_addProtocol(k,pr);}}
  objc_registerClassPair(cls);
  gDeviceObject=[cls new];
+ if(gDeviceObject && iconMetalTrace()) {
+  char text[88];
+  snprintf(text,sizeof(text),"metal-device %s reg=%llx %.42s",class_getName(cls),(unsigned long long)registryID,name);
+  iconMetalText(text);
+ }
  return gDeviceObject;
 }
 
