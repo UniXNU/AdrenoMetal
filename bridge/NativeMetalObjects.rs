@@ -229,6 +229,12 @@ impl PipelineRecords {
     }
 }
 
+/// True where `NATIVE_METAL_FLOW=1` (the boot argument `sheng-metal-flow=1`) enables the lowering thread, commit submission and the warm pass.
+fn flow_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NATIVE_METAL_FLOW").is_some_and(|value| value == "1"))
+}
+
 /// # Safety
 /// `loader` and `cache` are C strings.
 #[unsafe(no_mangle)]
@@ -253,8 +259,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
         // pay for them. A refusal only the lowering finds fails the command buffer, naming the call.
-        options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
-        let records = PipelineRecords::open(cache.to_string_lossy().as_ref());
+        if flow_on() {
+            options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
+        }
+        let records = flow_on().then(|| PipelineRecords::open(cache.to_string_lossy().as_ref())).flatten();
         if let Some(records) = records.clone() {
             options.pipeline_records = Some(std::sync::Arc::new(move |record| records.keep(&record)));
         }
@@ -2275,7 +2283,12 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
     guard(false, || {
         // The committing thread submits where no other pass is under way, with no wake of the scheduler thread between commit and GPU.
-        get(command_buffer)?.0.commit_and_submit().map_err(e("commit"))?;
+        let command_buffer = &get(command_buffer)?.0;
+        if flow_on() {
+            command_buffer.commit_and_submit().map_err(e("commit"))?;
+        } else {
+            command_buffer.commit().map_err(e("commit"))?;
+        }
         Ok(true)
     })
 }
