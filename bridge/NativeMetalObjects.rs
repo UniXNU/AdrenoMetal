@@ -165,6 +165,70 @@ impl NmbDevice {
     }
 }
 
+/// One program's pipeline records in the shader cache directory: each a 32-bit little-endian length and the record's bytes, appended in
+/// the order they came, each distinct record once. Deleting the file only costs the next process its warm pass.
+#[derive(Clone)]
+struct PipelineRecords(std::sync::Arc<PipelineRecordsFile>);
+
+struct PipelineRecordsFile {
+    file: std::sync::Mutex<std::fs::File>,
+    seen: std::sync::Mutex<std::collections::HashSet<u64>>,
+    earlier: std::sync::Mutex<Vec<metal2vulkan_runtime::PipelineRecord>>,
+}
+
+fn record_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
+impl PipelineRecords {
+    /// `None` where the directory takes no file (a sandbox's read-only cache) or the program has no name.
+    fn open(cache: &str) -> Option<PipelineRecords> {
+        let name = std::env::current_exe().ok()?.file_stem()?.to_string_lossy().into_owned();
+        let path = PathBuf::from(cache).join(format!("pipeline-records-{name}.bin"));
+        let kept = std::fs::read(&path).unwrap_or_default();
+        let (mut seen, mut earlier) = (std::collections::HashSet::new(), Vec::new());
+        let mut rest = kept.as_slice();
+        while let Some((length, after)) = rest.split_first_chunk::<4>() {
+            let Some((bytes, after)) = after.split_at_checked(u32::from_le_bytes(*length) as usize) else {
+                break;
+            };
+            rest = after;
+            if seen.insert(record_hash(bytes)) {
+                earlier.extend(metal2vulkan_runtime::PipelineRecord::from_bytes(bytes));
+            }
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok()?;
+        Some(PipelineRecords(std::sync::Arc::new(PipelineRecordsFile {
+            file: std::sync::Mutex::new(file),
+            seen: std::sync::Mutex::new(seen),
+            earlier: std::sync::Mutex::new(earlier),
+        })))
+    }
+
+    fn keep(&self, record: &metal2vulkan_runtime::PipelineRecord) {
+        use std::io::Write;
+        let bytes = record.to_bytes();
+        let Ok(length) = u32::try_from(bytes.len()) else {
+            return;
+        };
+        if !self.0.seen.lock().unwrap_or_else(|e| e.into_inner()).insert(record_hash(&bytes)) {
+            return;
+        }
+        let mut frame = Vec::with_capacity(bytes.len() + 4);
+        frame.extend_from_slice(&length.to_le_bytes());
+        frame.extend_from_slice(&bytes);
+        // One write of the whole frame, so another process of this program appending to the file does not split it.
+        let _ = self.0.file.lock().unwrap_or_else(|e| e.into_inner()).write_all(&frame);
+    }
+
+    fn take_earlier(&self) -> Vec<metal2vulkan_runtime::PipelineRecord> {
+        std::mem::take(&mut *self.0.earlier.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
 /// # Safety
 /// `loader` and `cache` are C strings.
 #[unsafe(no_mangle)]
@@ -187,6 +251,13 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
         options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
+        // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
+        // pay for them. A refusal only the lowering finds fails the command buffer, naming the call.
+        options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
+        let records = PipelineRecords::open(cache.to_string_lossy().as_ref());
+        if let Some(records) = records.clone() {
+            options.pipeline_records = Some(std::sync::Arc::new(move |record| records.keep(&record)));
+        }
         // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
         options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
@@ -194,6 +265,11 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
         // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
         device.refuse_rebinds();
+        // What this program made in earlier processes is made again in the background, below every other making. The shader cache's own
+        // capacity bounds the data, so the pass takes no budget of its own.
+        if let Some(records) = records {
+            device.warm(records.take_earlier(), u64::MAX);
+        }
         Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default())))
     })
 }
@@ -2180,7 +2256,8 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
     guard(false, || {
-        get(command_buffer)?.0.commit().map_err(e("commit"))?;
+        // The committing thread submits where no other pass is under way, with no wake of the scheduler thread between commit and GPU.
+        get(command_buffer)?.0.commit_and_submit().map_err(e("commit"))?;
         Ok(true)
     })
 }
