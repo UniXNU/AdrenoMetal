@@ -4785,6 +4785,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   if(nmb_device_texture_counts(gDevice,tc))
    row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
     (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
+  // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
+  // log waits, encoder ends on the lowering thread.
+  uint64_t flow[8]={};
+  if(nmb_device_flow_counts(gDevice,flow))
+   row("FL w %llu/%llu/%llu %lluK cm %llu/%llu lw %llu le %llu",(unsigned long long)flow[0],(unsigned long long)flow[1],(unsigned long long)flow[2],
+    (unsigned long long)(flow[3]>>10),(unsigned long long)flow[4],(unsigned long long)flow[5],(unsigned long long)flow[6],(unsigned long long)flow[7]);
   // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
   {
    std::lock_guard<std::mutex> lock(gUnalignedLock);
