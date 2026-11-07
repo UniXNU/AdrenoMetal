@@ -29,7 +29,12 @@ static bool run(id<MTLDevice> device, uint32_t w, uint32_t h, size_t srcStride, 
     const gpupresent::Result r = presenter.present({src, srcBytes, srcStride, w, h, 0, NGP_BGRX8888});
     if (r != gpupresent::kOk) {std::printf("FAIL %s present %d\n", name, (int)r); return false;}
     for (uint32_t y = 0; y < h; ++y) {
-        if (memcmp(dst + y * dstStride, src + y * srcStride, (size_t)w * 4)) {std::printf("FAIL %s row %u differs\n", name, y); return false;}
+        // The kernel scanout_opaque stores alpha 0xff; the Mac's own device runs no kernel of the bridge and blits the bytes as they are.
+        const bool opaque = !getenv("NMB_SYSTEM_DEVICE");
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t *in = src + y * srcStride + x * 4, *out = dst + y * dstStride + x * 4;
+            if (memcmp(in, out, 3) || out[3] != (opaque ? 0xff : in[3])) {std::printf("FAIL %s row %u pixel %u differs\n", name, y, x); return false;}
+        }
         for (size_t x = (size_t)w * 4; x < dstStride; ++x)
             if (dst[y * dstStride + x] != 0xa5) {std::printf("FAIL %s row %u padding written at %zu\n", name, y, x); return false;}
     }
