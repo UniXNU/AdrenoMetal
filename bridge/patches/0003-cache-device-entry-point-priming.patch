@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index fce02139..053cafe9 100644
+index f73a754bfc76e5f63a00baa6188129f82dafd7a5..d9532762b4b0928059db834985c833ffc225598a 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
-@@ -1503,6 +1503,31 @@ impl Device {
+@@ -1656,6 +1656,31 @@ impl Device {
          // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
          // `bufferDeviceAddress` where `device_address` says so; `queues` holds at least one of
          // its queues, which nothing uses yet.
@@ -34,7 +34,7 @@ index fce02139..053cafe9 100644
          if let Err(error) = unsafe {
              prime::prime(
                  &instance.raw,
-@@ -1518,27 +1543,13 @@ impl Device {
+@@ -1671,27 +1696,13 @@ impl Device {
                  queue_family,
                  &queues,
                  Sharing::new(&queue_families),
@@ -65,10 +65,10 @@ index fce02139..053cafe9 100644
          } {
              scheduler.stop();
 diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
-index 144a6e59..919f5c9e 100644
+index ec9582473be9e57836d454f549efc340b776e3e1..0519ac8a1b43bd9bd6e3ba1208d7dc3a71313716 100644
 --- a/crates/metal2vulkan-runtime/src/device/prime.rs
 +++ b/crates/metal2vulkan-runtime/src/device/prime.rs
-@@ -82,9 +82,11 @@ use crate::gpu_time::Calibration;
+@@ -83,9 +83,11 @@ use crate::gpu_time::Calibration;
  use crate::loader_word::LoaderWord;
  use crate::memory;
  use crate::release::{self, Generated, Released};
@@ -80,7 +80,7 @@ index 144a6e59..919f5c9e 100644
  use std::time::{Duration, Instant};
  
  use super::functions::Vk;
-@@ -361,7 +363,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
+@@ -362,7 +364,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
  /// What the device primed has: a queue family that writes timestamps, `hostQueryReset`, device
  /// addresses, `VK_EXT_device_generated_commands`, sparse binding on its queues, the push command,
  /// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
@@ -89,7 +89,7 @@ index 144a6e59..919f5c9e 100644
  pub(crate) struct Has {
      pub(crate) timestamps: bool,
      pub(crate) host_query_reset: bool,
-@@ -403,6 +405,16 @@ impl PrimedDraws {
+@@ -404,6 +406,16 @@ impl PrimedDraws {
      }
  }
  
@@ -106,7 +106,7 @@ index 144a6e59..919f5c9e 100644
  /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
  /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
  /// thread; `has` says what the device has, `generated` holds the commands of
-@@ -430,6 +442,7 @@ pub(super) unsafe fn prime(
+@@ -431,6 +443,7 @@ pub(super) unsafe fn prime(
      calibration: Option<Calibration>,
      drawn: PrimedDraws,
      ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
@@ -114,7 +114,7 @@ index 144a6e59..919f5c9e 100644
  ) -> Result<(), Error> {
      let mut primer = Primer {
          device,
-@@ -442,6 +455,8 @@ pub(super) unsafe fn prime(
+@@ -443,6 +456,8 @@ pub(super) unsafe fn prime(
          memory: unsafe { instance.get_physical_device_memory_properties(physical) },
          calls: 0,
          held: Vec::new(),
@@ -123,7 +123,7 @@ index 144a6e59..919f5c9e 100644
      };
      // SAFETY: the caller's.
      let primed = unsafe {
-@@ -460,6 +475,10 @@ pub(super) unsafe fn prime(
+@@ -461,6 +476,10 @@ pub(super) unsafe fn prime(
      unsafe {
          let _ = device.device_wait_idle();
          primer.made(Call::DeviceWaitIdle);
@@ -134,7 +134,7 @@ index 144a6e59..919f5c9e 100644
          while let Some(release) = primer.held.pop() {
              let call = release(device);
              primer.made(call);
-@@ -547,6 +566,8 @@ struct Primer<'a> {
+@@ -548,6 +567,8 @@ struct Primer<'a> {
      calls: u128,
      /// What was made, released last first.
      held: Vec<Release>,
@@ -143,7 +143,7 @@ index 144a6e59..919f5c9e 100644
  }
  
  impl Primer<'_> {
-@@ -840,7 +861,7 @@ impl Primer<'_> {
+@@ -855,7 +876,7 @@ impl Primer<'_> {
                  .layout(layout)
                  .push_next(&mut flags);
              let pipeline = device
@@ -152,7 +152,7 @@ index 144a6e59..919f5c9e 100644
                  .map_err(|(_, error)| vulkan(error))?[0];
              self.hold(pipeline);
              let pipelines = ExecutionSetPipelineInfo::new(pipeline, 1);
-@@ -1171,9 +1192,8 @@ impl Primer<'_> {
+@@ -1187,9 +1208,8 @@ impl Primer<'_> {
              let module = device.create_shader_module(&info, None).map_err(vulkan)?;
              self.made(Call::CreateShaderModule);
              self.hold(module);
@@ -165,10 +165,10 @@ index 144a6e59..919f5c9e 100644
              self.hold(cache);
              let specialization = specialization();
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-index c0e8d025..a9da76d1 100644
+index 351160abcd77a353b7eb8a0ddd7433dca10c0f88..508af31c41edd22aa81b3674af772ee505d1fa5e 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-@@ -380,6 +380,106 @@ impl CacheSetup {
+@@ -383,6 +383,106 @@ impl CacheSetup {
      }
  }
  

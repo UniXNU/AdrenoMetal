@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
-index 87190761..4edc64e5 100644
+index 137c56bf7d319d42ac10fbdb668e71156c1e6560..0824988619516fbac95f397c16273912114ee7ee 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
-@@ -438,6 +438,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+@@ -686,6 +686,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
          } = batch;
          lists.gathered.extend(fence.map(|fence| (queue, fence)));
          if last {
@@ -14,7 +14,7 @@ index 87190761..4edc64e5 100644
              let mut state = lock(&buffer.state);
              state.times.completed = seen;
              state.keep_holds(holds);
-@@ -670,6 +675,8 @@ struct Front {
+@@ -964,6 +969,8 @@ struct Front {
      value: u64,
      /// The fence its submission signals, where it has one.
      fence: Option<vk::Fence>,
@@ -23,7 +23,7 @@ index 87190761..4edc64e5 100644
  }
  
  /// `VkQueue` `queue`'s waiter (the module docs): it waits for its queue's first pending batch
-@@ -705,6 +712,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+@@ -999,6 +1006,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
                          let front = Front {
                              value: batch.value,
                              fence: batch.fence,
@@ -31,7 +31,7 @@ index 87190761..4edc64e5 100644
                          };
                          Some((front, batch.buffer.device().clone()))
                      }
-@@ -726,11 +734,18 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+@@ -1020,11 +1028,18 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
              continue;
          };
          device.shared().counts.completion_armed(slept);
@@ -51,25 +51,25 @@ index 87190761..4edc64e5 100644
                  Some(polled)
              }
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-index 409a9db6..37fa6fcf 100644
+index 2df5b1ef7eba508c2026248afde04b9c8ac91b4f..84ca51618da563edafd6600c88dcfc86d4725837 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -2436,9 +2436,12 @@ impl CommandBuffer {
-     /// [`commit`](Self::commit) for `call`, or, with `failure`,
-     /// [`commit_failed`](Self::commit_failed).
-     fn commit_as(&self, call: &'static str, failure: Option<CommitFailure>) -> Result<(), Error> {
+@@ -2934,9 +2934,12 @@ impl CommandBuffer {
+         failure: Option<CommitFailure>,
+         hand: Hand,
+     ) -> Result<(), Error> {
 +        let id = Arc::as_ptr(&self.0) as usize;
 +        crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitCall, 0);
          // Left to wait for the last render encoder's end, where its call left it to the device's
          // lowering thread and the thread has not lowered it, or for the commits left so.
-         if failure.is_none() && self.queue_commit(call)? {
+         if failure.is_none() && self.queue_commit(call, hand)? {
 +            crate::stage_trace::mark(id, crate::stage_trace::Stage::CommitQueued, 0);
              return Ok(());
          }
          // The last render encoder's end, where its call left it to the device's lowering thread.
-@@ -2527,6 +2530,12 @@ impl CommandBuffer {
-         failure: Option<CommitFailure>,
+@@ -3039,6 +3042,12 @@ impl CommandBuffer {
          run: CommitRun,
+         hand: Hand,
      ) -> Result<(), Error> {
 +        let run_kind = match run {
 +            CommitRun::AtCall => 0,
@@ -80,7 +80,7 @@ index 409a9db6..37fa6fcf 100644
          // The waiting fetched render targets take their storage form at this commit where it
          // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
          // ends the switch once it submitted the command buffer. None where nothing of it runs.
-@@ -2739,6 +2748,11 @@ impl CommandBuffer {
+@@ -3283,6 +3292,11 @@ impl CommandBuffer {
                  return Err(error);
              }
          };
@@ -92,15 +92,16 @@ index 409a9db6..37fa6fcf 100644
          // The first segment a host step records, which the device announces (a loop's check
          // records nothing).
          let announced = segments
-@@ -4362,18 +4376,23 @@ impl CommandBufferShared {
+@@ -5036,6 +5050,7 @@ impl CommandBufferShared {
          result: Result<(), CommandBufferError>,
      ) {
          let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
 +        let id = Arc::as_ptr(&*buffer) as usize;
-         let item = Item::Transition(Transition::finished(buffer, result));
-         let item = match program_objects::Unheld::enter() {
-             Some(unheld) => {
-                 let ran = contexts.run_here(queue, item);
+         let (signallers, own): (Vec<Arc<Follow>>, _) = {
+             let state = lock(&buffer.state);
+             let signallers = (state.waited.iter())
+@@ -5084,12 +5099,16 @@ impl CommandBufferShared {
+                 let ran = contexts.run_here(queue, item, may_run);
                  drop(unheld);
                  match ran {
 -                    Ok(()) => return,
@@ -114,14 +115,14 @@ index 409a9db6..37fa6fcf 100644
              None => item,
          };
 +        crate::stage_trace::mark(id, crate::stage_trace::Stage::Finished, 2);
-         contexts.post(queue, item);
+         contexts.post(queue, item.whole());
+         posted();
      }
- 
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-index 7b18eb69..e5e7a777 100644
+index ea86a3909a92f7849b32ec1b05cea9ddcd36b65e..1d32cf1cb209b9e407e90fa75ffcfe4bd2211062 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-@@ -343,6 +343,29 @@ impl CommandBufferShared {
+@@ -419,6 +419,29 @@ impl CommandBufferShared {
          last: bool,
          event_waits: &[(vk::Semaphore, u64)],
          scheduler: &mut scheduler::State,
@@ -152,32 +153,32 @@ index 7b18eb69..e5e7a777 100644
          let device = &self.device;
          if device.is_lost() {
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 400f6882..c5b00b55 100644
+index 92c210d8c38d2bc6fe96c7d7c921f0fb7c84f7f1..1851084aaf7d4d06250db3cc9a69a0e42d5fee4d 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
-@@ -24,6 +24,7 @@
- #![warn(missing_docs)]
+@@ -29,6 +29,7 @@
+ #![recursion_limit = "256"]
  
  mod address;
 +pub mod stage_trace;
  mod address_map;
  mod address_pool;
- mod amplification;
+ mod allocations;
 diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-index d8a3b7b3..34485655 100644
+index 0ba3fc12cfeca2f6a36e29fc79e3a6399b163802..5e9c63ce701e455c993fe54ddd7a44197deb699b 100644
 --- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-@@ -388,6 +388,9 @@ impl SchedulerShared {
-     /// (`asleep`, read under the lock the mark was made under; one that sleeps later reads the
-     /// mark first), counted as `woken`; else the notify, a system call, is spared.
+@@ -517,6 +517,9 @@ impl SchedulerShared {
+     /// lock of its sleep; one that sleeps later reads what the waker wrote first), counted as
+     /// `woken`; else the notify, a system call, is spared.
      fn woken(&self, woken: Woken, asleep: Asleep) {
 +        if !matches!(asleep, Asleep::No) {
 +            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerWake, woken as u32);
 +        }
          match asleep {
+             // The thread alone waits on it.
              Asleep::OnCondvar => {
-                 self.wakings[woken as usize].fetch_add(1, Ordering::Relaxed);
-@@ -537,6 +540,8 @@ struct Held {
+@@ -697,6 +700,8 @@ struct Held {
      /// The host nanoseconds at the first look of the scheduler's that found it held
      /// ([`held_for`](Self::held_for)), until it goes ([`hold_ended`](Self::hold_ended)).
      held_since: Option<u64>,
@@ -186,7 +187,7 @@ index d8a3b7b3..34485655 100644
  }
  
  impl Held {
-@@ -545,6 +550,15 @@ impl Held {
+@@ -705,6 +710,15 @@ impl Held {
      /// read from the host's clock while nothing waits.
      fn held_for(&mut self, reason: HeldFor) {
          (self.buffer.device().shared().counts).head_held_for(reason);
@@ -202,8 +203,8 @@ index d8a3b7b3..34485655 100644
          if self.held_since.is_none() {
              self.held_since = Some(gpu_time::host_nanos());
          }
-@@ -685,6 +699,11 @@ impl Scheduler {
-         batches: Vec<BatchSync>,
+@@ -848,6 +862,11 @@ impl Scheduler {
+         hand: Hand,
      ) {
          let shared = &*self.shared;
 +        crate::stage_trace::mark(
@@ -214,51 +215,52 @@ index d8a3b7b3..34485655 100644
          let committed = Committed {
              buffer: buffer.hold(),
              queue,
-@@ -966,15 +985,20 @@ fn run(shared: &SchedulerShared) {
-             };
+@@ -1216,6 +1235,7 @@ fn run(shared: &Arc<SchedulerShared>) {
+                 && bound.is_none()
+                 && stalls.is_none();
              let slice = bound.map_or(slice, |left| left.min(slice));
-             shared.sleeps.fetch_add(1, Ordering::Relaxed);
 +            let slice_ms = slice.as_millis().min(0x7fff) as u32;
-             if let Some(nudge) = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu)) {
+             let on_gpu = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu));
+             // The lock of the sleep ([`Sleep`]), under the scheduler's: a waker that found no
+             // pass under way wrote what it asks for before it took it, so its commit or nudge is
+@@ -1226,12 +1246,15 @@ fn run(shared: &Arc<SchedulerShared>) {
+             }
+             shared.sleeps.fetch_add(1, Ordering::Relaxed);
+             if let Some(nudge) = on_gpu {
 +                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms | 0x8000);
-                 state = wait_for_gpu(shared, state, nudge, &mut gpu, (slice, short));
+                 state = wait_for_gpu(shared, (state, sleep), nudge, &mut gpu, (slice, short));
 +                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, 0);
+                 #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+                 trace::submitting("thread woke");
                  continue;
              }
-             state.asleep = true;
+             sleep.asleep = true;
 +            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms);
-             let (woke, waited) = shared
-                 .wake
-                 .wait_timeout(state, slice)
-                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-+            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, u32::from(waited.timed_out()));
-             state = woke;
-             state.asleep = false;
-             if waited.timed_out() && !short {
-@@ -1072,7 +1096,10 @@ fn run_work(kind: Kind, work: Work) -> bool {
-     let (buffer, index) = &work;
-     match kind {
-         Kind::Step => {
-+            let id = Arc::as_ptr(&**buffer) as usize;
-+            crate::stage_trace::mark(id, crate::stage_trace::Stage::StepBegin, *index as u32);
-             buffer.host_step(*index);
-+            crate::stage_trace::mark(id, crate::stage_trace::Stage::StepEnd, *index as u32);
-             for &call in exit_guard::HOST_STEP {
-                 exit_guard::called(call);
-             }
-@@ -1098,7 +1125,11 @@ fn run_work(kind: Kind, work: Work) -> bool {
+             // A waker that marks the state under the scheduler's lock takes it once this lets
+             // go of it, and then the sleep's, which the wait lets go of.
+             drop(state);
+@@ -1248,6 +1271,7 @@ fn run(shared: &Arc<SchedulerShared>) {
+                     waited.timed_out()
+                 }
+             };
++            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, u32::from(timed_out));
+             sleep.asleep = false;
+             drop(sleep);
+             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+@@ -1371,8 +1395,12 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
  fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
      (shared.inbox).pass(|state, commits| {
          shared.passes.fetch_add(1, Ordering::Relaxed);
 +        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassBegin, 0);
 +        let before = passed.spent.len();
-         pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
+         let taken = pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
+         shared.took_in(taken);
 +        let spent = passed.spent.len().saturating_sub(before);
 +        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassEnd, spent.min(0xffff) as u32);
          !passed.exiting && left.is_empty() && !passed.more
      });
      passed.more = false;
-@@ -1137,6 +1168,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+@@ -1429,6 +1457,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
      } in commits.drain(..)
      {
          let count = batches.len();
@@ -270,7 +272,7 @@ index d8a3b7b3..34485655 100644
          let State { order, binary, .. } = &mut *state;
          let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
              buffer: buffer.hold(),
-@@ -1151,6 +1187,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) {
+@@ -1444,6 +1477,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
              hastened: false,
              counted_held: false,
              held_since: None,
@@ -278,9 +280,24 @@ index d8a3b7b3..34485655 100644
          });
          order.push(queue, held);
          spent.push(buffer);
+diff --git a/crates/metal2vulkan-runtime/src/scheduler/steps.rs b/crates/metal2vulkan-runtime/src/scheduler/steps.rs
+index 6ac057360c6298484f800bbf3d92d88e67781bda..52b9f9a7f8f45435fe14ebf75c8004bc636def54 100644
+--- a/crates/metal2vulkan-runtime/src/scheduler/steps.rs
++++ b/crates/metal2vulkan-runtime/src/scheduler/steps.rs
+@@ -138,7 +138,10 @@ fn record(shared: &SchedulerShared, work: Work) -> bool {
+     };
+     let (buffer, index) = &work;
+     let started = Instant::now();
++    let id = Arc::as_ptr(&**buffer) as usize;
++    crate::stage_trace::mark(id, crate::stage_trace::Stage::StepBegin, *index as u32);
+     buffer.host_step(*index);
++    crate::stage_trace::mark(id, crate::stage_trace::Stage::StepEnd, *index as u32);
+     for &call in exit_guard::HOST_STEP {
+         exit_guard::called(call);
+     }
 diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
 new file mode 100644
-index 00000000..d401a6c8
+index 0000000000000000000000000000000000000000..d401a6c8e98e98c9a74bff57be118929cb41f026
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
 @@ -0,0 +1,161 @@

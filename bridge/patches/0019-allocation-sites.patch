@@ -1,14 +1,16 @@
 diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
-index 1d760a06..bbb1fb47 100644
+index 8e068e3cb89983628a881b63153ac37841e9779f..480eaa0a4665febc88c0793e594c7a0d94aa95ae 100644
 --- a/crates/metal2vulkan-runtime/src/creation.rs
 +++ b/crates/metal2vulkan-runtime/src/creation.rs
-@@ -109,10 +109,66 @@ pub(crate) unsafe fn allocate_memory(
-     info: &vk::MemoryAllocateInfo<'_>,
- ) -> VkResult<vk::DeviceMemory> {
+@@ -115,12 +115,68 @@ pub(crate) unsafe fn allocate_memory(
+         return Err(vk::Result::ERROR_TOO_MANY_OBJECTS);
+     };
      vk_made(VkMaking::Memory, Location::caller());
 +    note_allocation_site(info.allocation_size);
      // SAFETY: the caller's.
-     unsafe { device.allocate_memory(info, None) }
+     let memory = unsafe { device.allocate_memory(info, None) };
+     allocations::allocated(admitted, memory.is_ok());
+     memory
  }
  
 +/// The call stacks that allocated device memory of at least [`SITE_BYTES`], by the bytes they
@@ -70,10 +72,10 @@ index 1d760a06..bbb1fb47 100644
  ///
  /// # Safety
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index ae78ee38..400f6882 100644
+index 606eab5326bf79f6961a3f0227ad9ee05bf77a7f..92c210d8c38d2bc6fe96c7d7c921f0fb7c84f7f1 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
-@@ -336,6 +336,7 @@ pub use render_values::{
+@@ -357,6 +357,7 @@ pub use render_values::{
  pub use resource::{ObjectId, ResourceRef};
  pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
  pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
@@ -82,10 +84,10 @@ index ae78ee38..400f6882 100644
      ShaderCacheOptions, ShaderCacheStatistics, DEFAULT_CAPACITY, DEFAULT_MEMORY_CAPACITY,
  };
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
-index cf468a3a..7283fc8c 100644
+index 94d37e2894d5f26e90c6aa223e993b07e3049b1c..de624e375544d8f8bf83cde72e88b2e835bb0f86 100644
 --- a/crates/metal2vulkan-runtime/src/work_counts.rs
 +++ b/crates/metal2vulkan-runtime/src/work_counts.rs
-@@ -3259,12 +3259,15 @@ pub struct WorkCounts {
+@@ -4142,12 +4142,15 @@ pub struct WorkCounts {
      pub pooled_memory_blocks_freed: u64,
      /// Its live dedicated blocks: a placement larger than half a block, or one placed apart.
      pub dedicated_memory_blocks_live: u64,

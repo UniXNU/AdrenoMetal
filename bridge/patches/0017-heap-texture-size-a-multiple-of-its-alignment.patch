@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
-index b77aaa48..f33c13af 100644
+index 091dda5b839f8f5793a7738cdf1f65ed3c03cd45..1260b2729b26afef711cdbfa87fee5dd64115fcb 100644
 --- a/crates/metal2vulkan-runtime/src/texture/heap.rs
 +++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
-@@ -1861,6 +1861,16 @@ impl Device {
+@@ -1881,6 +1881,16 @@ impl Device {
                  metal_layout = tiles;
              }
          }

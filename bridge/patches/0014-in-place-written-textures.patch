@@ -1,5 +1,5 @@
 diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
-index 86f42373..d287774a 100644
+index 2bad4ac2e4baca97b11dc4dd5da1a487f442449a..0418f75648d4d275be29f601fb5efa632627987b 100644
 --- a/crates/metal2vulkan-runtime/src/in_place.rs
 +++ b/crates/metal2vulkan-runtime/src/in_place.rs
 @@ -251,6 +251,10 @@ pub(crate) fn in_place(
@@ -14,10 +14,10 @@ index 86f42373..d287774a 100644
          return Err(ShadowCause::RenderTarget);
      }
 diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
-index 034be29f..ab2551eb 100644
+index b89aba06fa99b060c88e2ebb951fc0edd4955bdc..98b24b2a2107cfdfbf4fad7ec3e18382ecf79a9c 100644
 --- a/crates/metal2vulkan-runtime/src/linear_plan.rs
 +++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
-@@ -947,6 +947,26 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(),
+@@ -1072,6 +1072,26 @@ pub(super) fn holding(layout: &BufferLayout, usage: TextureUsage) -> Result<(),
      ))
  }
  
@@ -45,7 +45,7 @@ index 034be29f..ab2551eb 100644
  /// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels:
  /// the texels lie with no byte between them ([`holding`]), and its last subresource ends at their
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index 18bf0dde..2e786f6c 100644
+index d5c3cfe5e672c88a37adcbd745bd733c48ed8a58..b6361321fc44bef11158ef466550927960f58259 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -84,7 +84,7 @@ use super::image_plan::{
@@ -57,7 +57,7 @@ index 18bf0dde..2e786f6c 100644
  };
  use super::memory::{MemoryClass, Placement};
  use super::nan_clear;
-@@ -2258,7 +2258,30 @@ impl Device {
+@@ -2307,7 +2307,30 @@ impl Device {
              None => {
                  // Whether an image may hold the texels: none where their rows (or slices) lie
                  // with the buffer's bytes between them (`linear_plan::holding`), and else why.
@@ -90,10 +90,10 @@ index 18bf0dde..2e786f6c 100644
                  // texture over a buffer made without `ShaderWrite` and reads one made without
                  // `ShaderRead`. A linear image aliasing the buffer's memory takes it where one
 diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
-index be5bec3d..6687452e 100644
+index b1226e09a40bb7272c0da88493c63dde3d8b7ff6..1f3999d8b7a51b9bfd5ca7983ebdc474867d4a0e 100644
 --- a/crates/metal2vulkan/src/device/policy.rs
 +++ b/crates/metal2vulkan/src/device/policy.rs
-@@ -271,6 +271,14 @@ pub enum HostPageTexturePolicy {
+@@ -301,6 +301,14 @@ pub enum HostPageTexturePolicy {
      /// texels into before each use and merge back after each write, whose copies touch the
      /// texels alone.
      Shadow,
@@ -108,3 +108,20 @@ index be5bec3d..6687452e 100644
  }
  
  /// How a chain of `half` additions, subtractions and products rounds on a device without
+diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
+index 0e13f81dfed7521edb5494e03cbe9a73d9baadba..b1fcde25fd0190fe069839c50404a920c4b45caa 100644
+--- a/docs/FAST-PATHS.md
++++ b/docs/FAST-PATHS.md
+@@ -209,6 +209,12 @@ recorded here.
+   (`RGBA16Float` at 30% of a 1920x1080 target), and on the Iris Xe from an eighth of the reader's
+   scissor covered, whatever its area, so the rule costs up to 2.1 times there (a 320x180 scissor
+   covered whole over a private 1920x1080 `BGRA8Unorm` texture).
++- **`host_page_textures = HostPageTexturePolicy::InPlaceWrites` holds a texture over host pages or
++  padded rows in place whatever its usage, rendered and written too,** where the policy's default
++  and `HostPageTexturePolicy::Shadow` take the shadow below. It trusts the driver: an image's first
++  move and a pass's load and store must touch the texels alone, which Vulkan does not promise. A
++  consumer sets it where its driver is known to, as Turnip with its linear host images; nothing
++  checks it, and no copy in or merge back is paid.
+ - **A texture over a no-copy buffer's host pages, or over a host-visible buffer longer than 32
+   MiB, that renders or writes (or whose class's check has not passed, or whose pitch no image
+   takes, or under `HostPageTexturePolicy::Shadow`), and a texture over a buffer of the runtime's

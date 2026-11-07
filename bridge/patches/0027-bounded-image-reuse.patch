@@ -1,15 +1,17 @@
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 053ae23c77931389caf3cff42aa7a0ce2ac45811..8b325a4fdc52c3fcda09a5dde625cb09a5bd8eda 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -4412,6 +4412,8 @@
-     /// waiters once the transition's [`Hold`] (and every other) is gone, and they wait for the
-     /// trails below the mark. Waits from inside these steps answer as [`own`] says.
-     fn complete(self: &Arc<Self>, result: Result<(), CommandBufferError>) {
+@@ -5132,6 +5132,8 @@ impl CommandBufferShared {
+     /// The first part of [`complete`](Self::complete), to its completion-seen handlers: its
+     /// status final, they ran. What the rest needs is answered.
+     fn complete_seen(self: &Arc<Self>, result: Result<(), CommandBufferError>) -> Rest {
 +        let trace = Arc::as_ptr(self) as usize;
 +        crate::stage_trace::mark(trace, crate::stage_trace::Stage::CompleteBegin, 0);
          // A thread sleeps on `changed`, as the state's lock below reads.
          let parked;
          // Its command pool, where it settled, whose primary the device's spares begin ahead once
-@@ -4582,6 +4584,7 @@
+@@ -5303,6 +5305,7 @@ impl CommandBufferShared {
          }
          // The holds taken above go here, with no lock of the command buffer's held, before any
          // handler of its runs: a detach from one of them detaches (`detach.rs`).
@@ -17,7 +19,15 @@
          drop(submitted_holds);
          self.wake_parked(parked);
          let buffer = CommandBuffer(Arc::clone(self));
-@@ -4596,6 +4599,7 @@
+@@ -5333,6 +5336,7 @@ impl CommandBufferShared {
+     /// handlers ran ([`complete_seen`](Self::complete_seen)): its completed handlers, its queue's
+     /// slot, its releases and its gate.
+     fn complete_rest(self: &Arc<Self>, rest: Rest) {
++        let trace = Arc::as_ptr(self) as usize;
+         let Rest {
+             settled_pool,
+             released_versions,
+@@ -5359,6 +5363,7 @@ impl CommandBufferShared {
                  exit_guard::program(|| handler(&buffer));
              }
          }
@@ -25,7 +35,7 @@
          let handled = Instant::now();
          drop(buffer);
          // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
-@@ -4676,6 +4680,7 @@
+@@ -5439,6 +5444,7 @@ impl CommandBufferShared {
          }
          // The gate notifies its waiters only where it opened here, which this transition's own
          // hold holds it from: the notify for them is that hold's, as it goes (`gate.rs`).
@@ -33,7 +43,7 @@
          let notified = self.gate.finish();
          self.device.shared().counts.command_buffer_wake(notified);
          // Its pool's primary begun ahead, where no command buffer took the pool since
-@@ -4686,6 +4691,7 @@
+@@ -5449,6 +5455,7 @@ impl CommandBufferShared {
              let shared = self.device.shared();
              shared.spares.begin_ahead(shared, pool);
          }
@@ -41,9 +51,11 @@
      }
  }
  
+diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
+index 9c85bcc61b1f78b2bc2320e213548825105da91e..db002f6009dfd7c6993161e20e07c7551c2fe4ea 100644
 --- a/crates/metal2vulkan-runtime/src/creation.rs
 +++ b/crates/metal2vulkan-runtime/src/creation.rs
-@@ -170,7 +170,7 @@
+@@ -174,7 +174,7 @@ fn note_allocation_site(bytes: u64) {
  /// The call stacks that allocated device memory of 4 MiB or more, most bytes first.
  pub fn allocation_sites() -> Vec<AllocationSite> {
      let mut sites = SITES.lock().map(|sites| sites.clone()).unwrap_or_default();
@@ -52,13 +64,15 @@
      sites
  }
  
+diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
+index d0e24d65c98eb204d224c4bb3715d58cbe6f0025..e970e1da49c94da1ae6acc527a233aeb6ffa4ada 100644
 --- a/crates/metal2vulkan-runtime/src/device/room.rs
 +++ b/crates/metal2vulkan-runtime/src/device/room.rs
-@@ -92,29 +92,41 @@
+@@ -92,29 +92,41 @@ fn keep(device: &Device) {
          return;
      };
      let shared = device.shared();
-+    crate::memory::reap_retired(&shared.memory, shared.vk());
++    crate::memory::age_spares(&shared.memory, shared.vk());
      crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
  }
  
@@ -96,29 +110,28 @@
 +            keep(&device);
 +        } else {
 +            let parts = device.shared();
-+            crate::memory::reap_retired(&parts.memory, parts.vk());
++            crate::memory::age_spares(&parts.memory, parts.vk());
 +        }
          // Outside the state's lock: it may be the device's last handle, whose teardown stops
          // this thread.
          drop(device);
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index d98bd0526e68850299d0bda963814d50f922e84e..7163875f06c70811c879fb475dad4cf3a3fecdfa 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -100,6 +100,54 @@
- /// ([`Memory::release_kept`]) and when the system reports memory pressure
+@@ -108,6 +108,52 @@ pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
  /// ([`Memory::release_spare`]).
  pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
-+
+ 
 +/// Retained image backing, shared by all image pools of one device.
 +const SPARE_BYTES: u64 = 256 << 20;
-+/// Maximum backing waiting for physical release on the room worker.
-+const RETIRED_BYTES: u64 = 128 << 20;
-+/// Small frees do not need another thread handoff.
-+const RETIRE_MIN_BYTES: u64 = 256 << 10;
++/// Memory operations below this size are not traced.
++const TRACE_MIN_BYTES: u64 = 256 << 10;
 +
 +fn trace_memory(pool: (Holds, u32), bytes: u64, available: u64, kind: u32) -> usize {
 +    use crate::stage_trace::{self, Stage};
 +    use std::sync::atomic::{AtomicUsize, Ordering};
-+    if bytes < RETIRE_MIN_BYTES || !stage_trace::diagnostics() {
++    if bytes < TRACE_MIN_BYTES || !stage_trace::diagnostics() {
 +        return 0;
 +    }
 +    static NEXT: AtomicUsize = AtomicUsize::new(1);
@@ -155,10 +168,11 @@
 +        stage_trace::mark(id, Stage::MemoryHandleHigh, (raw >> 32) as u32);
 +    }
 +}
- 
++
  /// A dedicated block of images whose image went, kept for the next dedicated image of its pool
  /// ([`SPARE_FOR`]).
-@@ -648,7 +696,9 @@
+ #[derive(Debug)]
+@@ -707,7 +753,9 @@ impl<T> Pool<T> {
              let (count, total) = match (imported(&block.payload), block.dedicated) {
                  (true, _) => (&mut census.imported, &mut census.imported_bytes),
                  (false, true) => (&mut census.dedicated, &mut census.dedicated_bytes),
@@ -169,41 +183,7 @@
                  (false, false) => {
                      census.pooled_used_bytes += block.ranges.used();
                      (&mut census.pooled, &mut census.pooled_bytes)
-@@ -1081,6 +1131,10 @@
-     /// The dedicated blocks of images kept for the next dedicated image of their pool
-     /// ([`SPARE_FOR`]).
-     spare: Vec<Spare>,
-+    /// Owned, unused backing released by the room worker, with no program-owned holds.
-+    retired: std::collections::VecDeque<(usize, Block, FreeCause)>,
-+    retiring_bytes: Arc<std::sync::atomic::AtomicU64>,
-+    retiring_count: Arc<std::sync::atomic::AtomicU64>,
- }
- 
- impl Memory {
-@@ -1117,6 +1171,9 @@
-             log: None,
-             binds_wait: binds_wait(driver),
-             spare: Vec::new(),
-+            retired: std::collections::VecDeque::new(),
-+            retiring_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-+            retiring_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-         }
-     }
- 
-@@ -1196,6 +1253,12 @@
-             census.empty += 1;
-             census.empty_bytes += spare.block.size;
-         }
-+        census.empty += self
-+            .retiring_count
-+            .load(std::sync::atomic::Ordering::Relaxed);
-+        census.empty_bytes += self
-+            .retiring_bytes
-+            .load(std::sync::atomic::Ordering::Relaxed);
-         census
-     }
- 
-@@ -1464,18 +1527,17 @@
+@@ -1689,18 +1737,17 @@ impl Memory {
          let pool = self.pool(holds, type_index);
          let (freed, stale) = (pool.release(block, offset, size, now), pool.stale(now));
          if let Some(stale) = stale {
@@ -230,39 +210,7 @@
                  after
              }
              Some((block, dedicated)) => {
-@@ -1502,7 +1564,30 @@
-                 .extract_if(.., |spare| spare.pool.1 == type_index)
-                 .map(|spare| spare.block),
-         );
--        let count = blocks.len();
-+        // Allocation failure must reclaim queued backing before retrying Vulkan.
-+        let mut count = blocks.len();
-+        while let Some(index) = self
-+            .retired
-+            .iter()
-+            .position(|(_, block, _)| block.type_index == type_index)
-+        {
-+            let (id, block, cause) = self.retired.remove(index).expect("found retired block");
-+            count += 1;
-+            let bytes = block.size;
-+            if id != 0 {
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
-+            }
-+            // SAFETY: retired blocks have no placement, owner or pending GPU user.
-+            unsafe { block.release(device) };
-+            self.freed_by[cause as usize] += 1;
-+            self.retiring_bytes
-+                .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
-+            self.retiring_count
-+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-+            if id != 0 {
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
-+            }
-+        }
-         for block in blocks {
-             // SAFETY: nothing is placed in a kept empty block, and no command reads it.
-             drop(unsafe { self.let_go(device, block, FreeCause::KeptForRoom, None) });
-@@ -1510,10 +1595,52 @@
+@@ -1735,10 +1782,52 @@ impl Memory {
          count
      }
  
@@ -316,87 +264,51 @@
              .collect();
          for spare in stale {
              // SAFETY: nothing is placed in a spare block, and no command reads it.
-@@ -1586,13 +1713,52 @@
-         cause: FreeCause,
-         after: Option<Box<dyn Send>>,
-     ) -> Option<Box<dyn Send>> {
--        self.freed_by[block.cause(cause) as usize] += 1;
-+        let counted_cause = block.cause(cause);
+@@ -1828,10 +1917,18 @@ impl Memory {
+         };
+         let (heap, size) = (self.heap_of(block.type_index), block.size);
          let Some(parking) = &self.parking else {
-+            use std::sync::atomic::Ordering;
 +            let id = trace_memory((Holds::Buffers, block.type_index), block.size, 0, 3);
 +            trace_handle(id, block.memory);
-+            // Imported memory and program-owned keep-alives retain their synchronous release contract.
-+            let can_defer = block.plain()
-+                && after.is_none()
-+                && block.size >= RETIRE_MIN_BYTES
-+                && cause != FreeCause::KeptForRoom;
-+            if can_defer
-+                && self
-+                    .retiring_bytes
-+                    .load(Ordering::Relaxed)
-+                    .saturating_add(block.size)
-+                    <= RETIRED_BYTES
-+            {
-+                let bytes =
-+                    self.retiring_bytes.fetch_add(block.size, Ordering::Relaxed) + block.size;
-+                self.retiring_count.fetch_add(1, Ordering::Relaxed);
-+                self.retired.push_back((id, block, counted_cause));
-+                if id != 0 {
-+                    crate::stage_trace::mark(
-+                        id,
-+                        crate::stage_trace::Stage::MemoryDeferred,
-+                        (bytes >> 10) as u32,
-+                    );
-+                }
-+                return None;
-+            }
-+            if id != 0 {
-+                if can_defer {
-+                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryQueueFull, 0);
-+                }
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
-+            }
-+            self.freed_by[counted_cause as usize] += 1;
              self.say_block("freed a block", &block);
+             let Some(frees) = frees else {
++                if id != 0 {
++                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
++                }
+                 // SAFETY: the caller's.
+                 unsafe { block.release(device) };
++                if id != 0 {
++                    crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
++                }
+                 return after;
+             };
+             let Block {
+@@ -1848,6 +1945,9 @@ impl Memory {
+                 size,
+             };
              // SAFETY: the caller's.
-             unsafe { block.release(device) };
 +            if id != 0 {
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
++                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryDeferred, (size >> 10) as u32);
 +            }
-             return after;
+             return unsafe { frees.post_or_free(posted, device) };
          };
-+        self.freed_by[counted_cause as usize] += 1;
          self.say_block(
-             "a block goes, freed once the batches in flight complete",
-             &block,
-@@ -1834,6 +2000,11 @@
-             .flat_map(|pool| pool.drain())
-             .collect();
-         blocks.extend(self.spare.drain(..).map(|spare| spare.block));
-+        blocks.extend(self.retired.drain(..).map(|(_, block, _)| block));
-+        self.retiring_bytes
-+            .store(0, std::sync::atomic::Ordering::Relaxed);
-+        self.retiring_count
-+            .store(0, std::sync::atomic::Ordering::Relaxed);
-         for block in blocks {
-             self.say_block("freed a block as the device is destroyed", &block);
-             self.freed_by[block.cause(FreeCause::Teardown) as usize] += 1;
-@@ -2206,22 +2377,36 @@
+@@ -2497,23 +2597,37 @@ fn place(
              true => size,
              false => lock(memory).next_block_bytes(pool, size),
          };
 +        let available = lock(memory).pool(pool.0, pool.1).room();
 +        let trace = trace_memory(pool, block_size, available, 1);
          if fit == Fit::Pooled {
+             let mut memory = lock(memory);
              if let Some(placement) =
-                 lock(memory).place_pooled(device, pool, (size, align), addressed, class)?
+                 memory.place_pooled(device, pool, (size, align), addressed, class)?
              {
 +                trace_handle(trace, placement.memory);
 +                if trace != 0 {
 +                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 1);
 +                }
-                 return Ok(placement);
+                 return Ok(memory.mark_overflowed(placement, overflowing));
              }
          }
          // A dedicated image takes a spare block of its pool where one fits ([`SPARE_FOR`]); one
@@ -420,9 +332,9 @@
 +                    crate::stage_trace::mark(trace, crate::stage_trace::Stage::MemoryReused, 2);
 +                }
                  memory.say_placement("placed", &placement, Some(class));
-                 return Ok(placement);
+                 return Ok(memory.mark_overflowed(placement, overflowing));
              }
-@@ -2235,14 +2420,26 @@
+@@ -2534,14 +2648,26 @@ fn place(
          };
          match made {
              Ok(block) => {
@@ -434,7 +346,7 @@
                  let index = memory.add_block(pool, block, block_size, dedicated, size);
                  let placement = memory.placement(pool, index, 0, size, addressed.is_some());
                  memory.say_placement("placed", &placement, Some(class));
-                 return Ok(placement);
+                 return Ok(memory.mark_overflowed(placement, overflowing));
              }
 -            Err(error @ Error::OutOfMemory(_)) => failure = error,
 -            Err(error) => return Err(error),
@@ -451,43 +363,20 @@
          }
      }
      Err(failure)
-@@ -2255,6 +2452,35 @@
- /// with room rather than making one. A block of buffers gets its buffer of addresses (counted in
- /// `counts`) where blocks carry one. A block that fails to be made, or a pool the query fails for,
- /// is left to the placement that needs it.
-+/// Release owned unused backing on the room worker, outside the allocator lock.
-+pub(super) fn reap_retired(memory: &Mutex<Memory>, device: &ash::Device) {
-+    use std::sync::atomic::Ordering;
-+    let (blocks, bytes, count) = {
-+        let mut memory = lock(memory);
-+        memory.age_spare(device, Instant::now());
-+        let blocks: Vec<_> = memory.retired.drain(..).collect();
-+        (
-+            blocks,
-+            Arc::clone(&memory.retiring_bytes),
-+            Arc::clone(&memory.retiring_count),
-+        )
-+    };
-+    for (id, block, cause) in blocks {
-+        let size = block.size;
-+        if id != 0 {
-+            crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeBegin, 0);
-+        }
-+        // SAFETY: retired blocks contain no placement, pending GPU reader or program-owned keep-alive.
-+        unsafe { block.release(device) };
-+        lock(memory).freed_by[cause as usize] += 1;
-+        bytes.fetch_sub(size, Ordering::Relaxed);
-+        count.fetch_sub(1, Ordering::Relaxed);
-+        if id != 0 {
-+            crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryFreeEnd, 0);
-+        }
-+    }
+@@ -2562,6 +2688,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
+     released > 0 || waited
+ }
+ 
++/// Free the spare blocks whose time is up, from the room worker: a device that releases nothing
++/// more still lets its spares go after [`SPARE_FOR`].
++pub(super) fn age_spares(memory: &Mutex<Memory>, device: &ash::Device) {
++    lock(memory).age_spare(device, Instant::now());
 +}
 +
- pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &Counters) {
-     let (lacking, maker) = {
-         let mut memory = lock(memory);
-@@ -2274,19 +2500,189 @@
+ /// Keep room for any pooled placement (half a block) in each pool the runtime's encodings and
+ /// commits place their own resources in ([`Memory::kept`]), making a block, with `memory`'s lock
+ /// released, for a pool that lacks it. The device's creation calls, which may wait, keep it, so
+@@ -2588,19 +2720,188 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
          (lacking, memory.maker())
      };
      for (pool, bytes) in lacking {
@@ -605,12 +494,11 @@
 +        );
 +        let memory = Arc::new(Mutex::new(memory));
 +        let for_worker = Arc::clone(&memory);
-+        let thread = std::thread::Builder::new()
-+            .name("memory-release-test-worker".into())
-+            .spawn(move || {
-+                reap_retired(&for_worker, &driver);
-+            })
-+            .unwrap();
++        let thread = crate::exit_guard::spawn(
++            std::thread::Builder::new().name("memory-release-test-worker".into()),
++            move || reap_retired(&for_worker, &driver),
++        )
++        .unwrap();
 +        thread.join().unwrap();
 +        assert_eq!(WORKER_FREED.load(Ordering::Relaxed), 2);
 +        assert_eq!(lock(&memory).census().empty_bytes, 0);
@@ -680,9 +568,11 @@
 +        assert_eq!(FREED.load(Ordering::Relaxed), 5);
 +    }
 +}
+diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+index 77350458421422a754b58a6fff946a7dc2220b0e..3383f37230c426d7093a7b080b25d9e417ef6345 100644
 --- a/crates/metal2vulkan-runtime/src/stage_trace.rs
 +++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
-@@ -62,6 +62,43 @@
+@@ -62,6 +62,43 @@ pub enum Stage {
      SubmitStep = 16,
      /// The scheduler's thread went to sleep (id 0, `arg`: slice in ms, | 0x8000 on the GPU).
      SchedulerSleep = 20,
@@ -704,7 +594,7 @@
 +    MemoryHandleHigh = 47,
 +    /// Its backing was retained for reuse (`arg`: total spare bytes in KiB).
 +    MemoryCached = 48,
-+    /// Its physical release was queued (`arg`: pending bytes in KiB).
++    /// Its physical release was posted to the device's free thread (`arg`: bytes in KiB).
 +    MemoryDeferred = 49,
 +    /// Its physical release began.
 +    MemoryFreeBegin = 50,
@@ -726,7 +616,7 @@
      /// Something woke the scheduler's thread (id 0, `arg`: 0 commit, 1 completion, 2 host).
      SchedulerWake = 21,
      /// The scheduler's thread resumed after its sleep (id 0, `arg`: 1 timed out).
-@@ -129,7 +166,9 @@
+@@ -129,7 +166,9 @@ pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
      if !diagnostics() {
          return;
      }
@@ -737,7 +627,7 @@
      let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
      let slot = &SLOTS[(sequence as usize) & (RING - 1)];
      slot.word.store(0, Ordering::Release);
-@@ -187,11 +226,15 @@
+@@ -187,11 +226,15 @@ pub fn read(from: u64, out: &mut [StageRecord]) -> (usize, u64) {
  }
  
  /// Optional host hook. The installed function must remain loaded for the process lifetime.
@@ -752,9 +642,8 @@
  /// Link a command buffer to its Vulkan work, including batches later grouped by the scheduler.
 -pub(crate) fn diagnostic_link(id:u64, command:u64, batch:u64) {
 -    if let Some(hook)=DIAGNOSTIC_HOOK.get() { hook(45,id,command,batch); }
--}
 +pub(crate) fn diagnostic_link(id: u64, command: u64, batch: u64) {
 +    if let Some(hook) = DIAGNOSTIC_HOOK.get() {
 +        hook(45, id, command, batch);
 +    }
-+}
+ }

@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index 93b2ca98..8200c10d 100644
+index fb118ed37ec05886f7a9aec4dc5a5366112c34d0..62fa8af32bcea615d10ac4825050591e04720559 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -83,6 +83,13 @@ pub(super) const KEPT_EMPTY_FOR: Duration = Duration::from_secs(1);
+@@ -90,6 +90,13 @@ pub(super) const KEPT_EMPTY_FOR: Duration = Duration::from_secs(1);
  /// makes and frees blocks.
  const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
  
@@ -16,7 +16,7 @@ index 93b2ca98..8200c10d 100644
  /// What memory a resource needs.
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
  pub(super) enum MemoryClass {
-@@ -420,6 +427,14 @@ impl<T> Pool<T> {
+@@ -479,6 +486,14 @@ impl<T> Pool<T> {
          }
      }
  
@@ -31,7 +31,7 @@ index 93b2ca98..8200c10d 100644
      /// Whether a pooled block has room for `size` bytes at the largest alignment asked of the
      /// pool so far: whether [`Pool::room`] is that long.
      ///
-@@ -1250,6 +1265,17 @@ impl Memory {
+@@ -1473,6 +1488,17 @@ impl Memory {
              .add(size, dedicated, block, used)
      }
  
@@ -49,22 +49,25 @@ index 93b2ca98..8200c10d 100644
      /// What making a block takes, copied out so that the block is made with the memory's lock
      /// released ([`place`], [`keep_room`]).
      fn maker(&self) -> BlockMaker {
-@@ -2071,10 +2097,13 @@ fn place(
+@@ -2359,13 +2385,16 @@ fn place(
          return Err(Error::OutOfMemory(MemoryKind::Device));
      }
      let dedicated = fit == Fit::Apart || size > maker.block_bytes / 2;
 -    let block_size = if dedicated { size } else { maker.block_bytes };
      let mut failure = Error::OutOfMemory(MemoryKind::Device);
-     for type_index in candidates {
+     // The class's own types first, then those it overflows into where none of them has room.
+     let order = (candidates.iter().map(|&type_index| (type_index, false)))
+         .chain(overflow.iter().map(|&type_index| (type_index, true)));
+     for (type_index, overflowing) in order {
          let pool = (holds, type_index);
 +        let block_size = match dedicated {
 +            true => size,
 +            false => lock(memory).next_block_bytes(pool, size),
 +        };
          if fit == Fit::Pooled {
+             let mut memory = lock(memory);
              if let Some(placement) =
-                 lock(memory).place_pooled(device, pool, (size, align), addressed, class)?
-@@ -2117,19 +2146,25 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+@@ -2431,19 +2460,25 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
          let Ok(kept) = memory.kept(device) else {
              return;
          };
@@ -96,7 +99,7 @@ index 93b2ca98..8200c10d 100644
              let what = "made a pooled block and freed it at once, its pool having room";
              memory.say_block(what, &block);
              drop(memory);
-@@ -2137,6 +2172,6 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+@@ -2451,6 +2486,6 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
              unsafe { block.release(device) };
              continue;
          }
@@ -105,7 +108,7 @@ index 93b2ca98..8200c10d 100644
      }
  }
 diff --git a/crates/metal2vulkan-runtime/src/range.rs b/crates/metal2vulkan-runtime/src/range.rs
-index 1512ab0e..1fcd2f2e 100644
+index 1512ab0ed6e1783b636002e69a236a0f131fd099..1fcd2f2e9466e5bb7257086fd6810257120fd5c2 100644
 --- a/crates/metal2vulkan-runtime/src/range.rs
 +++ b/crates/metal2vulkan-runtime/src/range.rs
 @@ -111,6 +111,11 @@ impl RangeAllocator {
