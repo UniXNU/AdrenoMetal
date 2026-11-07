@@ -445,6 +445,24 @@ pub extern "C" fn nmb_device_texture_counts(device: *const NmbDevice, out: *mut 
     })
 }
 
+/// The warm pass and where work ran, into the caller's eight words: records warmed, failed and unread, driver bytes the pass added; scheduler
+/// passes and batches submitted on the committing thread; render log waits, and encoder ends the lowering thread lowered.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_flow_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's eight words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
+        let device = &get(device)?.0;
+        let (warm, w) = (device.warm_statistics(), device.work_counts());
+        out.copy_from_slice(&[warm.records_warmed, warm.records_failed, warm.records_unread, warm.pipeline_bytes,
+                              w.scheduler_passes_at_commit, w.batches_submitted_at_commit, w.render_log_waits, w.render_log_ends_by_thread]);
+        Ok(true)
+    })
+}
+
 /// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
 /// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
 /// made and their bytes, and stand-in copies made and those made at draws.

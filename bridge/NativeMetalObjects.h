@@ -49,6 +49,9 @@ bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.
 bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
+// Records warmed, failed and unread, driver bytes the warm pass added; scheduler passes and batches submitted on the committing thread;
+// render log waits, and encoder ends the lowering thread lowered.
+bool nmb_device_flow_counts(const NmbDevice *, uint64_t out[8]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
