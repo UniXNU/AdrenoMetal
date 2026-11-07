@@ -1,7 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
+index 84ca51618da563edafd6600c88dcfc86d4725837..053ae23c77931389caf3cff42aa7a0ce2ac45811 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -1778,6 +1778,9 @@
+@@ -2081,6 +2081,9 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
  }
  
  impl CommandBuffer {
@@ -10,11 +11,26 @@ diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/meta
 +
      /// A new command buffer of `queue`, holding `slot` of it.
      pub(super) fn new(queue: &CommandQueue, slot: Slot) -> CommandBuffer {
-         CommandBuffer(Arc::new(CommandBufferShared {
+         let footprints = Footprints::default();
+diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+index ed2aceefd513a6eba99d837b2e69725af03afbd3..2a0f08dfe67ba7ffc372b2cdc926454245c1c0bf 100644
+--- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
++++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
+@@ -1017,6 +1017,9 @@ impl CommandBufferShared {
+                 false => work.insert(0, lead),
+             }
+         }
++        for command in work.iter().chain(finale.iter()) {
++            crate::stage_trace::diagnostic_link(Arc::as_ptr(self) as u64, ash::vk::Handle::as_raw(*command), index as u64);
++        }
+         let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
+             .wait_semaphore_values(wait_values)
+             .signal_semaphore_values(work_signal_values);
 diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
+index 53af5b0bfb9058d0d8af7e5078959561a3644d89..77350458421422a754b58a6fff946a7dc2220b0e 100644
 --- a/crates/metal2vulkan-runtime/src/stage_trace.rs
 +++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
-@@ -129,6 +129,7 @@
+@@ -129,6 +129,7 @@ pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
      if !diagnostics() {
          return;
      }
@@ -22,7 +38,7 @@ diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulka
      let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
      let slot = &SLOTS[(sequence as usize) & (RING - 1)];
      slot.word.store(0, Ordering::Release);
-@@ -184,3 +185,13 @@
+@@ -184,3 +185,13 @@ pub fn read(from: u64, out: &mut [StageRecord]) -> (usize, u64) {
      }
      (written, sequence)
  }
@@ -36,16 +52,3 @@ diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulka
 +pub(crate) fn diagnostic_link(id:u64, command:u64, batch:u64) {
 +    if let Some(hook)=DIAGNOSTIC_HOOK.get() { hook(45,id,command,batch); }
 +}
-diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
---- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-+++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-@@ -897,6 +897,9 @@
-                 false => work.insert(0, lead),
-             }
-         }
-+        for command in work.iter().chain(finale.iter()) {
-+            crate::stage_trace::diagnostic_link(Arc::as_ptr(self) as u64, ash::vk::Handle::as_raw(*command), index as u64);
-+        }
-         let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
-             .wait_semaphore_values(wait_values)
-             .signal_semaphore_values(work_signal_values);

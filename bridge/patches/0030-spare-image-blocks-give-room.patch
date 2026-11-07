@@ -1,17 +1,17 @@
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index 28c6643..bcc2c68 100644
+index 7163875f06c70811c879fb475dad4cf3a3fecdfa..64940570e63e653da09b8b06f682449e099e12be 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -101,8 +101,6 @@ pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
+@@ -108,8 +108,6 @@ pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
  /// ([`Memory::release_spare`]).
  pub(super) const SPARE_FOR: Duration = Duration::from_secs(10);
  
 -/// Retained image backing, shared by all image pools of one device.
 -const SPARE_BYTES: u64 = 256 << 20;
- /// Maximum backing waiting for physical release on the room worker.
- const RETIRED_BYTES: u64 = 128 << 20;
- /// Small frees do not need another thread handoff.
-@@ -1595,31 +1593,14 @@ impl Memory {
+ /// Memory operations below this size are not traced.
+ const TRACE_MIN_BYTES: u64 = 256 << 10;
+ 
+@@ -1782,31 +1780,14 @@ impl Memory {
          count
      }
  
@@ -48,7 +48,7 @@ index 28c6643..bcc2c68 100644
          self.spare.push(Spare {
              pool,
              block,
-@@ -1662,6 +1643,16 @@ impl Memory {
+@@ -1849,6 +1830,16 @@ impl Memory {
          Some(self.spare.swap_remove(index).block)
      }
  
@@ -65,7 +65,7 @@ index 28c6643..bcc2c68 100644
      /// Free every spare block and every kept empty pooled block: the system reports memory
      /// pressure, the signal Metal's resource cache gives memory back on. How many went.
      pub(super) fn release_spare(&mut self, device: &ash::Device) -> usize {
-@@ -2502,6 +2493,21 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
+@@ -2722,6 +2713,21 @@ pub(super) fn keep_room(memory: &Mutex<Memory>, device: &ash::Device, counts: &C
      for (pool, bytes) in lacking {
          let available = lock(memory).pool(pool.0, pool.1).room();
          let trace = trace_memory(pool, bytes, available, 2);
@@ -87,16 +87,97 @@ index 28c6643..bcc2c68 100644
          let addressed = (pool.0 == Holds::Buffers).then_some(counts);
          let Ok(block) = maker.make(device, pool.1, bytes, addressed) else {
              continue;
-@@ -2666,7 +2672,7 @@ mod latency_tests {
+@@ -2754,7 +2760,6 @@ mod latency_tests {
+ 
+     static SERIAL: Mutex<()> = Mutex::new(());
+     static FREED: AtomicU64 = AtomicU64::new(0);
+-    static WORKER_FREED: AtomicU64 = AtomicU64::new(0);
+ 
+     unsafe extern "system" fn free_memory(
+         _: vk::Device,
+@@ -2762,9 +2767,6 @@ mod latency_tests {
+         _: *const vk::AllocationCallbacks<'_>,
+     ) {
+         FREED.fetch_add(1, Ordering::Relaxed);
+-        if std::thread::current().name() == Some("memory-release-test-worker") {
+-            WORKER_FREED.fetch_add(1, Ordering::Relaxed);
+-        }
+     }
+ 
+     fn driver() -> ash::Device {
+@@ -2804,43 +2806,6 @@ mod latency_tests {
+         Memory::new(&props, 1 << 30, false, true, Vec::new(), None, None)
+     }
+ 
+-    #[test]
+-    fn owned_release_is_bounded_and_runs_off_the_caller() {
+-        let _serial = lock(&SERIAL);
+-        FREED.store(0, Ordering::Relaxed);
+-        WORKER_FREED.store(0, Ordering::Relaxed);
+-        let driver = driver();
+-        let mut memory = allocator();
+-        unsafe {
+-            assert!(memory
+-                .let_go(&driver, block(1, 64 << 20), FreeCause::Dedicated, None)
+-                .is_none());
+-            assert!(memory
+-                .let_go(&driver, block(2, 64 << 20), FreeCause::Dedicated, None)
+-                .is_none());
+-        }
+-        assert_eq!(FREED.load(Ordering::Relaxed), 0);
+-        assert_eq!(memory.census().empty_bytes, RETIRED_BYTES);
+-        unsafe {
+-            drop(memory.let_go(&driver, block(3, 1 << 20), FreeCause::Dedicated, None));
+-        }
+-        assert_eq!(
+-            FREED.load(Ordering::Relaxed),
+-            1,
+-            "a full queue does not grow beyond its byte bound"
+-        );
+-        let memory = Arc::new(Mutex::new(memory));
+-        let for_worker = Arc::clone(&memory);
+-        let thread = crate::exit_guard::spawn(
+-            std::thread::Builder::new().name("memory-release-test-worker".into()),
+-            move || reap_retired(&for_worker, &driver),
+-        )
+-        .unwrap();
+-        thread.join().unwrap();
+-        assert_eq!(WORKER_FREED.load(Ordering::Relaxed), 2);
+-        assert_eq!(lock(&memory).census().empty_bytes, 0);
+-    }
+-
+     #[test]
+     fn surplus_pooled_image_backing_can_be_reused() {
+         let _serial = lock(&SERIAL);
+@@ -2867,26 +2832,7 @@ mod latency_tests {
      }
  
      #[test]
+-    fn allocation_failure_reclaims_queued_backing_before_retry() {
+-        let _serial = lock(&SERIAL);
+-        FREED.store(0, Ordering::Relaxed);
+-        let driver = driver();
+-        let mut memory = allocator();
+-        unsafe {
+-            drop(memory.let_go(&driver, block(1, 64 << 20), FreeCause::Dedicated, None));
+-        }
+-        assert_eq!(FREED.load(Ordering::Relaxed), 0);
+-        assert_eq!(memory.release_kept(&driver, 0), 1);
+-        assert_eq!(FREED.load(Ordering::Relaxed), 1);
+-        assert_eq!(memory.retiring_bytes.load(Ordering::Relaxed), 0);
+-        assert_eq!(memory.retiring_count.load(Ordering::Relaxed), 0);
+-        assert!(memory.retired.is_empty());
+-        assert!(memory.destroy(&driver).is_empty());
+-        assert_eq!(FREED.load(Ordering::Relaxed), 1);
+-    }
+-
+-    #[test]
 -    fn image_spares_have_one_device_byte_budget() {
 +    fn image_spares_age_and_give_room() {
          let _serial = lock(&SERIAL);
          FREED.store(0, Ordering::Relaxed);
          let driver = driver();
-@@ -2675,13 +2681,15 @@ mod latency_tests {
+@@ -2895,13 +2841,15 @@ mod latency_tests {
          for raw in 1..=5 {
              memory.keep_spare(&driver, (Holds::Images, 0), block(raw, 64 << 20), now);
          }

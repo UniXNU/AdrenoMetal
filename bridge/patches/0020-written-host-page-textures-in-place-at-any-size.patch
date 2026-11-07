@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index b1b02b30..8baf3ded 100644
+index 2a3ea08669a685a9007eb42781ccda19b39715f1..a71faa70d97332bc206a2f3194329245eacf2441 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
-@@ -2221,27 +2221,13 @@ impl Device {
+@@ -2270,27 +2270,13 @@ impl Device {
                          true => HostPageTexturePolicy::InPlace,
                          false => self.compile_device().policy().host_page_textures,
                      };

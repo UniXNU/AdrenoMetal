@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index 053cafe9..96352266 100644
+index d9532762b4b0928059db834985c833ffc225598a..f5116eaae35d47769123828ba33ee6542b3c3fdd 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
-@@ -27,6 +27,7 @@ pub(super) mod keeper;
+@@ -28,6 +28,7 @@ pub(super) mod keeper;
  pub(super) mod prime;
  pub(super) mod properties;
  pub(crate) mod relay;
@@ -10,7 +10,7 @@ index 053cafe9..96352266 100644
  mod staging;
  pub(super) mod submit;
  pub(crate) mod submit_stalls;
-@@ -501,6 +502,9 @@ pub(super) struct DeviceShared {
+@@ -560,6 +561,9 @@ pub(super) struct DeviceShared {
      /// The thread that lets go of what a released state's pool pieces gave back as they ended
      /// (`pipeline/reaper.rs`).
      pub(super) reaper: crate::pipeline::reaper::Reaper,
@@ -20,7 +20,7 @@ index 053cafe9..96352266 100644
      /// The trails its threads open between a signal and their last let-go of what they held for
      /// the work, which a command buffer's waiters wait for (`trails.rs`).
      pub(crate) trails: Arc<crate::trails::Trails>,
-@@ -718,6 +722,9 @@ impl Drop for DeviceShared {
+@@ -793,6 +797,9 @@ impl Drop for DeviceShared {
          // What the reaper is handed holds the device: none is left, and it only stops, unless
          // this teardown runs on its thread.
          self.reaper.stop();
@@ -30,7 +30,7 @@ index 053cafe9..96352266 100644
          // What the residency thread releases holds the device: none is left.
          #[cfg(unix)]
          self.residency.stop();
-@@ -1014,13 +1021,24 @@ impl Device {
+@@ -1116,13 +1123,24 @@ impl Device {
      /// a pipeline state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes
      /// a memory block, whose `vkAllocateMemory` waited 2.37 s for other processes' GPU work on
      /// NVIDIA's driver. Nothing in a host step, a serial point of the command buffers' stream
@@ -57,7 +57,7 @@ index 053cafe9..96352266 100644
      }
  
      /// Whether `other` is this device (the same handle, not merely the same physical device).
-@@ -1898,6 +1916,7 @@ impl Device {
+@@ -2081,6 +2099,7 @@ impl Device {
              uncommitted: Arc::default(),
              pipeline_pool: Default::default(),
              reaper: Default::default(),
@@ -67,7 +67,7 @@ index 053cafe9..96352266 100644
              libraries: graphics_pipeline_library.then(Default::default),
 diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
 new file mode 100644
-index 00000000..d0e24d65
+index 0000000000000000000000000000000000000000..d0e24d65c98eb204d224c4bb3715d58cbe6f0025
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/device/room.rs
 @@ -0,0 +1,122 @@
@@ -194,10 +194,10 @@ index 00000000..d0e24d65
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index 1f882747..e015fc9b 100644
+index 0a3ba9caf6495854b299791df26462cf4109eca9..d98bd0526e68850299d0bda963814d50f922e84e 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -90,6 +90,26 @@ const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
+@@ -97,6 +97,26 @@ const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
  /// guest's home screen.
  pub(super) const FIRST_BLOCK_BYTES: u64 = 4 << 20;
  
@@ -224,7 +224,7 @@ index 1f882747..e015fc9b 100644
  /// What memory a resource needs.
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
  pub(super) enum MemoryClass {
-@@ -754,6 +774,12 @@ struct BlockAddresses {
+@@ -813,6 +833,12 @@ struct BlockAddresses {
  }
  
  impl Block {
@@ -236,26 +236,26 @@ index 1f882747..e015fc9b 100644
 +
      /// The cause its `vkFreeMemory` is counted under. A block freed as the one placement in it
      /// went ([`FreeCause::Dedicated`]) that is an import of its own is counted as that import
-     /// instead: the caller's host memory ([`Memory::import_host`]) or a buffer's fresh pages
-@@ -1052,6 +1078,9 @@ pub(super) struct Memory {
-     /// ([`binds_wait`]), so an image bound while such work may be queued takes a block of its own
-     /// ([`allocate_image_while_queued`]).
-     binds_wait: bool,
+     /// instead: the caller's host memory ([`import_host`]) or a buffer's fresh pages
+@@ -1174,6 +1200,9 @@ pub(super) struct Memory {
+     /// The placements so far that lie past their class's own memory types, in one they
+     /// overflowed into ([`overflow_candidates`], `WorkCounts::device_memory_overflows`).
+     overflows: u64,
 +    /// The dedicated blocks of images kept for the next dedicated image of their pool
 +    /// ([`SPARE_FOR`]).
 +    spare: Vec<Spare>,
  }
  
  impl Memory {
-@@ -1087,6 +1116,7 @@ impl Memory {
-             freed_by: [0; FreeCause::COUNT],
-             log: None,
+@@ -1217,6 +1246,7 @@ impl Memory {
+             heaps,
              binds_wait: binds_wait(driver),
+             overflows: 0,
 +            spare: Vec::new(),
          }
      }
  
-@@ -1162,6 +1192,10 @@ impl Memory {
+@@ -1381,6 +1411,10 @@ impl Memory {
          for pool in &self.pools {
              pool.count_into(&mut census, |block| block.imported);
          }
@@ -266,7 +266,7 @@ index 1f882747..e015fc9b 100644
          census
      }
  
-@@ -1433,7 +1467,17 @@ impl Memory {
+@@ -1658,7 +1692,17 @@ impl Memory {
              // SAFETY: nothing is placed in a kept empty block, and no command reads it.
              drop(unsafe { self.let_go(device, stale, FreeCause::KeptStale, None) });
          }
@@ -284,7 +284,7 @@ index 1f882747..e015fc9b 100644
              Some((block, dedicated)) => {
                  let cause = match dedicated {
                      true => FreeCause::Dedicated,
-@@ -1449,10 +1493,15 @@ impl Memory {
+@@ -1674,10 +1718,15 @@ impl Memory {
      /// Release every kept empty pooled block of memory type `type_index`, of buffers and of
      /// images, as a block of that type fails to be made ([`place`]): how many went.
      fn release_kept(&mut self, device: &ash::Device, type_index: u32) -> usize {
@@ -301,7 +301,7 @@ index 1f882747..e015fc9b 100644
          let count = blocks.len();
          for block in blocks {
              // SAFETY: nothing is placed in a kept empty block, and no command reads it.
-@@ -1461,6 +1510,46 @@ impl Memory {
+@@ -1686,6 +1735,46 @@ impl Memory {
          count
      }
  
@@ -348,7 +348,7 @@ index 1f882747..e015fc9b 100644
      /// Over every pool: the block slots the room queries have walked and the free ranges they
      /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
      /// where it derived per call ([`Pool::room_per_call`]).
-@@ -1741,9 +1830,10 @@ impl Memory {
+@@ -1970,9 +2059,10 @@ impl Memory {
      /// and no resource is left. What waited with them, for the caller to let go of with no lock
      /// held.
      pub(super) fn destroy(&mut self, device: &ash::Device) -> Vec<Box<dyn Send>> {
@@ -360,8 +360,8 @@ index 1f882747..e015fc9b 100644
          for block in blocks {
              self.say_block("freed a block as the device is destroyed", &block);
              self.freed_by[block.cause(FreeCause::Teardown) as usize] += 1;
-@@ -2123,6 +2213,19 @@ fn place(
-                 return Ok(placement);
+@@ -2415,6 +2505,19 @@ fn place(
+                 return Ok(memory.mark_overflowed(placement, overflowing));
              }
          }
 +        // A dedicated image takes a spare block of its pool where one fits ([`SPARE_FOR`]); one
@@ -374,9 +374,9 @@ index 1f882747..e015fc9b 100644
 +                let index = memory.pool(pool.0, pool.1).add(bytes, true, block, size);
 +                let placement = memory.placement(pool, index, 0, size, false);
 +                memory.say_placement("placed", &placement, Some(class));
-+                return Ok(placement);
++                return Ok(memory.mark_overflowed(placement, overflowing));
 +            }
 +        }
-         // The type's kept empty blocks go before a block of it fails to be made.
-         let made = match maker.make(device, type_index, block_size, addressed) {
-             Err(Error::OutOfMemory(_)) if lock(memory).release_kept(device, type_index) > 0 => {
+         // Frees posted still count against their heap: where the block would take its heap past
+         // the heap's size, those of the heap complete first (`free_thread.rs`).
+         let before = lock(memory).frees_before(type_index, block_size);
