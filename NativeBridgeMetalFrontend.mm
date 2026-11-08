@@ -450,10 +450,17 @@ static void traceStartWriter() {
    if(head<written+4)continue;
    head-=4;                                   // records still being filled stay for the next round
    if(head-written>16000)written=head-16000;   // the ring lapped the writer: the oldest are gone
+   // The file stops growing at kFramesTraceCap (64 MiB): it stays within half of the diagnostic export region, and Data never
+   // holds more than that of it. Later records are dropped.
+   static constexpr uint64_t kFramesTraceCap=64ull<<20;
+   static uint64_t fileBytes=0;
    while(written<head){
     uint32_t n=head-written;const uint32_t room=16384-written%16384;if(n>room)n=room;
+    const uint64_t left=(kFramesTraceCap-fileBytes)/sizeof(TraceRec);
+    if(!left){written=head;break;}
+    if(n>left)n=(uint32_t)left;
     if(write(fd,&gTrace[written%16384],n*sizeof(TraceRec))<0)break;
-    written+=n;
+    written+=n;fileBytes+=n*sizeof(TraceRec);
    }
   }
  }).detach();
