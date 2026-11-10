@@ -86,15 +86,26 @@ static bool writeTask(uintptr_t address, const void *data, size_t size) {
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
 // (10-bit) framebuffer nor universal buffer compression. Whether the state it reads those from is the whole story is what the markers show.
-// EXPERIMENT (boot-arg sheng-fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
+// EXPERIMENT (boot-arg fb-bgra=1): the render server's framebuffer format with every other virtualized answer left as it is.
 // framebuffer_pixel_format (24A446 0x184461838) takes RGhA on `tbnz w8, #0` at 0x184461928 when CADeviceIsVirtualized (byte 0x1e701bdd9) is 1;
 // 40 other places in QuartzCore read the same byte (XR formats, backdrop compute, ASTC ...). Holding the byte at 0 turned all of them, and the
 // tablet drew light blue blocks. Here the byte stays 1 and only this branch is made a NOP, so the framebuffer is chosen as on a real device and
 // nothing else changes. Marks 0x6E40 unreadable, 0x6E41 other instruction, 0x6E42 patched, 0x6E50|stage failures.
+// The boot argument token that starts with prefix (a whole name, or name=value), or nullptr: a name is matched only at the start of the
+// command line or after a space, so "log=1" does not find "cache-log=1".
+static const char *bootArgToken(const char *args, const char *prefix) {
+    const size_t length = strlen(prefix);
+    for (const char *at = args; (at = strstr(at, prefix)); at += length)
+        if (at == args || at[-1] == ' ') return at;
+    return nullptr;
+}
 static bool bootArgSet(const char *key) {
     char args[1100] = {};
     size_t size = sizeof args - 1;
-    return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return false;
+    const char *at = bootArgToken(args, key);
+    const size_t length = strlen(key);
+    return at && (at[length] == 0 || at[length] == ' ');
 }
 static unsigned patchFramebufferBranch(uintptr_t slide) {
     const uintptr_t site = 0x184461928 + slide;
@@ -222,35 +233,35 @@ static id deviceForPort(unsigned port) {
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
             fclose(flags);
         }
-        // sheng-tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
+        // tu-debug=<flags>: TU_DEBUG for every Metal process (an experiment: sysmem renders without GMEM load and store, gmem always with them).
         {
             char args[1100] = {};
             size_t size = sizeof args - 1;
             if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
-                if (const char *at = strstr(args, "sheng-tu-debug=")) {
+                if (const char *at = bootArgToken(args, "tu-debug=")) {
                     char value[64] = {};
-                    strlcpy(value, at + 15, sizeof value);
+                    strlcpy(value, at + strlen("tu-debug="), sizeof value);
                     value[strcspn(value, " ")] = 0;
                     setenv("TU_DEBUG", value, 1);
                 }
         }
-        // Every pass renders in system memory with the 8-bit BGRA framebuffer (sheng-fb-bgra=1): measured against tile memory with the swap of
+        // Every pass renders in system memory with the 8-bit BGRA framebuffer (fb-bgra=1): measured against tile memory with the swap of
         // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
         // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
-        // still came out with red and blue exchanged. sheng-tu-debug= overrides this for experiments.
-        setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
-        // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+        // still came out with red and blue exchanged. tu-debug= overrides this for experiments.
+        setenv("TU_DEBUG", bootArgSet("fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
-        if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+        if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
-        if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+        if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
-        // sheng-metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
-        // (native_bridge_metal_open), so two runs compare without sheng-diag=1's own cost.
-        if (bootArgSet("sheng-metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
-        else if (bootArgSet("sheng-metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
+        // metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
+        // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
+        if (bootArgSet("metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
+        else if (bootArgSet("metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
         else unsetenv("NATIVE_METAL_FLOW");
-        if (bootArgSet("sheng-wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
+        if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
@@ -319,7 +330,7 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
@@ -354,7 +365,7 @@ static id deviceForPort(unsigned port) {
         }
 #endif
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
-        // (sheng-diag=1).
+        // (diag=1).
         unsetenv("METAL2VULKAN_LOG_PIPELINES");
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
@@ -446,7 +457,7 @@ static id deviceForPort(unsigned port) {
         pthread_attr_destroy(&attributes);
         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
         // kernel's GPU trace as a problem record (event 65).
-        if (bootArgSet("sheng-swaptest=1") && !strcmp(getprogname(), "backboardd")) {
+        if (bootArgSet("swaptest=1") && !strcmp(getprogname(), "backboardd")) {
             pthread_t tester;
             pthread_create(&tester, nullptr, [](void *) -> void * {
                     sleep(20);

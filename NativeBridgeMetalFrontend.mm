@@ -59,7 +59,7 @@ static std::string gLoaderPath;   // the Turnip library the runtime loaded (its 
 static id gDeviceObject;
 static bool (*gFrameTransport)(uint32_t,const void *,uint32_t);
 static std::atomic<uint64_t> gFrameNumber{0};
-// The kernel trace (sheng-gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
+// The kernel trace (gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
 // CPU sampler follows. Everything else of this process goes to the frame trace file.
 static bool gpuTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}
 static void traceRuntimeWide(uint64_t,uint32_t,uint32_t);
@@ -214,7 +214,7 @@ static bool nbForwardPriority(uint32_t foreground,uint32_t background);
 static NBQueuePriorities gQueuePriorities;
 static std::mutex gPriorityLock;
 // Every diagnostic of this process (the frame trace, the sampler, Turnip's pass stamps and submission ring, the runtime's stage ring) runs only
-// with SHENG_DIAG set, which the plugin sets from the boot argument sheng-diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
+// with SHENG_DIAG set, which the plugin sets from the boot argument diag=1 before the device opens (NativeAdrenoMetalPlugin.mm).
 static bool diagOn() {static const bool on=getenv("SHENG_DIAG")!=nullptr;return on;}
 static uint32_t threadCpuUs() {
  thread_basic_info_data_t info;mach_msg_type_number_t count=THREAD_BASIC_INFO_COUNT;
@@ -533,7 +533,7 @@ static void noteProblem(NSString *what) {
    if(native_bridge_metal_problem_hook)native_bridge_metal_problem_hook(gFirstProblem);
   }
  }
- // With sheng-gpu-trace=1 each distinct refusal text reaches the kernel GPU ring (event 65, 88 characters a part), for the processes
+ // With gpu-trace=1 each distinct refusal text reaches the kernel GPU ring (event 65, 88 characters a part), for the processes
  // whose crash follows a nil Metal object (iconservicesagent in untagged-102cb4a069).
  if(gpuTraceOn() && gFrameTransport) {
   const char *text=what.UTF8String?:"?";const size_t length=strlen(text);
@@ -4553,7 +4553,7 @@ static void installAnswers(Class cls) {
  }
 }
 
-// With sheng-metal-flow= set (NATIVE_METAL_FLOW), the warm pass and work placement counts go to os_log every ten seconds when they changed.
+// With metal-flow= set (NATIVE_METAL_FLOW), the warm pass and work placement counts go to os_log every ten seconds when they changed.
 static void logFlowCounts() {
  const char *setting=getenv("NATIVE_METAL_FLOW");
  if(!setting)return;

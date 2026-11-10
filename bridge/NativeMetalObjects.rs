@@ -229,7 +229,7 @@ impl PipelineRecords {
     }
 }
 
-/// True where `NATIVE_METAL_FLOW=1` (the boot argument `sheng-metal-flow=1`) enables the lowering thread, commit submission and the warm pass.
+/// True where `NATIVE_METAL_FLOW=1` (the boot argument `metal-flow=1`) enables the lowering thread, commit submission and the warm pass.
 fn flow_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("NATIVE_METAL_FLOW").is_some_and(|value| value == "1"))
