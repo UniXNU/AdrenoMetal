@@ -10,6 +10,8 @@
 
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
+#[path = "NativeMetalPurge.rs"]
+pub mod purge;
 
 // The system allocator: mimalloc reserved its arenas with large mmaps, and on iPadOS 27 the kernel stopped the render server and
 // SpringBoard with an exception inside that mmap (unix_mmap_prim_aligned from mi_arena_reserve), so the shell resprung.
