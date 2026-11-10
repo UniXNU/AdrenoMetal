@@ -58,6 +58,16 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+// Live blocks of the runtime's own device memory (bridge patch 0031): seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
+// larger) of pooled blocks with a placement [0], pooled blocks kept empty [7], spare image blocks [14], dedicated blocks of an image
+// [21] and of a buffer [28]; bytes of the spare blocks [35] and of the dedicated blocks of images [36] and buffers [37]; lazily
+// allocated blocks with a placement [38] and kept without one [42], each as blocks, bytes, blocks the driver committed, bytes it
+// committed; buffers' own imported pages as blocks and bytes [46].
+bool nmb_device_memory_kinds(const NmbDevice *, uint64_t out[48]);
+// VkPipelines the pipeline states' variants made, of them made at a state's creation and how many of those a draw or dispatch took,
+// those made at a draw or dispatch by a host step; nanoseconds inside the driver's graphics and compute pipeline makings; functions
+// translated and shader modules made.
+bool nmb_device_pipeline_counts(const NmbDevice *, uint64_t out[8]);
 /* The runtime's command buffer stages from sequence from on (bridge patch 0022): 24-byte records {u64 uptime ns, u64 id, u32 sequence,
  * u16 stage, u16 arg}; returns how many, *next the sequence to ask for next. */
 size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);

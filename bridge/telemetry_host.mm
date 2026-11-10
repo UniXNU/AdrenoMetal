@@ -34,8 +34,34 @@ int main(int argc, char **argv) {
         frontendchecks::drawQuad(render, pipeline, texture, nil, frontendchecks::kQuarter, 6);
         [copy commit];[render commit];
         if (!frontendchecks::completed(copy, "blit") || !frontendchecks::completed(render, "render")) return 1;
-        char text[4608] = {};
+        char text[8192] = {};
         native_bridge_metal_telemetry(text, sizeof text);
+        // The table's memory, compile and thread rows are there, within the first 48 rows (what the kernel keeps), each at most 90 characters.
+        {
+            const std::string table = text;
+            unsigned row = 0;
+            std::map<std::string, unsigned> at;
+            unsigned long long blocks = 0;
+            for (size_t begin = 0; begin < table.size(); ++row) {
+                size_t end = table.find('\n', begin);
+                if (end == std::string::npos) end = table.size();
+                if (end - begin > 90) {std::puts("FAIL a telemetry row longer than 90 characters");return 1;}
+                const std::string line = table.substr(begin, end - begin);
+                at.emplace(line.substr(0, line.find(' ')), row);
+                // The blocks the size rows count: the pooled blocks in use and kept empty of the MK row.
+                unsigned long long c[14] = {};
+                if (sscanf(line.c_str(), "MK 16/32/40/48/56/64/+ pool %llu/%llu/%llu/%llu/%llu/%llu/%llu empty %llu/%llu/%llu/%llu/%llu/%llu/%llu",
+                           &c[0], &c[1], &c[2], &c[3], &c[4], &c[5], &c[6], &c[7], &c[8], &c[9], &c[10], &c[11], &c[12], &c[13]) == 14)
+                    for (unsigned long long n : c) blocks += n;
+                if (!line.compare(0, 3, "MK ") || !line.compare(0, 3, "ML ") || !line.compare(0, 3, "VP ") || !line.compare(0, 3, "TH ")) std::printf("%s\n", line.c_str());
+                begin = end + 1;
+            }
+            for (const char *name : {"MEM", "MK", "MKb", "MKc", "ML", "PG", "PE", "PS", "T", "VP", "V", "SC", "PR", "TH", "P0", "S"}) {
+                const auto found = at.find(name);
+                if (found == at.end() || found->second >= 48) {std::printf("FAIL telemetry row %s missing from the first 48 rows\n", name);return 1;}
+            }
+            if (!blocks) {std::puts("FAIL the size rows count no pooled block of a device that holds a texture and a buffer");return 1;}
+        }
         std::map<unsigned, std::pair<unsigned, unsigned>> counts;
         for (char *line = strtok(text, "\n"); line; line = strtok(nullptr, "\n")) {
             unsigned index, sec, ms, passes, draws, kpx, dispatches, blits;

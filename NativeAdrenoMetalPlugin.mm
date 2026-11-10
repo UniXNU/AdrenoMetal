@@ -153,6 +153,41 @@ static void removeHalfImported(const char *root) {
         if (e->fts_info == FTS_F && e->fts_namelen > 7 && !strcmp(e->fts_name + e->fts_namelen - 7, ".import")) unlink(e->fts_path);
     fts_close(fts);
 }
+// diag=1 in the render server: the bridge's telemetry table (native_bridge_metal_telemetry) to the kernel's board log every six
+// seconds and to the system log every thirty. The kernel keeps 48 rows of at most 95 characters (its [metal table] section): the
+// marker 0xC000 | row starts a row, 0x8000 | a << 7 | b appends two characters. A row that reads as it did when last sent is not
+// sent again, and a row the table no longer has is cleared. The system log has every row, past the 48th too.
+static void *streamTelemetry(void *arg) {
+    Gpu *g = static_cast<Gpu *>(arg);
+    pthread_setname_np("native-metal-telemetry");
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);   // a row is up to 46 marker calls: behind the render server's own work
+    sleep(5);
+    static char table[8192], sent[48][92];
+    for (unsigned pass = 0;; ++pass) {
+        native_bridge_metal_telemetry(table, sizeof table);
+        unsigned row = 0;
+        for (char *line = table; *line; ++row) {
+            char *end = strchr(line, '\n');
+            if (end) *end = 0;
+            if (pass % 5 == 0) os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal table: %{public}s", line);
+            if (row < 48 && strncmp(sent[row], line, sizeof sent[row] - 1)) {
+                strlcpy(sent[row], line, sizeof sent[row]);
+                g->mark(0xC000u | row);
+                const size_t length = strlen(sent[row]);
+                for (size_t i = 0; i < length; i += 2) {
+                    const unsigned a = (unsigned char)sent[row][i] & 0x7f, b = i + 1 < length ? (unsigned char)sent[row][i + 1] & 0x7f : 0;
+                    g->mark(0x8000u | (a << 7) | b);
+                }
+            }
+            if (!end) {++row; break;}
+            line = end + 1;
+        }
+        for (; row < 48; ++row)
+            if (sent[row][0]) {sent[row][0] = 0; g->mark(0xC000u | row);}
+        sleep(6);
+    }
+    return nullptr;
+}
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
@@ -499,6 +534,11 @@ static id deviceForPort(unsigned port) {
         pthread_attr_init(&attributes);
         pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
         pthread_attr_setstacksize(&attributes, 1u << 20);
+        // The telemetry table with diag=1 (streamTelemetry); without it the thread does not exist.
+        if (getenv("SHENG_DIAG")) {
+            pthread_t telemetry;
+            pthread_create(&telemetry, &attributes, streamTelemetry, gpu);
+        }
         pthread_create(&scanout, &attributes, [](void *arg) -> void * {
             Gpu *g = static_cast<Gpu *>(arg);
             sleep(3);
