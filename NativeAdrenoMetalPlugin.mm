@@ -8,6 +8,12 @@
 // gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
 // own GPU plugin.
 #import <Foundation/Foundation.h>
+#include <string>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <sys/mount.h>
+#include <os/log.h>
+#include "NativeRenderServer.h"
 #include "SharedShaderCache.h"
 #include <pthread.h>
 #include <thread>
@@ -30,13 +36,24 @@
 #include "PrimeShaders.h"
 #include "ExceptionDiag.h"
 
+#if TARGET_OS_OSX
+#include "IOGPUMetalDeviceShim.h"
+// macOS: +[IOGPUMetalDevice registerAcceleratorService:] takes the bundle's MetalPluginClassName only if it subclasses IOGPUMetalDevice.
+@interface IOGPUMetalDevice : NSObject
+@end
+#else
 @interface _MTLDevice : NSObject
 @end
+#endif
 @interface NativeAdrenoMetalDeviceBase : NSObject   // only a lock object for the published mode's one-time setup
 @end
 @implementation NativeAdrenoMetalDeviceBase
 @end
+#if TARGET_OS_OSX
+@interface NativeAdrenoMetalDevice : IOGPUMetalDevice
+#else
 @interface NativeAdrenoMetalDevice : _MTLDevice
+#endif
 - (id)initWithAcceleratorPort:(unsigned)port;
 @end
 
@@ -80,7 +97,7 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
     vm_size_t got = 0;
     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
 }
-static bool writeTask(uintptr_t address, const void *data, size_t size) {
+[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {   // iPadOS only (24A446 QuartzCore)
     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
 }
 // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
@@ -106,7 +123,7 @@ static bool bootArgSet(const char *key) {
     const size_t length = strlen(key);
     return at && (at[length] == 0 || at[length] == ' ');
 }
-static unsigned patchFramebufferBranch(uintptr_t slide) {
+[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
     const uintptr_t site = 0x184461928 + slide;
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
@@ -216,6 +233,42 @@ static id clientDevice(unsigned port) {
     }
     return device;
 }
+#if TARGET_OS_OSX
+// The compositor's QuartzCore asserts metallib_url != nil (CA::OGL::new_metal_context: [[NSBundle bundleForClass:[CALayer class]]
+// URLForResource:@"default" withExtension:@"metallib"]) on this layout (macOS run32), though both the root and the SystemOS volume hold
+// QuartzCore.framework/Versions/A/Resources/default.metallib. Measured here, in the render server, with the same calls, before QuartzCore
+// makes its Metal context: what the bundle resolves to, and what readdir and NSFileManager list at the bundle's root and in Versions.
+static void quartzCoreBundleReport() {
+    @autoreleasepool {
+        Class layer = NSClassFromString(@"CALayer");
+        NSBundle *bundle = layer ? [NSBundle bundleForClass:layer] : nil;
+        NSURL *url = [bundle URLForResource:@"default" withExtension:@"metallib"];
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: bundle %{public}s resources %{public}s exec %{public}s url %{public}s",
+               bundle.bundlePath.UTF8String ?: "-", bundle.resourcePath.UTF8String ?: "-", bundle.executablePath.UTF8String ?: "-",
+               url.path.UTF8String ?: "nil");
+        NSString *root = bundle.bundlePath ?: @"/System/Library/Frameworks/QuartzCore.framework";
+        for (NSString *sub in @[@"", @"/Versions", @"/Versions/A", @"/Versions/A/Resources", @"/Resources"]) {
+            NSString *path = [root stringByAppendingString:sub];
+            std::string listing;
+            if (DIR *d = opendir(path.fileSystemRepresentation)) {
+                while (struct dirent *e = readdir(d)) {listing += e->d_name; listing += ' ';}
+                closedir(d);
+            } else listing = "(opendir " + std::to_string(errno) + ")";
+            NSArray *items = [NSFileManager.defaultManager contentsOfDirectoryAtPath:path error:nil];
+            struct stat st = {};
+            const int sr = lstat(path.fileSystemRepresentation, &st);
+            // opendir reads a whole union directory (both layers) only when fstatfs reports MNT_UNION (0x20) for it.
+            struct statfs sf = {};
+            const int fr = statfs(path.fileSystemRepresentation, &sf);
+            os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: %{public}s statfs %d flags 0x%x %{public}s on %{public}s",
+                   path.UTF8String, fr, sf.f_flags, sf.f_fstypename, sf.f_mntonname);
+            os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal qc: %{public}s lstat %d mode %o dev %d readdir [%{public}s] fm [%{public}s]",
+                   path.UTF8String, sr, st.st_mode, st.st_dev, listing.c_str(),
+                   [[items componentsJoinedByString:@" "] UTF8String] ?: "nil");
+        }
+    }
+}
+#endif
 static id deviceForPort(unsigned port) {
     static id device;
     static bool tried;
@@ -264,7 +317,23 @@ static id deviceForPort(unsigned port) {
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
-        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
+#if TARGET_OS_OSX
+        // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
+        // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
+        // GPU's window does not have. The render server (WindowServer) takes the same path as backboardd on iPadOS below (display hand-off
+        // client, shader cache directory, pipeline pack, priming), without the iPadOS QuartzCore addresses; every device gets IOGPU's
+        // answers (IOGPUMetalDeviceShim.h).
+        setenv("TU_DARWIN_SERVICE", "AGXAccelerator", 1);
+        setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+        CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+        if (!nativeIsRenderServer()) {
+            device = clientDevice(port);
+            if (device) iogpu::install(device, port);
+            return device;
+        }
+#else
+        if (!nativeIsRenderServer()) return device = clientDevice(port);
+#endif
         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
@@ -322,6 +391,8 @@ static id deviceForPort(unsigned port) {
         setenv("CA_DISPLAY_EDR_HEADROOM", "1", 1);
         setenv("CA_FP16_MIN_HEADROOM", "1e30", 1);
         setenv("CA_ALLOW_EDR_MIRRORING", "0", 1);
+#if !TARGET_OS_OSX
+        // The stored option values and the framebuffer branch are addresses of iPadOS 27's QuartzCore (24A446).
         if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart")) {
             const uintptr_t slide = (uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x1846dce88;
             const float one = 1.0f, never = 1e30f;
@@ -362,6 +433,7 @@ static id deviceForPort(unsigned port) {
             }, gpu) == 0)
                 pthread_detach(reader);
         }
+#endif  // !TARGET_OS_OSX
 #endif
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
         // (diag=1).
@@ -377,7 +449,7 @@ static id deviceForPort(unsigned port) {
         // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
         // (marker 0x6814); the earlier candidates keep their markers.
         if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
-            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
+            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple." NATIVE_RENDER_SERVER, user->pw_dir);
             mkdir(candidates[4], 0700);
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
@@ -456,7 +528,7 @@ static id deviceForPort(unsigned port) {
         pthread_attr_destroy(&attributes);
         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
         // kernel's GPU trace as a problem record (event 65).
-        if (bootArgSet("swaptest=1") && !strcmp(getprogname(), "backboardd")) {
+        if (bootArgSet("swaptest=1") && nativeIsRenderServer()) {
             pthread_t tester;
             pthread_create(&tester, nullptr, [](void *) -> void * {
                     sleep(20);
@@ -477,6 +549,10 @@ static id deviceForPort(unsigned port) {
             pthread_detach(tester);
         }
         gpu->mark(0x6803);
+#if TARGET_OS_OSX
+        iogpu::install(device, port);
+        quartzCoreBundleReport();
+#endif
         return device;
     }
 }
@@ -484,8 +560,18 @@ static id deviceForPort(unsigned port) {
 
 @implementation NativeAdrenoMetalDevice
 - (id)initWithAcceleratorPort:(unsigned)port {
+#if TARGET_OS_OSX
+    // The registered device is the frontend's object, not this one: IOGPUMetalDevice's own initializer would open an IOGPU user client.
+    // This object is kept, because -[IOGPUMetalDevice dealloc] tears down state its initializer never made.
+    static NSMutableArray *kept;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ kept = [NSMutableArray array]; });
+    @synchronized(kept) {[kept addObject:self];}
+    if (!port) return nil;
+#else
     self = [super init];
     if (!self || !port) return nil;
+#endif
     if (publish::requested()) return publish::deviceForPort(port);
     static bool attempted;
     if (attempted) return nil;
@@ -512,7 +598,11 @@ static id deviceForPort(unsigned port) {
                 auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
                 auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
                 if (matching && getService) {
+#if TARGET_OS_OSX
+                    const unsigned own = getService(0, matching("AGXAccelerator"));
+#else
                     const unsigned own = getService(0, matching("IOAcceleratorES"));
+#endif
                     if (own) port = own;
                 }
             }
@@ -525,3 +615,80 @@ static id deviceForPort(unsigned port) {
     return nil;
 }
 @end
+
+#if TARGET_OS_OSX
+#include <objc/runtime.h>
+#include <mach/mach_time.h>
+#include <atomic>
+// WindowServer's frame pacing, as macOS-DroidVM's plugin (24af265, kc253-kc292), each behind its boot argument.
+//
+// ca-triple-buffer=1 sets QuartzCore's debug option 198, CA_FORCE_TRIPLE_BUFFERED_LATENCY (read by IOMFBDisplay::can_update_):
+// CoreAnimation renders a frame ahead instead of starting each frame only after the last one's buffer came back, which it otherwise
+// does whenever a frame took longer than a refresh (DroidVM: a heavy window drag from 56-60 to 61-67 frames a second).
+__attribute__((constructor)) static void tripleBufferFromBootArgs() {
+    if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-triple-buffer=1")) return;
+    auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
+    if (setOption) setOption(198, true);
+    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY %{public}s", setOption ? "set" : "not found");
+}
+
+// ca-free-wakeup=1: SkyLight starts each WindowServer update at -[CAWindowServerDisplay nextWakeupTime], which QuartzCore puts on the
+// refresh grid (the last VBL plus a frame), so an update that took 13 ms is followed by one at 16.7 ms. This answers the earlier of that
+// and a refresh after the last update's start (-beginExternalUpdate:usingSoftwareRenderer:): the display shows a swap when it comes,
+// not at a VBL. SkyLight adds its updater delay (0.5 ms) and updates at once only when the last update is more than 1.25 frames before
+// the answer, so before the due time the answer is the due time less that delay, after it the least time 1.25 frames past the last
+// start. Without an update in the last second the grid's answer stands. The refresh is vsync='s (120 by default).
+// DroidVM: a heavy window drag from 60 to 96 frames a second.
+static std::atomic<uint64_t> gUpdateBegan{0}, gLastAsk{0};
+static double hostSeconds(uint64_t t) {
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return (double)t * base.numer / base.denom / 1e9;
+}
+static uint64_t hostTicks(double seconds) {
+    static mach_timebase_info_data_t base;
+    if (!base.denom) mach_timebase_info(&base);
+    return (uint64_t)(seconds * 1e9 * base.denom / base.numer);
+}
+__attribute__((constructor)) static void freeWakeupFromBootArgs() {
+    if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-free-wakeup=1")) return;
+    char args[1100] = {};
+    size_t size = sizeof args - 1;
+    unsigned hz = 120;
+    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+        if (const char *at = publish::bootArgToken(args, "vsync=")) {
+            const int value = atoi(at + 6);
+            if (value >= 30 && value <= 240) hz = (unsigned)value;
+        }
+    const double refresh = 1.0 / hz;
+    Class display = objc_getClass("CAWindowServerDisplay");
+    static SEL wakeSel = sel_registerName("nextWakeupTime"), beginSel = sel_registerName("beginExternalUpdate:usingSoftwareRenderer:");
+    Method wake = display ? class_getInstanceMethod(display, wakeSel) : nullptr;
+    Method begin = display ? class_getInstanceMethod(display, beginSel) : nullptr;
+    if (!wake || !begin || method_getTypeEncoding(wake)[0] != 'd' || method_getNumberOfArguments(begin) != 4) {
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup: CAWindowServerDisplay lacks %{public}s",
+               !wake ? "nextWakeupTime" : "beginExternalUpdate:usingSoftwareRenderer:");
+        return;
+    }
+    static auto wakeGrid = reinterpret_cast<double (*)(id, SEL)>(method_getImplementation(wake));
+    static auto beginOriginal = reinterpret_cast<uint64_t (*)(id, SEL, void *, uint64_t)>(method_getImplementation(begin));
+    method_setImplementation(begin, imp_implementationWithBlock(^uint64_t(id self, void *update, uint64_t software) {
+        // The update's start is SkyLight's last ask before it, where its update callback began.
+        const uint64_t now = mach_absolute_time(), asked = gLastAsk.load(std::memory_order_relaxed);
+        gUpdateBegan.store(asked && now - asked < hostTicks(0.003) ? asked : now, std::memory_order_relaxed);
+        return beginOriginal(self, beginSel, update, software);
+    }));
+    method_setImplementation(wake, imp_implementationWithBlock(^double(id self) {
+        const double grid = wakeGrid(self, wakeSel);
+        gLastAsk.store(mach_absolute_time(), std::memory_order_relaxed);
+        const uint64_t began = gUpdateBegan.load(std::memory_order_relaxed);
+        if (grid <= 0 || !began) return grid;
+        const double now = hostSeconds(mach_absolute_time()), start = hostSeconds(began);
+        if (now - start > 1.0) return grid;
+        const double due = start + refresh - 0.0005, ahead = start + 1.25 * refresh + 0.001;
+        if (now < due) return due < grid ? due : grid;
+        return now > ahead ? now : ahead;
+    }));
+    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: free wakeup on (%.2f ms)", refresh * 1e3);
+}
+#endif
