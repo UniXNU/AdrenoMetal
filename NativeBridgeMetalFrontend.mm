@@ -5201,6 +5201,16 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("PE warn %llu crit %llu freed %llu | imports held %llu %lluM | tuc flush %llu",(ull)gPressureEvents[0].load(),
     (ull)gPressureEvents[1].load(),(ull)gPressureEvents[2].load(),(ull)held,(ull)(heldBytes>>20),(ull)bc[4]);
   }
+  // Two-plane YCbCr surface textures (video frames; bridge patch 0035): made over their planes alone and made with a converted
+  // image, images made later at a slot binding that could not read the planes in place, textures another call made whole, the
+  // converted images alive and their MiB; then why a texture kept its image: the device, the layout, a swizzle, the planes'
+  // offset, their element count, planes past the surface, no texel buffer view. Only once such a texture was made.
+  {
+   uint64_t yc[14]={};
+   if(nmb_ycbcr_surface_counts(gDevice,yc) && (yc[0] || yc[1]))
+    row("YC planes %llu conv %llu later %llu whole %llu | img %llu %lluM | kept %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)yc[0],(ull)yc[1],
+     (ull)yc[2],(ull)yc[3],(ull)yc[4],(ull)(yc[5]>>20),(ull)yc[7],(ull)yc[8],(ull)yc[9],(ull)yc[10],(ull)yc[11],(ull)yc[12],(ull)yc[13]);
+  }
   // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
   // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
   {

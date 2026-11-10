@@ -526,12 +526,49 @@ impl<T> std::ops::Deref for Live<'_, T> {
     }
 }
 
+/// A resource made in a light form that serves slot bindings alone, and how to make it whole: a two-plane YCbCr texture over a
+/// surface's planes with no converted image (bridge patch 0035). The first call that needs more than a slot binding makes the whole
+/// object, which every call uses from then on; an encoder or a batch that bound the light one keeps it until it is done.
+pub struct Forms<T: Kind> {
+    /// The object in use and whether it is the whole one.
+    now: Mutex<(T, bool)>,
+    whole: Box<dyn Fn() -> Result<T, String> + Send + Sync>,
+    tie: Option<Tie>,
+}
+
+/// The light objects a call made whole, for the frontend's YC row.
+static MADE_WHOLE: AtomicU64 = AtomicU64::new(0);
+
+/// How many light objects a call other than a slot binding made whole.
+pub fn made_whole() -> u64 {
+    MADE_WHOLE.load(Relaxed)
+}
+
+impl<T: Kind> Forms<T> {
+    /// The whole object, made at the first call that asks for it.
+    fn whole(&self) -> Result<T, String> {
+        let mut now = lock(&self.now);
+        if !now.1 {
+            *now = ((self.whole)()?, true);
+            MADE_WHOLE.fetch_add(1, Relaxed);
+        }
+        Ok(now.0.clone())
+    }
+
+    /// The object in use: the light one until a call made it whole.
+    fn any(&self) -> T {
+        lock(&self.now).0.clone()
+    }
+}
+
 /// A buffer, texture or heap behind a frontend handle.
 pub enum Resource<T: Kind> {
     /// Never discarded: its object, and its tie on the resource it was made of where that one may be.
     Fixed(T, Option<Tie>),
     /// May be discarded while Volatile or Empty and idle.
     Kept(Arc<Cell<T>>),
+    /// Never discarded: light until a call needs it whole.
+    Forms(Forms<T>),
 }
 
 impl<T: Kind> Resource<T> {
@@ -569,11 +606,27 @@ impl<T: Kind> Resource<T> {
         }))
     }
 
-    /// The object for a call that uses the resource, placed again where it was discarded.
+    /// `light`, which serves slot bindings alone, made of the resource `tie` is on, and `whole`, which makes the object every
+    /// other call uses.
+    pub fn forms(light: T, tie: Option<Tie>, whole: impl Fn() -> Result<T, String> + Send + Sync + 'static) -> Resource<T> {
+        Resource::Forms(Forms { now: Mutex::new((light, false)), whole: Box::new(whole), tie })
+    }
+
+    /// The object for a call that uses the resource, placed again where it was discarded, and made whole where it was light.
     pub fn live(&self) -> Result<Live<'_, T>, String> {
         match self {
             Resource::Fixed(object, _) => Ok(Live::Fixed(object)),
             Resource::Kept(cell) => cell.live().map(Live::Placed),
+            Resource::Forms(forms) => forms.whole().map(Live::Placed),
+        }
+    }
+
+    /// The object for a slot binding, or a question every form answers alike: as [`live`](Self::live), but a light object stays
+    /// light.
+    pub fn slot(&self) -> Result<Live<'_, T>, String> {
+        match self {
+            Resource::Forms(forms) => Ok(Live::Placed(forms.any())),
+            other => other.live(),
         }
     }
 
@@ -582,13 +635,14 @@ impl<T: Kind> Resource<T> {
         match self {
             Resource::Fixed(object, _) => Some(Live::Fixed(object)),
             Resource::Kept(cell) => cell.peek().map(Live::Placed),
+            Resource::Forms(forms) => Some(Live::Placed(forms.any())),
         }
     }
 
     /// What a kept resource was made of.
     pub fn recipe(&self) -> Option<&T::Recipe> {
         match self {
-            Resource::Fixed(..) => None,
+            Resource::Fixed(..) | Resource::Forms(_) => None,
             Resource::Kept(cell) => Some(&cell.recipe),
         }
     }
@@ -598,6 +652,7 @@ impl<T: Kind> Resource<T> {
         match self {
             Resource::Fixed(object, _) => object.bytes(),
             Resource::Kept(cell) => cell.bytes,
+            Resource::Forms(forms) => forms.any().bytes(),
         }
     }
 
@@ -607,6 +662,7 @@ impl<T: Kind> Resource<T> {
         match self {
             Resource::Fixed(object, _) => Ok(object.state(requested)?.raw()),
             Resource::Kept(cell) => cell.set_state(requested),
+            Resource::Forms(forms) => Ok(forms.any().state(requested)?.raw()),
         }
     }
 
@@ -614,7 +670,7 @@ impl<T: Kind> Resource<T> {
     /// resource's object is read: what a fixed resource is itself tied to, since that is whose memory the new one shares.
     pub fn tie(&self) -> Option<Tie> {
         match self {
-            Resource::Fixed(_, tie) => tie.as_ref().map(|tie| Tie::on(Arc::clone(&tie.0))),
+            Resource::Fixed(_, tie) | Resource::Forms(Forms { tie, .. }) => tie.as_ref().map(|tie| Tie::on(Arc::clone(&tie.0))),
             Resource::Kept(cell) => {
                 let cell: Arc<dyn Tied> = cell.clone();
                 Some(Tie::on(cell))
@@ -627,7 +683,7 @@ impl<T: Kind> Resource<T> {
     /// without having set it NonVolatile, and the command's use will place it again, emptied.
     pub fn hold(&self) -> bool {
         match self {
-            Resource::Fixed(..) => false,
+            Resource::Fixed(..) | Resource::Forms(_) => false,
             Resource::Kept(cell) => {
                 cell.holds.fetch_add(1, SeqCst);
                 cell.out.load(SeqCst)
