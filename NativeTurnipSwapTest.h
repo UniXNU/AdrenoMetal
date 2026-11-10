@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// GMEM colour order test (boot-arg sheng-swaptest=1, once, in the render server): which byte order each path between tile memory and
+// GMEM colour order test (boot-arg swaptest=1, once, in the render server): which byte order each path between tile memory and
 // memory leaves in a linear BGRA8 image, rendered in system memory and in GMEM. The image is 3048 x 64, as wide as the render server's
 // surface (3048 is not a whole number of GMEM blocks, so an imported image takes the unpadded load and store paths). Two kinds: device memory,
 // and host memory imported (as an IOSurface's pages are). Its memory starts as B=10 G=20 R=30 A=255 in every pixel; one render pass that loads

@@ -82,7 +82,7 @@ static void *worker(void *arg) {
     __atomic_store_n(&job->done, true, __ATOMIC_RELEASE);
     return nullptr;
 }
-// Serves the display driver's frames with the GPU on `device` (the kernel offers them only with sheng-fb-gpu=1). The calls go through a hand-off-only
+// Serves the display driver's frames with the GPU on `device` (the kernel offers them only with fb-gpu=1). The calls go through a hand-off-only
 // connection to the accelerator (open type 0x4148: no GPU slot is taken): the original sandbox profiles admit that class and not the presenter's own
 // service. Reports on GPU7 only when the state changes: "P<step> e<hex>" (0 no connection, 1 no selector, 2 mode refused, 3 scanout not
 // mappable/importable, 4 serving), then "PF <frames>/<failures> r<last result> v<verified>/<differing rows> t<ms>" at the first frame, every fifth after

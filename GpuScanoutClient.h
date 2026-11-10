@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Userspace side of the GPU hand-off (boot-arg sheng-fb-gpu=1): serves the display driver's frames with the GPU. For every offered frame the
+// Userspace side of the GPU hand-off (boot-arg fb-gpu=1): serves the display driver's frames with the GPU. For every offered frame the
 // GPU copies the compositor's surface pages into the scanout mapping (GpuScanoutPresenter.h), and the swap is completed with the GPU's
 // verdict. A failed copy is reported as failed; the display driver then falls back to its own path and counts it.
 // The calls reach the kernel through a Transport. In the plugin that is the Adreno accelerator's connection (the original sandbox profiles
