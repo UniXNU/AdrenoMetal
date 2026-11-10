@@ -1023,14 +1023,24 @@ static void trimHeldImports(bool all) {
  gone.clear();   // the imports' last frontend references go here, outside the lock
 }
 extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(false);}
+// The system's memory pressure events this process got, for the telemetry's PE row: [0] warnings, [1] critical ones, [2] the blocks
+// the runtime gave back at them.
+static std::atomic<uint64_t> gPressureEvents[3];
 static void watchImportPressure() {
  static dispatch_once_t once;
+ // The source lives as long as the process: a source whose last reference goes is taken off its event queue, and this file's
+ // objects are reference counted by the compiler, so one held only by a local of the block below never delivered an event.
+ static dispatch_source_t source;
  dispatch_once(&once,^{
-  dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
+  source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
    DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
   // The runtime's spare and kept empty memory blocks go too (bridge patch 0021), as Metal's resource cache gives memory back.
-  dispatch_source_set_event_handler(source,^{trimHeldImports(true);if(gDevice)(void)nmb_device_release_kept_memory(gDevice);});
+  dispatch_source_set_event_handler(source,^{
+   gPressureEvents[dispatch_source_get_data(source)&DISPATCH_MEMORYPRESSURE_CRITICAL?1:0]++;
+   trimHeldImports(true);
+   if(gDevice)gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);
+  });
   dispatch_activate(source);
  });
 }
