@@ -669,14 +669,23 @@ static id deviceForPort(unsigned port) {
 #include <atomic>
 // WindowServer's frame pacing, as macOS-DroidVM's plugin (24af265, kc253-kc292), each behind its boot argument.
 //
-// ca-triple-buffer=1 sets QuartzCore's debug option 198, CA_FORCE_TRIPLE_BUFFERED_LATENCY (read by IOMFBDisplay::can_update_):
+// ca-triple-buffer=1 sets QuartzCore's debug option CA_FORCE_TRIPLE_BUFFERED_LATENCY (read by IOMFBDisplay::can_update_):
 // CoreAnimation renders a frame ahead instead of starting each frame only after the last one's buffer came back, which it otherwise
 // does whenever a frame took longer than a refresh (DroidVM: a heavy window drag from 56-60 to 61-67 frames a second).
 __attribute__((constructor)) static void tripleBufferFromBootArgs() {
     if (strcmp(getprogname(), "WindowServer") || !publish::bootArgSet("ca-triple-buffer=1")) return;
     auto setOption = reinterpret_cast<void (*)(unsigned, bool)>(dlsym(RTLD_DEFAULT, "CASetDebugOption"));
-    if (setOption) setOption(198, true);
-    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY %{public}s", setOption ? "set" : "not found");
+    auto optionName = reinterpret_cast<const char *(*)(unsigned)>(dlsym(RTLD_DEFAULT, "CAGetDebugOptionEnvVariableName"));
+    // The option's index differs between QuartzCore builds, so it is found by its name.
+    unsigned index = ~0u;
+    for (unsigned i = 0; optionName && i < 1024; ++i) {
+        const char *name = optionName(i);
+        if (!name) break;
+        if (!strcmp(name, "CA_FORCE_TRIPLE_BUFFERED_LATENCY")) { index = i; break; }
+    }
+    const bool set = setOption && index != ~0u;
+    if (set) setOption(index, true);
+    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: CA_FORCE_TRIPLE_BUFFERED_LATENCY %{public}s (option %u)", set ? "set" : "not found", index);
 }
 
 // ca-free-wakeup=1: SkyLight starts each WindowServer update at -[CAWindowServerDisplay nextWakeupTime], which QuartzCore puts on the
