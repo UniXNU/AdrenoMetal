@@ -1,0 +1,182 @@
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index 81505f4542bf4137c773b4773806e7dcc8bd169f..467d738484f6a6da29c613a08abdb295daafba0b 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -2320,6 +2320,15 @@ impl Device {
+         taken
+     }
+ 
++    /// Let the parked buffers go whose time is up, or every one where `all` (`Recycler::aged`):
++    /// how many went.
++    pub(super) fn age_parked_buffers(&self, all: bool) -> usize {
++        let gone = lock(&self.shared().recycled_buffers).aged(Instant::now(), all);
++        let count = gone.len();
++        self.let_go_parked_buffers(gone);
++        count
++    }
++
+     /// Destroy the parked buffers the recycler let go of, `gone`, and free their memory.
+     fn let_go_parked_buffers(&self, gone: recycle::Gone<vk::Buffer>) {
+         if gone.is_empty() {
+diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
+index 24c7b99a03bc183ec76d7b838ad4812e36bef21c..f18989ac24b08a69caf7890219972ad0e077e6f1 100644
+--- a/crates/metal2vulkan-runtime/src/device/mod.rs
++++ b/crates/metal2vulkan-runtime/src/device/mod.rs
+@@ -1135,14 +1135,34 @@ impl Device {
+     /// Give back the memory kept for later placements: every spare dedicated block and every
+     /// kept empty pooled block (`memory::SPARE_FOR`), as Metal's resource cache gives memory
+     /// back when the system reports memory pressure. How many blocks went. No Metal counterpart.
++    ///
++    /// The parked images and buffers go first (`recycle.rs`): each keeps its placement, so the
++    /// blocks they lie in empty only once they went.
+     pub fn release_kept_memory(&self) -> usize {
+         let Some(_busy) = crate::exit_guard::enter() else {
+             return 0;
+         };
++        self.age_parked_images(true);
++        self.age_parked_buffers(true);
+         let shared = self.shared();
+         lock(&shared.memory).release_spare(shared.vk())
+     }
+ 
++    /// Let the parked images and buffers go whose time is up (`recycle.rs`), from the room
++    /// thread: a device that makes and releases nothing more still lets them go.
++    pub(crate) fn age_parked(&self) {
++        self.age_parked_images(false);
++        self.age_parked_buffers(false);
++    }
++
++    /// How long a spare block of the device's memory stays before it is freed
++    /// (`memory::SPARE_FOR`): the age a consumer that gives memory back by age of its own
++    /// (resources its caller declared discardable) takes, so both go on one clock. No Metal
++    /// counterpart.
++    pub fn spare_age() -> std::time::Duration {
++        crate::memory::SPARE_FOR
++    }
++
+     /// The device's live blocks of its own memory by what holds them and by size, and what its
+     /// driver committed of the lazily allocated ones (`memory::MemoryKinds`): one walk of the
+     /// blocks under the memory's lock. A call of the program's on its own thread, as
+diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
+index 0bd3beae740946b54655fd6e28d229a10ae9d56e..8a81b4cff0c2dc246667ca122421356655a84344 100644
+--- a/crates/metal2vulkan-runtime/src/device/room.rs
++++ b/crates/metal2vulkan-runtime/src/device/room.rs
+@@ -91,6 +91,7 @@ fn keep(device: &Device) {
+     let Some(_busy) = exit_guard::enter() else {
+         return;
+     };
++    device.age_parked();
+     let shared = device.shared();
+     crate::memory::age_spares(&shared.memory, shared.vk());
+     crate::memory::keep_room(&shared.memory, shared.vk(), &shared.counts);
+@@ -125,7 +126,8 @@ fn run(shared: &Shared, weak: &WeakDevice) {
+             keep(&device);
+         } else if let Some(_busy) = exit_guard::enter() {
+             // In a section of the exit guard, as every Vulkan call of a thread of the runtime's is:
+-            // a spare whose time is up is freed here.
++            // a parked image or buffer, a kept empty block and a spare whose time is up go here.
++            device.age_parked();
+             let parts = device.shared();
+             crate::memory::age_spares(&parts.memory, parts.vk());
+         }
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index d3f1daee8a9830aa61dc4c527ef0d0ac49dcecb9..15afb34bd364ef06373b4a99c41273b67b6eb940 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -1909,6 +1909,28 @@ impl Memory {
+         }
+     }
+ 
++    /// In every pool, the kept empty pooled blocks that stayed empty for [`KEPT_EMPTY_FOR`] at
++    /// `now` go while another stays kept ([`Pool::stale`]): a block of images becomes a spare,
++    /// any other is freed, as at a release ([`Memory::release_range`]).
++    fn age_kept(&mut self, device: &ash::Device, now: Instant) {
++        let types = self.types.len();
++        for at in 0..self.pools.len() {
++            let holds = match at < types {
++                true => Holds::Buffers,
++                false => Holds::Images,
++            };
++            let type_index = (at % types.max(1)) as u32;
++            while let Some(stale) = self.pools[at].stale(now) {
++                if holds == Holds::Images && stale.plain() {
++                    self.keep_spare(device, (holds, type_index), stale, now);
++                } else {
++                    // SAFETY: nothing is placed in a kept empty block, and no command reads it.
++                    drop(unsafe { self.let_go(device, stale, FreeCause::KeptStale, None) });
++                }
++            }
++        }
++    }
++
+     /// Free the spare blocks that stayed spare for [`SPARE_FOR`] at `now`.
+     fn age_spare(&mut self, device: &ash::Device, now: Instant) {
+         let stale: Vec<Spare> = (self.spare)
+@@ -2786,9 +2808,14 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
+ }
+ 
+ /// Free the spare blocks whose time is up, from the room worker: a device that releases nothing
+-/// more still lets its spares go after [`SPARE_FOR`].
++/// more still lets its spares go after [`SPARE_FOR`]. The kept empty pooled blocks beyond each
++/// pool's one go as they do at a release ([`Pool::stale`]), which a pool that releases nothing
++/// more never reached: its second empty block stayed for good.
+ pub(super) fn age_spares(memory: &Mutex<Memory>, device: &ash::Device) {
+-    lock(memory).age_spare(device, Instant::now());
++    let mut memory = lock(memory);
++    let now = Instant::now();
++    memory.age_kept(device, now);
++    memory.age_spare(device, now);
+ }
+ 
+ /// Keep room for any pooled placement (half a block) in each pool the runtime's encodings and
+diff --git a/crates/metal2vulkan-runtime/src/recycle.rs b/crates/metal2vulkan-runtime/src/recycle.rs
+index fc916fdd58fa0c802ca41688ef15f849a26a25ae..4a6068c418fd615068fac48a84c991e8bd3cd9c4 100644
+--- a/crates/metal2vulkan-runtime/src/recycle.rs
++++ b/crates/metal2vulkan-runtime/src/recycle.rs
+@@ -311,6 +311,26 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
+         Some(self.unindexed(order, parked))
+     }
+ 
++    /// The objects parked longer than the bounds' time at `now`, out of the recycler, or every
++    /// parked object where `all`: what a device lets go of when its time passes with no making or
++    /// release to notice it (the room thread, `device/room.rs`), and when the system reports
++    /// memory pressure (`Device::release_kept_memory`). A parked object keeps its placement, so
++    /// its block stays live: a process that released its last textures and then made nothing more
++    /// kept up to the bounds' bytes parked for good.
++    pub(crate) fn aged(&mut self, now: Instant, all: bool) -> Gone<R> {
++        if !all {
++            return self.stale(now);
++        }
++        let mut gone = Gone::new();
++        while let Some((order, parked)) = self.trial.pop_first(None) {
++            gone.push(self.unindexed(order, parked));
++        }
++        while let Some((order, parked)) = self.proven.pop_first(None) {
++            gone.push(self.unindexed(order, parked));
++        }
++        gone
++    }
++
+     /// The objects parked longer than the bounds' time at `now`, out of the recycler.
+     fn stale(&mut self, now: Instant) -> Gone<R> {
+         let stale = Some((now, self.bounds.parked_for));
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 6c7b47589e73adc3f0979d7106e031614cd2e7ca..f245020e8b46b8c50880991aa9a78f70e164fd5f 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -3071,6 +3071,15 @@ impl Device {
+         Ok((raw, placement))
+     }
+ 
++    /// Let the parked images go whose time is up, or every one where `all` (`Recycler::aged`):
++    /// how many went.
++    pub(super) fn age_parked_images(&self, all: bool) -> usize {
++        let gone = lock(&self.shared().textures.recycled).aged(Instant::now(), all);
++        let count = gone.len();
++        self.let_go_parked(gone);
++        count
++    }
++
+     /// Destroy the parked images the recycler let go of, `gone`.
+     fn let_go_parked(&self, gone: recycle::Gone<vk::Image>) {
+         if gone.is_empty() {
