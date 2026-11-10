@@ -550,10 +550,12 @@ static void noteProblem(NSString *what) {
 extern "C" void native_bridge_metal_note(const char *what) {noteProblem([NSString stringWithUTF8String:what]?:@"?");}
 // NMB_LOG_STDERR: also on stderr (a daemon's NSLog reaches only the unified log, which a bring-up board does not read).
 static bool logToStderr() {static bool on=getenv("NMB_LOG_STDERR")!=nullptr;return on;}
-// The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): NSLog output, the pipeline journal. The problem notes that feed
-// the status rows (noteProblem) are kept either way.
+// The GPU stack's log lines (log-gpu=1 on the boot line: the plugin sets SHENG_LOG_GPU): the log output, the pipeline journal. The problem notes that feed
+// the status rows (noteProblem) are kept either way. A line goes to the system log as a public string: NSLog's object arguments are
+// stored redacted on macOS 27 (every line of a refusal's text read "<private>" in the log archive).
 static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;return on;}
-#define GLOG(...) do{if(logGpuOn())NSLog(__VA_ARGS__);}while(0)
+#define GLOG(...) do{if(logGpuOn()){NSString *glogText=[NSString stringWithFormat:__VA_ARGS__];\
+ os_log(OS_LOG_DEFAULT,"%{public}s",glogText.UTF8String?:"?");}}while(0)
 #define NBLOG(...) do{NSString *nbText=[NSString stringWithFormat:__VA_ARGS__];GLOG(@"%@",nbText);noteProblem(nbText);\
  if(logToStderr())fprintf(stderr,"%s: %.140s\n",getprogname(),nbText.UTF8String?:"?");}while(0)
 // The render server does not get past the loss of its GPU context: CoreAnimation keeps submitting to the dead context and
@@ -4632,7 +4634,8 @@ static void fillBaseLimits(id device) {
    break;
   }
  }
- NBLOG(@"native-metal: base limits: %u fields of %zu bytes filled from the device's answers",filled,size);
+ // A log line, not a problem: as a problem it stood in every client's one problem row in place of the client's own refusal.
+ GLOG(@"native-metal: base limits: %u fields of %zu bytes filled from the device's answers",filled,size);
 }
 static void installAnswers(Class cls) {
  uint32_t kind=0;
