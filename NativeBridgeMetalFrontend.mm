@@ -881,6 +881,30 @@ static void answerMissing(NSInvocation *invocation) {
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 @end
+// What the caller asked of setPurgeableState: (MTLResource, MTLHeap), for the telemetry's PG row: how much memory the process has declared
+// discardable. The runtime keeps the state and never discards (its attributes.rs), so these bytes are what a purge could give back.
+// [0..2] requests on buffers, textures, heaps; [3] bytes volatile now, [4] bytes empty now (an object freed in either state stays
+// counted: an upper bound); [5] bytes ever made volatile or empty, [6] bytes made non-volatile again, [7] the largest such object.
+static std::atomic<uint64_t> gPurgeable[8];
+static void notePurgeable(unsigned kind,MTLPurgeableState before,MTLPurgeableState asked,uint64_t bytes) {
+ gPurgeable[kind].fetch_add(1,std::memory_order_relaxed);
+ if(asked==MTLPurgeableStateKeepCurrent)return;
+ const MTLPurgeableState after=before==MTLPurgeableStateEmpty && asked==MTLPurgeableStateVolatile?MTLPurgeableStateEmpty:asked;
+ if(after==before)return;
+ const auto slot=[](MTLPurgeableState state){return state==MTLPurgeableStateVolatile?3:state==MTLPurgeableStateEmpty?4:-1;};
+ if(slot(before)>=0) {
+  // never below zero: the count is an estimate (see above)
+  uint64_t now=gPurgeable[slot(before)].load(std::memory_order_relaxed);
+  while(!gPurgeable[slot(before)].compare_exchange_weak(now,now>bytes?now-bytes:0,std::memory_order_relaxed)){}
+ }
+ if(slot(after)>=0) {
+  gPurgeable[slot(after)].fetch_add(bytes,std::memory_order_relaxed);
+  if(slot(before)<0)gPurgeable[5].fetch_add(bytes,std::memory_order_relaxed);
+  uint64_t big=gPurgeable[7].load(std::memory_order_relaxed);
+  while(bytes>big && !gPurgeable[7].compare_exchange_weak(big,bytes,std::memory_order_relaxed)){}
+ } else if(slot(before)>=0) gPurgeable[6].fetch_add(bytes,std::memory_order_relaxed);
+}
+
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
@@ -957,6 +981,7 @@ static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
+ else notePurgeable(0,(MTLPurgeableState)answer,state,[self allocatedSize]);
  return (MTLPurgeableState)answer;
 }
 - (NSUInteger)allocatedSize {return nmb_buffer_length(_handle);}
@@ -1189,6 +1214,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
+ else notePurgeable(1,(MTLPurgeableState)answer,state,[self allocatedSize]);
  return (MTLPurgeableState)answer;
 }
 NB_RESOURCE_SPI
@@ -3892,6 +3918,7 @@ static char dvmMemoryReleaseKey;
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
  const uint64_t answer=nmb_heap_set_purgeable_state(_handle,state);
  if(!answer)NBLOG(@"native-metal: heap setPurgeableState refused: %@",lastError());
+ else notePurgeable(2,(MTLPurgeableState)answer,state,[self size]);
  return (MTLPurgeableState)answer;
 }
 - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
@@ -4926,6 +4953,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
     (unsigned long long)bc[2],(unsigned long long)bc[3]);
   }
+  // What the process declared discardable (notePurgeable): requests on buffers/textures/heaps, MiB volatile and empty now, MiB ever
+  // declared and taken back, the largest object.
+  row("PG req %llu/%llu/%llu | vol %lluM empty %lluM | to %lluM back %lluM big %lluM",(unsigned long long)gPurgeable[0].load(),
+   (unsigned long long)gPurgeable[1].load(),(unsigned long long)gPurgeable[2].load(),(unsigned long long)(gPurgeable[3].load()>>20),
+   (unsigned long long)(gPurgeable[4].load()>>20),(unsigned long long)(gPurgeable[5].load()>>20),(unsigned long long)(gPurgeable[6].load()>>20),
+   (unsigned long long)(gPurgeable[7].load()>>20));
   // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
   // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
   {
