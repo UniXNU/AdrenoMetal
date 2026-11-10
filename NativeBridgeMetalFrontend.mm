@@ -4701,6 +4701,37 @@ static void logFlowCounts() {
  dispatch_resume(timer);
 }
 
+// With diag=1, a process other than the render server (which has the telemetry table) writes what it compiled to the system log
+// every 30 s while that changes: pipeline states, libraries and compiler requests made with their total and longest times, the
+// driver pipelines made (in all, at a state's creation, at a draw or dispatch) and the driver's time in them, the shader cache's
+// hits, misses and writes, and the MiB of the runtime's pooled, kept and dedicated blocks. One line a process, so a boot's log
+// says which app compiled how much at first use.
+static void logClientWork() {
+ if(!diagOn() || isRenderServer())return;
+ static dispatch_source_t timer;
+ timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+ dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,30*NSEC_PER_SEC),30*NSEC_PER_SEC,5*NSEC_PER_SEC);
+ dispatch_source_set_event_handler(timer,^{
+  static uint64_t last[3];
+  uint64_t vp[8]={},work[10]={},mc[10]={};
+  if(!nmb_device_pipeline_counts(gDevice,vp))return;
+  const uint64_t now[3]={gTimePipeline.count.load(),gTimeCompile.count.load()+gCompileCached.load(),vp[0]};
+  if(!memcmp(now,last,sizeof now))return;
+  memcpy(last,now,sizeof now);
+  (void)nmb_device_work_stats(gDevice,work);(void)nmb_device_memory_counts(gDevice,mc);
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal work: pipeline %llu/%llums/%llums library %llu/%llums compile %llu/%llums cached %llu | vk %llu "
+   "create %llu/%llu step %llu drv %llu+%llums | cache hit %llu miss %llu wr %llu | mem %llu/%llu/%lluM | problems %llu",
+   (unsigned long long)gTimePipeline.count.load(),(unsigned long long)(gTimePipeline.total.load()/1000),
+   (unsigned long long)(gTimePipeline.slowest.load()/1000),(unsigned long long)gTimeLibrary.count.load(),
+   (unsigned long long)(gTimeLibrary.total.load()/1000),(unsigned long long)gTimeCompile.count.load(),
+   (unsigned long long)(gTimeCompile.total.load()/1000),(unsigned long long)gCompileCached.load(),(unsigned long long)vp[0],
+   (unsigned long long)vp[1],(unsigned long long)vp[2],(unsigned long long)vp[3],(unsigned long long)(vp[4]/1000000),
+   (unsigned long long)(vp[5]/1000000),(unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],
+   (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),(unsigned long long)gProblems.load());
+ });
+ dispatch_resume(timer);
+}
+
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
@@ -4715,6 +4746,9 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(!gDevice){NBLOG(@"native-metal: device refused: %s",nmb_last_error());return nil;}
  watchImportPressure();
  logFlowCounts();
+ logClientWork();
+ // Where this process's pipeline cache is and whose it is: a cache serves the processes of its user that may write its directory.
+ if(diagOn() || logGpuOn())os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d",cache?cache:"none",(int)getuid());
  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
@@ -4870,147 +4904,140 @@ extern "C" size_t native_bridge_metal_benchmark(id device,const char *metallib,u
  }
  return at;
 }
-// The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters.
+// The process's threads by the CPU time they used since the last call (the first call: since each began), for the telemetry's TH rows:
+// what the process's CPU share in a process listing is made of, taken in the process itself, where a sampling tool on a loaded
+// system got 15 to 47 samples in four seconds. Names lose "com.apple.", and "coreanimation." and "metal2vulkan-" become "ca." and
+// "m2v-"; a thread without one is its id's low 16 bits.
+struct ThreadCpu {uint64_t us;char name[16];};
+static unsigned threadCpuTop(ThreadCpu *top,unsigned max,uint64_t *totalUs,uint64_t *windowUs) {
+ static std::mutex lock;
+ static std::unordered_map<uint64_t,uint64_t> last;
+ static uint64_t lastAt;
+ std::lock_guard<std::mutex> hold(lock);
+ thread_act_array_t threads=nullptr;mach_msg_type_number_t count=0;
+ if(task_threads(mach_task_self(),&threads,&count)!=KERN_SUCCESS)return 0;
+ std::unordered_map<uint64_t,uint64_t> seen;
+ std::vector<ThreadCpu> used;
+ uint64_t total=0;
+ for(mach_msg_type_number_t i=0;i<count;i++) {
+  thread_identifier_info_data_t id={};mach_msg_type_number_t idCount=THREAD_IDENTIFIER_INFO_COUNT;
+  thread_extended_info_data_t info={};mach_msg_type_number_t infoCount=THREAD_EXTENDED_INFO_COUNT;
+  if(thread_info(threads[i],THREAD_IDENTIFIER_INFO,(thread_info_t)&id,&idCount)==KERN_SUCCESS &&
+     thread_info(threads[i],THREAD_EXTENDED_INFO,(thread_info_t)&info,&infoCount)==KERN_SUCCESS) {
+   const uint64_t us=(info.pth_user_time+info.pth_system_time)/1000;
+   seen[id.thread_id]=us;
+   const auto before=last.find(id.thread_id);
+   const uint64_t delta=before==last.end()?us:us>before->second?us-before->second:0;
+   total+=delta;
+   if(delta>=1000) {   // a millisecond or more: the rows show milliseconds
+    ThreadCpu t={delta,{}};
+    const char *name=info.pth_name;
+    if(!strncmp(name,"com.apple.",10))name+=10;
+    if(!strncmp(name,"metal2vulkan-",13))snprintf(t.name,sizeof t.name,"m2v-%s",name+13);
+    else if(!strncmp(name,"coreanimation.",14))snprintf(t.name,sizeof t.name,"ca.%s",name+14);
+    else if(name[0])strlcpy(t.name,name,sizeof t.name);
+    else snprintf(t.name,sizeof t.name,"#%04llx",(unsigned long long)(id.thread_id&0xffff));
+    for(char &c:t.name)if(c==' ' || c==':')c='_';
+    used.push_back(t);
+   }
+  }
+  mach_port_deallocate(mach_task_self(),threads[i]);
+ }
+ vm_deallocate(mach_task_self(),(vm_address_t)threads,count*sizeof(thread_act_t));
+ last.swap(seen);
+ const uint64_t now=nowUs();
+ *windowUs=lastAt?now-lastAt:0;lastAt=now;*totalUs=total;
+ std::sort(used.begin(),used.end(),[](const ThreadCpu &a,const ThreadCpu &b){return a.us>b.us;});
+ const unsigned n=(unsigned)std::min<size_t>(used.size(),max);
+ for(unsigned i=0;i<n;i++)top[i]=used[i];
+ return n;
+}
+// The telemetry table the plugin streams to the kernel's log: newline-separated rows of at most 90 characters. The kernel keeps the
+// first 48 rows, so the rows come in the order of what a boot is read for: where the GPU memory is, what was compiled and what it
+// cost, which threads used the CPU, the last problems, then the frame work and the last command buffers.
 extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  size_t at=0;out[0]=0;
  auto row=[&](const char *format,auto... args){
   char text[200];int n=snprintf(text,sizeof text,format,args...);if(n<=0)return;if(n>90)n=90;
   if(at+(size_t)n+2>=size)return;memcpy(out+at,text,(size_t)n);at+=(size_t)n;out[at++]='\n';out[at]=0;};
  auto ms=[](uint64_t us){return (unsigned long long)(us/1000);};
- {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
- row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(unsigned long long)gCommits.load(),(unsigned long long)gCommitFailures.load(),
-  (unsigned long long)gCompleted.load(),(unsigned long long)gPipelines.load(),(unsigned long long)gProblems.load(),(unsigned long long)gPasses.load(),
-  (unsigned long long)gDraws.load(),(unsigned long long)gFullScreenPasses.load(),(unsigned long long)(gBiggestPass.load()>>10),
-  (unsigned long long)gDispatches.load(),(unsigned long long)gBlits.load());
- {
-  // The five most used (pass target, pipeline) format pairs: p target format, s pipeline format, l load action, S an IOSurface, B a screen-size target.
-  struct {uint64_t key,n;} top[5]={};
-  {std::lock_guard<std::mutex> lock(gPassFormatLock);
-   for(unsigned i=0;i<gPassFormatCount;i++)for(unsigned t=0;t<5;t++)if(gPassFormatRows[i].n>top[t].n){for(unsigned u=4;u>t;u--)top[u]=top[u-1];top[t]={gPassFormatRows[i].key,gPassFormatRows[i].n};break;}}
-  for(unsigned t=0;t<5 && top[t].n;t++)
-   row("DF p%u s%u l%u %s%s n%llu",(unsigned)(top[t].key&0xffff),(unsigned)(top[t].key>>32),(unsigned)(top[t].key>>16&3),top[t].key>>18&1?"S":"-",
-    top[t].key>>19&1?"B":"-",(unsigned long long)top[t].n);
+ using ull=unsigned long long;
+ // Turnip's own counters, once the runtime has loaded it.
+ static void *turnip;
+ static void (*cacheStats)(uint64_t *),(*modeStats)(uint64_t *),(*sideStats)(uint64_t *);
+ if(!turnip && !gLoaderPath.empty() && (turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD))) {
+  cacheStats=(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats");
+  modeStats=(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats");
+  sideStats=(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats");
  }
- row("T pipeline n=%llu total=%llums max=%llums",(unsigned long long)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
- row("T library n=%llu total=%llums max=%llums",(unsigned long long)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
- row("T compile n=%llu total=%llums max=%llums cached=%llu",(unsigned long long)gTimeCompile.count.load(),ms(gTimeCompile.total.load()),
-  ms(gTimeCompile.slowest.load()),(unsigned long long)gCompileCached.load());
- row("T function n=%llu total=%llums max=%llums",
-  (unsigned long long)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
- row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(unsigned long long)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
-  ms(gTimeEncodeToCommit.slowest.load()),(unsigned long long)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
- for(int k=0;k<3;k++) {
-  const std::atomic<uint64_t> *bins=k==0?gHistFrameGpu:k==1?gHistOtherGpu:gHistFrameEncode;
-  row("H %s <1=%llu <2=%llu <4=%llu <8=%llu <16=%llu <32=%llu <64=%llu <128=%llu <256=%llu more=%llu",k==0?"frame-gpu":k==1?"other-gpu":"frame-enc",
-   (unsigned long long)bins[0].load(),(unsigned long long)bins[1].load(),(unsigned long long)bins[2].load(),(unsigned long long)bins[3].load(),
-   (unsigned long long)bins[4].load(),(unsigned long long)bins[5].load(),(unsigned long long)bins[6].load(),(unsigned long long)bins[7].load(),
-   (unsigned long long)bins[8].load(),(unsigned long long)bins[9].load());
- }
- row("J scheduled wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
- row("J completed wait n=%llu total=%llums max=%llums t=%llu",(unsigned long long)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()),(unsigned long long)gWaitTimeouts.load());
- row("J resource wait n=%llu total=%llums max=%llums",(unsigned long long)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
- row("J resource checks=%llu skipped=%llu",(unsigned long long)gResourceChecks.load(),(unsigned long long)gResourceSkipped.load());
- row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(unsigned long long)gTimeSurfaceFlush.count.load(),
-  (unsigned long long)gSurfaceFlushBytes.load(),(unsigned long long)gSurfaceFlushDuplicates.load(),
-  (unsigned long long)gTimeSurfaceFlush.total.load(),(unsigned long long)gTimeSurfaceFlush.slowest.load());
- row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(unsigned long long)gNoCopyAll.load(),(unsigned long long)gNoCopyReleased.load(),
-  (unsigned long long)gNoCopyMade.load(),
-  (unsigned long long)gSurfaceImportsReleased.load(),(unsigned long long)gSurfaceImportsMade.load());
- {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(unsigned long long)remaps[0],(unsigned long long)remaps[1]);}
- // The runtime's VkPipeline makings (the creation log, METAL2VULKAN_LOG_PIPELINES; they happen at draws, not at the state's creation) and
- // its shader cache: where the driver's compile time goes.
- uint64_t work[10]={};
- if(gDevice && nmb_device_work_stats(gDevice,work)) {
-  row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",
-   (unsigned long long)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(unsigned long long)work[4]);
-  row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],(unsigned long long)work[5],
-   (unsigned long long)work[6]);
-  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
-  // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
-  // pipeline cache: loads, saves, hits, misses.
-  uint64_t sc[24]={};
-  if(nmb_device_shader_cache_detail(gDevice,sc)) {
-   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(unsigned long long)sc[2],(unsigned long long)sc[3],(unsigned long long)sc[4],(unsigned long long)sc[5],
-    (unsigned long long)sc[6],(unsigned long long)sc[7],(unsigned long long)sc[8],(unsigned long long)sc[9]);
-   row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(unsigned long long)sc[10],(unsigned long long)sc[11],
-    (unsigned long long)sc[12],(unsigned long long)(sc[13]>>10),(unsigned long long)sc[15],(unsigned long long)sc[16],(unsigned long long)sc[14],(unsigned long long)sc[17],
-    (unsigned long long)sc[20],(unsigned long long)sc[18],(unsigned long long)sc[19]);
+ // ---- where this process's GPU memory is ----
+ if(gDevice) {
+  // MiB: the runtime's pooled blocks (placed in them), empty kept blocks and spares, dedicated blocks, host imports, allocated so
+  // far; live pooled and dedicated block counts; GPU pool blocks made and released; then Turnip's cache of freed BOs now and at
+  // most (tu_darwin_bo_cache_stats). The kernel's [gpu objects] and [bo owners] rows have the process's own BOs: what is neither
+  // the runtime's nor the cache's is Turnip's own (command streams, shaders, the attachments it backs itself: the ML row).
+  uint64_t mc[10]={},bc[8]={};
+  if(cacheStats)cacheStats(bc);
+  if(nmb_device_memory_counts(gDevice,mc)) {
+   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
+    (ull)(mc[0]>>20),(ull)(mc[1]>>20),(ull)(mc[2]>>20),(ull)(mc[3]>>20),(ull)(mc[4]>>20),(ull)(mc[5]>>20),(ull)mc[6],(ull)mc[7],
+    (ull)mc[8],(ull)mc[9],(ull)(bc[5]>>20),(ull)(bc[6]>>20),(ull)bc[2],(ull)bc[3]);
   }
-  // Where textures over buffers and surfaces cost copies: host-page textures in place (of them at Metal's pitch), shadowed for their
-  // pitch and for no driver image; shadowed textures, their copies in, texels copied back; host-page render targets shadowed.
-  uint64_t tc[8]={};
-  if(nmb_device_texture_counts(gDevice,tc))
-   row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(unsigned long long)tc[0],(unsigned long long)tc[1],(unsigned long long)tc[2],
-    (unsigned long long)tc[3],(unsigned long long)tc[4],(unsigned long long)tc[5],(unsigned long long)tc[6],(unsigned long long)tc[7]);
-  // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
-  // log waits, encoder ends on the lowering thread.
-  uint64_t flow[8]={};
-  if(nmb_device_flow_counts(gDevice,flow))
-   row("FL w %llu/%llu/%llu %lluK cm %llu/%llu lw %llu le %llu",(unsigned long long)flow[0],(unsigned long long)flow[1],(unsigned long long)flow[2],
-    (unsigned long long)(flow[3]>>10),(unsigned long long)flow[4],(unsigned long long)flow[5],(unsigned long long)flow[6],(unsigned long long)flow[7]);
-  // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
+  // The same blocks by size (nmb_device_memory_kinds): how many of at most 16, 32, 40, 48, 56 and 64 MiB and of more, for the
+  // pooled blocks in use and those kept empty (MK), the spare image blocks and the dedicated blocks of an image, with their MiB
+  // (MKb), and the dedicated blocks of a buffer with theirs and buffers' own imported pages (MKc). A full-screen 3048x2032
+  // RGBA16Float image is 47.3 MiB, a pooled block grows from 4 to 64 MiB.
+  uint64_t mk[48]={};
+  if(nmb_device_memory_kinds(gDevice,mk)) {
+   auto classes=[&](char *text,size_t bytes,const uint64_t *c){
+    snprintf(text,bytes,"%llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)c[0],(ull)c[1],(ull)c[2],(ull)c[3],(ull)c[4],(ull)c[5],(ull)c[6]);};
+   char a[40],b[40];
+   classes(a,sizeof a,mk);classes(b,sizeof b,mk+7);
+   row("MK 16/32/40/48/56/64/+ pool %s empty %s",a,b);
+   classes(a,sizeof a,mk+14);classes(b,sizeof b,mk+21);
+   row("MKb spare %s %lluM | dedi %s %lluM",a,(ull)(mk[35]>>20),b,(ull)(mk[36]>>20));
+   classes(a,sizeof a,mk+28);
+   row("MKc dedb %s %lluM | own pages %llu %lluM",a,(ull)(mk[37]>>20),(ull)mk[46],(ull)(mk[47]>>20));
+   // Lazily allocated memory (Metal's memoryless attachments): the blocks with a placement, their MiB, how many of them the driver
+   // backed and the MiB it backed (a pass that rendered the attachment outside tile memory); then the same of the blocks kept
+   // empty or spare. Backed MiB here are buffer objects Turnip made itself, inside the runtime's pool, empty and dedicated figures.
+   row("ML lazy used %llu %lluM backed %llu %lluM | kept %llu %lluM backed %llu %lluM",(ull)mk[38],(ull)(mk[39]>>20),(ull)mk[40],
+    (ull)(mk[41]>>20),(ull)mk[42],(ull)(mk[43]>>20),(ull)mk[44],(ull)(mk[45]>>20));
+  }
+  // What the process declared discardable (notePurgeable): requests on buffers/textures/heaps, MiB volatile and empty now, MiB ever
+  // declared and taken back, the largest object.
+  row("PG req %llu/%llu/%llu | vol %lluM empty %lluM | to %lluM back %lluM big %lluM",(ull)gPurgeable[0].load(),
+   (ull)gPurgeable[1].load(),(ull)gPurgeable[2].load(),(ull)(gPurgeable[3].load()>>20),(ull)(gPurgeable[4].load()>>20),
+   (ull)(gPurgeable[5].load()>>20),(ull)(gPurgeable[6].load()>>20),(ull)(gPurgeable[7].load()>>20));
+  // The system's memory pressure events this process got (warnings, critical ones) and the blocks the runtime gave back at them;
+  // then the surface imports held between frames and their MiB, which go back at such an event, and how often Turnip emptied its BO
+  // cache (at its own pressure events and when an allocation failed).
   {
-   std::lock_guard<std::mutex> lock(gUnalignedLock);
-   if(gUnalignedCount)
-    row("TB n%llu %lluM big %ux%u row%u %.20s+%llx",(unsigned long long)gUnalignedCount,(unsigned long long)(gUnalignedBytes>>20),
-     gUnalignedSize[0],gUnalignedSize[1],gUnalignedSize[2],gUnalignedImage,(unsigned long long)gUnalignedCaller);
+   uint64_t held=0,heldBytes=0;
+   {std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+    for(const auto &entry:gHeldImports){++held;heldBytes+=nmb_buffer_length(entry.second.buffer.handle);}}
+   row("PE warn %llu crit %llu freed %llu | imports held %llu %lluM | tuc flush %llu",(ull)gPressureEvents[0].load(),
+    (ull)gPressureEvents[1].load(),(ull)gPressureEvents[2].load(),(ull)held,(ull)(heldBytes>>20),(ull)bc[4]);
+  }
+  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
+  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
+  {
+   uint64_t rm[8]={};
+   if(modeStats) {
+    modeStats(rm);
+    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(ull)rm[0],(ull)(rm[1]/1000),(ull)rm[2],
+     (ull)(rm[3]/1000),(ull)rm[4],(ull)(rm[5]/1000),(ull)rm[6]);
+   }
   }
   // Where passes cost more than one pass in tile memory: passes begun as instances, split inline; instance splits for a barrier, tile
   // memory, a memoryless write, a pending pipeline; stand-ins made and MiB; stand-in copies, of them at draws.
   uint64_t pc[10]={};
   if(nmb_device_pass_counts(gDevice,pc))
-   row("PS ins %llu inl %llu | bar %llu tile %llu ml %llu pend %llu | sti %llu %lluM cp %llu/%llu",(unsigned long long)pc[0],
-    (unsigned long long)pc[1],(unsigned long long)pc[2],(unsigned long long)pc[3],(unsigned long long)pc[4],(unsigned long long)pc[5],
-    (unsigned long long)pc[6],(unsigned long long)(pc[7]>>20),(unsigned long long)pc[8],(unsigned long long)pc[9]);
-  // Where this process's GPU memory is (MiB): the runtime's pooled blocks (placed in them), empty kept blocks, dedicated blocks, host
-  // imports, allocated so far; then Turnip's cache of freed BOs now and at most (tu_darwin_bo_cache_stats). The kernel's [gpu objects]
-  // row has the process's own BOs: what is neither the runtime's nor the cache's is Turnip's own (command streams, shaders).
-  uint64_t mc[10]={};
-  if(nmb_device_memory_counts(gDevice,mc)) {
-   uint64_t bc[8]={};
-   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-   static void (*cacheStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_darwin_bo_cache_stats"):nullptr;
-   if(cacheStats)cacheStats(bc);
-   row("MEM pool %llu(%llu) empty %llu ded %llu imp %llu alloc %llu | blk %llu/%llu gp %llu-%llu | tuc %llu/%llu n%llu/%llu",
-    (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
-    (unsigned long long)(mc[4]>>20),(unsigned long long)(mc[5]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
-    (unsigned long long)mc[8],(unsigned long long)mc[9],(unsigned long long)(bc[5]>>20),(unsigned long long)(bc[6]>>20),
-    (unsigned long long)bc[2],(unsigned long long)bc[3]);
-  }
-  // What the process declared discardable (notePurgeable): requests on buffers/textures/heaps, MiB volatile and empty now, MiB ever
-  // declared and taken back, the largest object.
-  row("PG req %llu/%llu/%llu | vol %lluM empty %lluM | to %lluM back %lluM big %lluM",(unsigned long long)gPurgeable[0].load(),
-   (unsigned long long)gPurgeable[1].load(),(unsigned long long)gPurgeable[2].load(),(unsigned long long)(gPurgeable[3].load()>>20),
-   (unsigned long long)(gPurgeable[4].load()>>20),(unsigned long long)(gPurgeable[5].load()>>20),(unsigned long long)(gPurgeable[6].load()>>20),
-   (unsigned long long)(gPurgeable[7].load()>>20));
-  // How Turnip rendered the passes (tu_render_mode_stats): GMEM passes and their Mpx, SYSMEM passes the autotuner chose and theirs,
-  // SYSMEM passes for another reason and theirs, then GMEM passes with an attachment loaded or stored over its texels alone.
-  {
-   uint64_t rm[8]={};
-   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-   static void (*modeStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_render_mode_stats"):nullptr;
-   if(modeStats) {
-    modeStats(rm);
-    row("RM gmem %llu %lluM | sys auto %llu %lluM other %llu %lluM | exact %llu",(unsigned long long)rm[0],(unsigned long long)(rm[1]/1000),
-     (unsigned long long)rm[2],(unsigned long long)(rm[3]/1000),(unsigned long long)rm[4],(unsigned long long)(rm[5]/1000),(unsigned long long)rm[6]);
-   }
-  }
-  // The tile-memory side of GMEM loads and stores (tu_gmem_side_stats), per site: 3D store source, 3D load source, 2D store source, input attachment; each
-  // transfers / of them with a swap other than WZYX / with MUTABLEEN / of a linear image. The second number must stay 0 for linear images.
-  {
-   uint64_t gm[16]={};
-   static void *turnip=gLoaderPath.empty()?nullptr:dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
-   static void (*sideStats)(uint64_t *)=turnip?(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats"):nullptr;
-   if(sideStats) {
-    sideStats(gm);
-    row("GM s3d %llu/%llu/%llu/%llu l3d %llu/%llu/%llu/%llu",(unsigned long long)gm[0],(unsigned long long)gm[1],(unsigned long long)gm[2],(unsigned long long)gm[3],
-     (unsigned long long)gm[4],(unsigned long long)gm[5],(unsigned long long)gm[6],(unsigned long long)gm[7]);
-    row("GMb s2d %llu/%llu/%llu/%llu in %llu/%llu/%llu/%llu",(unsigned long long)gm[8],(unsigned long long)gm[9],(unsigned long long)gm[10],(unsigned long long)gm[11],
-     (unsigned long long)gm[12],(unsigned long long)gm[13],(unsigned long long)gm[14],(unsigned long long)gm[15]);
-   }
-  }
-  // Who allocated the device memory (4 MiB or more at once): the three call stacks with the most bytes, as MiB, allocations and return
-  // addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map names them; *offset in another).
+   row("PS ins %llu inl %llu | bar %llu tile %llu ml %llu pend %llu | sti %llu %lluM cp %llu/%llu",(ull)pc[0],(ull)pc[1],(ull)pc[2],
+    (ull)pc[3],(ull)pc[4],(ull)pc[5],(ull)pc[6],(ull)(pc[7]>>20),(ull)pc[8],(ull)pc[9]);
+  // Who allocated the device memory (4 MiB or more at once, so far, freed since or not): the three call stacks with the most bytes,
+  // as MiB, allocations and return addresses relative to their image (+offset in the plugin, whose link map NativeAdrenoMetal.map
+  // names them; *offset in another).
   {
    uint64_t sites[3*12]={};
    const size_t n=nmb_allocation_sites(sites,3);
@@ -5022,32 +5049,154 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
      const bool found=dladdr((const void *)site[2+f],&info) && info.dli_fbase;
      static Dl_info self={};static bool selfFound=dladdr((const void *)&nmb_allocation_sites,&self);
      const bool mine=found && selfFound && info.dli_fbase==self.dli_fbase;
-     snprintf(frames[f],sizeof frames[f],"%c%llx",mine?'+':'*',
-      (unsigned long long)(found?site[2+f]-(uint64_t)info.dli_fbase:site[2+f]));
+     snprintf(frames[f],sizeof frames[f],"%c%llx",mine?'+':'*',(ull)(found?site[2+f]-(uint64_t)info.dli_fbase:site[2+f]));
     }
-    row("MA%zu %lluM n%llu %s %s %s %s %s",i,(unsigned long long)(site[0]>>20),(unsigned long long)site[1],frames[0],frames[1],frames[2],
-     frames[3],frames[4]);
+    row("MA%zu %lluM n%llu %s %s %s %s %s",i,(ull)(site[0]>>20),(ull)site[1],frames[0],frames[1],frames[2],frames[3],frames[4]);
     row("MA%zub %s %s %s %s %s",i,frames[5],frames[6],frames[7],frames[8],frames[9]);
    }
   }
+ }
+ // ---- what was compiled, and what it cost ----
+ row("T pipeline n=%llu total=%llums max=%llums",(ull)gTimePipeline.count.load(),ms(gTimePipeline.total.load()),ms(gTimePipeline.slowest.load()));
+ row("T library n=%llu total=%llums max=%llums",(ull)gTimeLibrary.count.load(),ms(gTimeLibrary.total.load()),ms(gTimeLibrary.slowest.load()));
+ row("T compile n=%llu total=%llums max=%llums cached=%llu",(ull)gTimeCompile.count.load(),ms(gTimeCompile.total.load()),
+  ms(gTimeCompile.slowest.load()),(ull)gCompileCached.load());
+ row("T function n=%llu total=%llums max=%llums",(ull)gTimeFunction.count.load(),ms(gTimeFunction.total.load()),ms(gTimeFunction.slowest.load()));
+ if(gDevice) {
+  // The driver pipelines the runtime made (nmb_device_pipeline_counts): VkPipelines in all, those made at a state's creation and how
+  // many of those a draw or dispatch took, those made at a draw or dispatch (a host step: the ones a frame waits for); the driver's
+  // time in its graphics and compute pipeline makings; functions translated and shader modules made. Shader priming's makings are
+  // in these too (the PR row has its count).
+  uint64_t vp[8]={};
+  if(nmb_device_pipeline_counts(gDevice,vp))
+   row("VP made %llu create %llu/%llu step %llu | drv gfx %llums cmp %llums | fn %llu mod %llu",(ull)vp[0],(ull)vp[1],(ull)vp[2],
+    (ull)vp[3],(ull)(vp[4]/1000000),(ull)(vp[5]/1000000),(ull)vp[6],(ull)vp[7]);
+  // The runtime's creation log's VkPipeline makings, where a host tool turned it on (METAL2VULKAN_LOG_PIPELINES; the plugin leaves it
+  // off), and its shader cache: hits, misses and writes, then the device's messages by severity.
+  uint64_t work[10]={};
+  if(nmb_device_work_stats(gDevice,work)) {
+   if(work[0])
+    row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",(ull)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(ull)work[4]);
+   row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(ull)work[7],(ull)work[8],(ull)work[9],(ull)work[5],(ull)work[6]);
+  }
+  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
+  // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
+  // pipeline cache: loads, saves, hits, misses.
+  uint64_t sc[24]={};
+  if(nmb_device_shader_cache_detail(gDevice,sc)) {
+   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
+    (ull)sc[8],(ull)sc[9]);
+   row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(ull)sc[10],(ull)sc[11],
+    (ull)sc[12],(ull)(sc[13]>>10),(ull)sc[15],(ull)sc[16],(ull)sc[14],(ull)sc[17],(ull)sc[20],(ull)sc[18],(ull)sc[19]);
+  }
+ }
+ row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
+ if(gDevice) {
+  // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
+  // log waits, encoder ends on the lowering thread.
+  uint64_t flow[8]={};
+  if(nmb_device_flow_counts(gDevice,flow))
+   row("FL w %llu/%llu/%llu %lluK cm %llu/%llu lw %llu le %llu",(ull)flow[0],(ull)flow[1],(ull)flow[2],(ull)(flow[3]>>10),(ull)flow[4],
+    (ull)flow[5],(ull)flow[6],(ull)flow[7]);
+ }
+ // ---- which threads used the CPU since the last table ----
+ {
+  ThreadCpu top[6]={};uint64_t total=0,window=0;
+  const unsigned n=threadCpuTop(top,6,&total,&window);
+  if(n) {
+   char text[2][80]={};
+   for(unsigned i=0;i<n;i++) {
+    char *line=text[i/3];const size_t used=strlen(line);
+    snprintf(line+used,sizeof text[0]-used," %s:%llu",top[i].name,ms(top[i].us));
+   }
+   row("TH cpu %llums in %llums |%s",ms(total),ms(window),text[0]);
+   if(text[1][0])row("THb%s",text[1]);
+  }
+ }
+ // ---- the last problems ----
+ {
+  std::lock_guard<std::mutex> lock(gProblemLock);
+  row("P0 %.86s",gLastProblems[0]);if(strlen(gLastProblems[0])>86)row("P0b %.86s",gLastProblems[0]+86);
+  row("P1 %.86s",gLastProblems[1]);if(strlen(gLastProblems[1])>86)row("P1b %.86s",gLastProblems[1]+86);
+  char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
+ }
+ if(gDevice) {
   char warning[200];size_t n=nmb_last_warning(warning,sizeof warning);
   if(n){row("W %.86s",warning);if(n>86)row("Wb %.86s",warning+86);}
  }
+ // ---- the frame work ----
+ {std::lock_guard<std::mutex> lock(gBenchLock);for(unsigned r=0;r<4;r++)if(gBench[r][0])row("%.90s",gBench[r]);}
+ row("S c%llu/%llu d%llu p%llu x%llu R%llu D%llu F%llu M%lluk C%llu B%llu",(ull)gCommits.load(),(ull)gCommitFailures.load(),
+  (ull)gCompleted.load(),(ull)gPipelines.load(),(ull)gProblems.load(),(ull)gPasses.load(),
+  (ull)gDraws.load(),(ull)gFullScreenPasses.load(),(ull)(gBiggestPass.load()>>10),
+  (ull)gDispatches.load(),(ull)gBlits.load());
+ row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(ull)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
+  ms(gTimeEncodeToCommit.slowest.load()),(ull)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
+ for(int k=0;k<3;k++) {
+  const std::atomic<uint64_t> *bins=k==0?gHistFrameGpu:k==1?gHistOtherGpu:gHistFrameEncode;
+  row("H %s <1=%llu <2=%llu <4=%llu <8=%llu <16=%llu <32=%llu <64=%llu <128=%llu <256=%llu more=%llu",k==0?"frame-gpu":k==1?"other-gpu":"frame-enc",
+   (ull)bins[0].load(),(ull)bins[1].load(),(ull)bins[2].load(),(ull)bins[3].load(),
+   (ull)bins[4].load(),(ull)bins[5].load(),(ull)bins[6].load(),(ull)bins[7].load(),
+   (ull)bins[8].load(),(ull)bins[9].load());
+ }
+ row("J scheduled wait n=%llu total=%llums max=%llums",(ull)gTimeWaitScheduled.count.load(),ms(gTimeWaitScheduled.total.load()),ms(gTimeWaitScheduled.slowest.load()));
+ row("J completed wait n=%llu total=%llums max=%llums t=%llu",(ull)gTimeWaitCompleted.count.load(),ms(gTimeWaitCompleted.total.load()),ms(gTimeWaitCompleted.slowest.load()),(ull)gWaitTimeouts.load());
+ row("J resource wait n=%llu total=%llums max=%llums",(ull)gTimeResourceWait.count.load(),ms(gTimeResourceWait.total.load()),ms(gTimeResourceWait.slowest.load()));
+ row("J resource checks=%llu skipped=%llu",(ull)gResourceChecks.load(),(ull)gResourceSkipped.load());
+ row("J surface cache n=%llu bytes=%llu dup=%llu us=%llu max=%llu",(ull)gTimeSurfaceFlush.count.load(),
+  (ull)gSurfaceFlushBytes.load(),(ull)gSurfaceFlushDuplicates.load(),
+  (ull)gTimeSurfaceFlush.total.load(),(ull)gTimeSurfaceFlush.slowest.load());
+ row("N no-copy %llu dealloc %llu/%llu surface %llu/%llu",(ull)gNoCopyAll.load(),(ull)gNoCopyReleased.load(),
+  (ull)gNoCopyMade.load(),
+  (ull)gSurfaceImportsReleased.load(),(ull)gSurfaceImportsMade.load());
+ {uint64_t remaps[2]={};if(nmb_no_copy_remaps(remaps))row("N no-copy ranges checked %llu remapped %llu",(ull)remaps[0],(ull)remaps[1]);}
+ if(gDevice) {
+  // Where textures over buffers and surfaces cost copies: host-page textures in place (of them at Metal's pitch), shadowed for their
+  // pitch and for no driver image; shadowed textures, their copies in, texels copied back; host-page render targets shadowed.
+  uint64_t tc[8]={};
+  if(nmb_device_texture_counts(gDevice,tc))
+   row("L inp %llu/%llu rf %llu/%llu sh %llu cp %llu bk %llu rt %llu",(ull)tc[0],(ull)tc[1],(ull)tc[2],
+    (ull)tc[3],(ull)tc[4],(ull)tc[5],(ull)tc[6],(ull)tc[7]);
+  // Textures over host pages at rows or offsets this GPU's linear images cannot take: how many, MiB, the largest and who made it.
+  {
+   std::lock_guard<std::mutex> lock(gUnalignedLock);
+   if(gUnalignedCount)
+    row("TB n%llu %lluM big %ux%u row%u %.20s+%llx",(ull)gUnalignedCount,(ull)(gUnalignedBytes>>20),
+     gUnalignedSize[0],gUnalignedSize[1],gUnalignedSize[2],gUnalignedImage,(ull)gUnalignedCaller);
+  }
+  // The tile-memory side of GMEM loads and stores (tu_gmem_side_stats), per site: 3D store source, 3D load source, 2D store source, input attachment; each
+  // transfers / of them with a swap other than WZYX / with MUTABLEEN / of a linear image. The second number must stay 0 for linear images.
+  {
+   uint64_t gm[16]={};
+   if(sideStats) {
+    sideStats(gm);
+    row("GM s3d %llu/%llu/%llu/%llu l3d %llu/%llu/%llu/%llu",(ull)gm[0],(ull)gm[1],(ull)gm[2],(ull)gm[3],
+     (ull)gm[4],(ull)gm[5],(ull)gm[6],(ull)gm[7]);
+    row("GMb s2d %llu/%llu/%llu/%llu in %llu/%llu/%llu/%llu",(ull)gm[8],(ull)gm[9],(ull)gm[10],(ull)gm[11],
+     (ull)gm[12],(ull)gm[13],(ull)gm[14],(ull)gm[15]);
+   }
+  }
+ }
+ {
+  // The five most used (pass target, pipeline) format pairs: p target format, s pipeline format, l load action, S an IOSurface, B a screen-size target.
+  struct {uint64_t key,n;} top[5]={};
+  {std::lock_guard<std::mutex> lock(gPassFormatLock);
+   for(unsigned i=0;i<gPassFormatCount;i++)for(unsigned t=0;t<5;t++)if(gPassFormatRows[i].n>top[t].n){for(unsigned u=4;u>t;u--)top[u]=top[u-1];top[t]={gPassFormatRows[i].key,gPassFormatRows[i].n};break;}}
+  for(unsigned t=0;t<5 && top[t].n;t++)
+   row("DF p%u s%u l%u %s%s n%llu",(unsigned)(top[t].key&0xffff),(unsigned)(top[t].key>>32),(unsigned)(top[t].key>>16&3),top[t].key>>18&1?"S":"-",
+    top[t].key>>19&1?"B":"-",(ull)top[t].n);
+ }
  {
   std::lock_guard<std::mutex> lock(gProblemLock);
-  char formats[160];native_bridge_metal_formats_locked(formats,sizeof formats);row("F %.86s",formats);
-  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
   const SurfaceRefusal &r=gSurfaceLastRefusal;
   if(r.step)row("SR %u %08x %c%c%c%c pl%u/%u o%llx rb%llu a%llx %llux%llu pf%u",r.step,r.format,(char)(r.format>>24),(char)(r.format>>16),(char)(r.format>>8),
-   (char)r.format,r.plane,r.planes,(unsigned long long)r.offset,(unsigned long long)r.row,(unsigned long long)r.allocation,(unsigned long long)r.width,
-   (unsigned long long)r.height,r.pixelFormat);
-  if(r.step)row("SR layout surface=%llux%llu rotation=%llu framebuffer=%u",(unsigned long long)r.surfaceWidth,
-   (unsigned long long)r.surfaceHeight,(unsigned long long)r.rotation,r.framebufferOnly);
-  row("ROT imports 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu",(unsigned long long)gSurfaceRotations[0].load(),
-   (unsigned long long)gSurfaceRotations[1].load(),(unsigned long long)gSurfaceRotations[2].load(),
-   (unsigned long long)gSurfaceRotations[3].load(),(unsigned long long)gSurfaceRotations[4].load());
-  row("P0 %.86s",gLastProblems[0]);row("P0b %.86s",strlen(gLastProblems[0])>86?gLastProblems[0]+86:"");
-  row("P1 %.86s",gLastProblems[1]);row("P1b %.86s",strlen(gLastProblems[1])>86?gLastProblems[1]+86:"");
+   (char)r.format,r.plane,r.planes,(ull)r.offset,(ull)r.row,(ull)r.allocation,(ull)r.width,
+   (ull)r.height,r.pixelFormat);
+  if(r.step)row("SR layout surface=%llux%llu rotation=%llu framebuffer=%u",(ull)r.surfaceWidth,
+   (ull)r.surfaceHeight,(ull)r.rotation,r.framebufferOnly);
+  row("ROT imports 0=%llu 1=%llu 2=%llu 3=%llu 4=%llu",(ull)gSurfaceRotations[0].load(),
+   (ull)gSurfaceRotations[1].load(),(ull)gSurfaceRotations[2].load(),
+   (ull)gSurfaceRotations[3].load(),(ull)gSurfaceRotations[4].load());
  }
  {
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -5056,20 +5205,20 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   for(unsigned i=0;i<8;i++) {
    const WaitCaller &w=gWaitCallers[i];
    if(!w.n.load())continue;
-   row("WC%u lr=%llx n%u us%llu t=%.23s s=%.27s",i,(unsigned long long)w.lr.load(),w.n.load(),(unsigned long long)w.us.load(),w.thread,w.symbol);
+   row("WC%u lr=%llx n%u us%llu t=%.23s s=%.27s",i,(ull)w.lr.load(),w.n.load(),(ull)w.us.load(),w.thread,w.symbol);
   }
   for(unsigned i=0;i<4;i++) {
    const FrameAttribution::Bin &b=gAttribution.bins[i];
    if(!b.n)continue;
-   row("FA%u n%u I%llu pg%llu enc%llu res%lld kpx%llu hv%u",i,b.n,(unsigned long long)(b.sumI/b.n),(unsigned long long)(b.sumPg/b.n),
-    (unsigned long long)(b.sumEnc/b.n),(long long)(b.sumRes/(int64_t)b.n),(unsigned long long)(b.sumKpx/b.n),b.heavy);
+   row("FA%u n%u I%llu pg%llu enc%llu res%lld kpx%llu hv%u",i,b.n,(ull)(b.sumI/b.n),(ull)(b.sumPg/b.n),
+    (ull)(b.sumEnc/b.n),(long long)(b.sumRes/(int64_t)b.n),(ull)(b.sumKpx/b.n),b.heavy);
   }
   for(uint32_t k=0;k<20 && k<newest;k++) {
    const CommitRecord &r=gCommitRing[(newest-k)%32];
    if(r.index!=newest-k)continue;
-   row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus",r.index,(unsigned long long)(r.committedUs/1000000),(unsigned long long)((r.committedUs/1000)%1000),
-    r.work.passes,r.work.draws,(unsigned long long)(r.work.pixels>>10),r.work.dispatches,r.work.blits,(unsigned long long)r.callbackUs);
-   if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(unsigned long long)r.ageUs,(long long)r.scheduledUs);
+   row("K%u t=%llu.%03llus rp%u dr%u kpx%llu cs%u bl%u ctc=%lluus",r.index,(ull)(r.committedUs/1000000),(ull)((r.committedUs/1000)%1000),
+    r.work.passes,r.work.draws,(ull)(r.work.pixels>>10),r.work.dispatches,r.work.blits,(ull)r.callbackUs);
+   if(k<4)row("E%u age=%lluus scheduled=%lldus",r.index,(ull)r.ageUs,(long long)r.scheduledUs);
   }
  }
  return at;

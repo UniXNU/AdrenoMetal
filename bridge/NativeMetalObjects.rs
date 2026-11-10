@@ -509,6 +509,52 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
+/// The runtime's live blocks of its own device memory by what holds them and by size (bridge patch 0031), into the caller's 48 words:
+/// seven size classes each (at most 16, 32, 40, 48, 56 and 64 MiB, and larger) of the pooled blocks with a placement, the pooled
+/// blocks kept empty, the spare image blocks, the dedicated blocks of an image and those of a buffer; then the bytes of the spare
+/// blocks and of the dedicated blocks of images and of buffers; then, of the blocks of a lazily allocated memory type, those with a
+/// placement and those kept without one, each as blocks, bytes, blocks the driver committed and bytes it committed; then the blocks
+/// and bytes of buffers' own imported pages.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_memory_kinds(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's 48 words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 48) };
+        let k = get(device)?.0.memory_kinds();
+        let classes = [k.pooled, k.empty, k.spare, k.dedicated_images, k.dedicated_buffers];
+        for (words, counts) in out.chunks_mut(metal2vulkan_runtime::MEMORY_KIND_CLASSES).zip(classes) {
+            words.copy_from_slice(&counts);
+        }
+        out[35..38].copy_from_slice(&[k.spare_bytes, k.dedicated_image_bytes, k.dedicated_buffer_bytes]);
+        out[38..42].copy_from_slice(&k.lazy);
+        out[42..46].copy_from_slice(&k.lazy_kept);
+        out[46..48].copy_from_slice(&k.own_pages);
+        Ok(true)
+    })
+}
+
+/// The driver pipelines the runtime made, into the caller's eight words: `VkPipeline`s its pipeline states' variants made, of them
+/// those made at a state's creation and how many of those a draw or dispatch took, those a host step made at a draw or dispatch,
+/// the nanoseconds its graphics and its compute pipeline makings spent inside the driver, the functions translated and the shader
+/// modules made. Counters the runtime keeps at all times: the creation log need not be on.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_pipeline_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's eight words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 8) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.variant_pipelines_made, w.creation_pipelines_made, w.creation_pipelines_drawn, w.host_step_pipelines_made,
+                              w.render_pipeline_create_nanos, w.compute_pipeline_create_nanos, w.functions_translated, w.shader_modules_made]);
+        Ok(true)
+    })
+}
+
 /// The runtime's command buffer stages (bridge patch 0022, `stage_trace.rs`) from sequence `from` on, at most `max` records of
 /// {u64 host uptime ns, u64 id, u32 sequence, u16 stage, u16 arg}: how many were written; `*next` the sequence to ask for next.
 #[unsafe(no_mangle)]
