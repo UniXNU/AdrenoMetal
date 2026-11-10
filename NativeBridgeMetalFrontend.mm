@@ -619,6 +619,9 @@ __attribute__((weak)) volatile uint32_t native_prime_libraries_total;
 __attribute__((weak)) volatile uint32_t native_prime_made;
 __attribute__((weak)) volatile uint32_t native_prime_rate;
 __attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_primed;   // libraries this process's passes compiled
+__attribute__((weak)) volatile uint32_t native_prime_libraries_skipped;  // other GPUs' driver bundles (whole system) or not loaded here
+__attribute__((weak)) volatile uint32_t native_prime_scope;              // 0 no pass yet, 1 loaded bundles only, 2 the whole system
 }
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
@@ -660,15 +663,32 @@ static void onLargeStack(void (^body)(void)) {
 // its Metal cache directory but not Library/Caches: with the replies only there it kept none, and each of its launches compiled
 // every request again.
 static std::string gCacheRoot;   // the pipeline cache directory the device opened with (native_bridge_metal_open)
+// The system shader cache as this process uses it (native_bridge_metal_system_cache): 0 not named, 1 read as a layer, 2 filled by
+// this process, 3 refused; its directory or the refusal's reason; and the compiler replies the layer answered.
+static int gSystemCacheState;
+static std::string gSystemCacheText;
+static std::atomic<uint64_t> gCompileSystem;
 struct NBShaderCacheHeader {uint32_t magic,warningBytes;uint64_t metallibBytes;unsigned char digest[CC_SHA256_DIGEST_LENGTH];};
 static const uint32_t kNBShaderCacheMagic=0x3143534e;   // "NSC1"
-static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,const std::vector<uint8_t> &request) {
+static NSString *shaderCacheName(const unsigned char uuid[16],uint32_t type,const std::vector<uint8_t> &request) {
+ CC_SHA256_CTX context;CC_SHA256_Init(&context);
+ CC_SHA256_Update(&context,uuid,16);CC_SHA256_Update(&context,&type,sizeof type);
+ CC_SHA256_Update(&context,request.data(),(CC_LONG)request.size());
+ unsigned char key[CC_SHA256_DIGEST_LENGTH];CC_SHA256_Final(key,&context);
+ char name[2*CC_SHA256_DIGEST_LENGTH+8];
+ for(int i=0;i<CC_SHA256_DIGEST_LENGTH;i++)snprintf(name+2*i,3,"%02x",key[i]);
+ strlcat(name,".reply",sizeof name);
+ return @(name);
+}
+static NSString *shaderCachePath(NSString *name) {
  static NSString *directory;
  static dispatch_once_t once;
  dispatch_once(&once,^{
   if(getenv("NATIVE_METAL_NO_SHADER_CACHE"))return;
   const std::string shared=sharedShaderCacheDirectory();
   NSMutableArray<NSString *> *roots=[NSMutableArray array];
+  // The process that fills the system cache keeps its replies there, where every process reads them.
+  if(gSystemCacheState==2 && !gCacheRoot.empty())[roots addObject:@(gCacheRoot.c_str())];
   if(!shared.empty())[roots addObject:@(shared.c_str())];
   if(!gCacheRoot.empty())[roots addObject:@(gCacheRoot.c_str())];
   if(NSString *caches=NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject)[roots addObject:caches];
@@ -679,17 +699,9 @@ static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,cons
   }
  });
  if(!directory)return nil;
- CC_SHA256_CTX context;CC_SHA256_Init(&context);
- CC_SHA256_Update(&context,uuid,16);CC_SHA256_Update(&context,&type,sizeof type);
- CC_SHA256_Update(&context,request.data(),(CC_LONG)request.size());
- unsigned char key[CC_SHA256_DIGEST_LENGTH];CC_SHA256_Final(key,&context);
- char name[2*CC_SHA256_DIGEST_LENGTH+8];
- for(int i=0;i<CC_SHA256_DIGEST_LENGTH;i++)snprintf(name+2*i,3,"%02x",key[i]);
- strlcat(name,".reply",sizeof name);
- return [directory stringByAppendingPathComponent:@(name)];
+ return [directory stringByAppendingPathComponent:name];
 }
-static bool shaderCacheRead(NSString *path,NSData **metallib,NSString **warnings) {
- NSData *file=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil]:nil;
+static bool shaderCacheDecode(NSData *file,NSData **metallib,NSString **warnings) {
  NBShaderCacheHeader header;
  if(file.length<sizeof header)return false;
  memcpy(&header,file.bytes,sizeof header);
@@ -701,6 +713,20 @@ static bool shaderCacheRead(NSString *path,NSData **metallib,NSString **warnings
  *warnings=header.warningBytes?[[NSString alloc] initWithBytes:payload length:header.warningBytes encoding:NSUTF8StringEncoding]:nil;
  *metallib=[NSData dataWithBytes:payload+header.warningBytes length:(NSUInteger)header.metallibBytes];
  return true;
+}
+// The reply at `path` in this process's directory, else the one of that name the system layer holds (the render server's, read by
+// the layer's owner and mode rules), checked the same way: a reply the layer holds is one this process does not compile.
+static bool shaderCacheRead(NSString *path,NSString *name,NSData **metallib,NSString **warnings) {
+ NSData *file=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:nil]:nil;
+ if(shaderCacheDecode(file,metallib,warnings))return true;
+ if(gSystemCacheState!=1 || getenv("NATIVE_METAL_NO_SHADER_CACHE"))return false;
+ size_t length=0;
+ uint8_t *bytes=nmb_system_cache_read([@"native-metal-shaders/" stringByAppendingString:name].UTF8String,256u<<20,&length);
+ if(!bytes)return false;
+ const bool good=shaderCacheDecode([NSData dataWithBytesNoCopy:bytes length:length freeWhenDone:YES],metallib,warnings);
+ nmb_system_cache_verdict(good,length);
+ if(good)gCompileSystem++;
+ return good;
 }
 static void shaderCacheWrite(NSString *path,NSData *metallib,NSString *warnings) {
  if(!path || !metallib.length)return;
@@ -783,9 +809,10 @@ static NSData *codeGenRequest(uint32_t type,const std::vector<uint8_t> &request,
   }
  });
  if(!service){*failure=@"the system's Metal compiler (MTLCompiler.framework) is not available";return nil;}
- NSString *cached=shaderCachePath(compilerUuid,type,request);
+ NSString *cachedName=shaderCacheName(compilerUuid,type,request);
+ NSString *cached=shaderCachePath(cachedName);
  NSData *kept=nil;NSString *keptWarnings=nil;
- if(shaderCacheRead(cached,&kept,&keptWarnings)) {
+ if(shaderCacheRead(cached,cachedName,&kept,&keptWarnings)) {
   gCompileCached++;
   *warnings=keptWarnings;*failure=nil;
   return kept;
@@ -4831,20 +4858,24 @@ static void logClientWork() {
  dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,30*NSEC_PER_SEC),30*NSEC_PER_SEC,5*NSEC_PER_SEC);
  dispatch_source_set_event_handler(timer,^{
   static uint64_t last[3];
-  uint64_t vp[8]={},work[10]={},mc[10]={};
+  uint64_t vp[8]={},work[10]={},mc[10]={},sy[4]={};
   if(!nmb_device_pipeline_counts(gDevice,vp))return;
+  (void)nmb_system_cache_counts(sy);
   const uint64_t now[3]={gTimePipeline.count.load(),gTimeCompile.count.load()+gCompileCached.load(),vp[0]};
   if(!memcmp(now,last,sizeof now))return;
   memcpy(last,now,sizeof now);
   (void)nmb_device_work_stats(gDevice,work);(void)nmb_device_memory_counts(gDevice,mc);
   os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal work: pipeline %llu/%llums/%llums library %llu/%llums compile %llu/%llums cached %llu | vk %llu "
-   "create %llu/%llu step %llu drv %llu+%llums | cache hit %llu miss %llu wr %llu | mem %llu/%llu/%lluM | problems %llu",
+   "create %llu/%llu step %llu drv %llu+%llums | cache hit %llu miss %llu wr %llu | system %llu/%lluK rej %llu refused %llu replies %llu | "
+   "mem %llu/%llu/%lluM | problems %llu",
    (unsigned long long)gTimePipeline.count.load(),(unsigned long long)(gTimePipeline.total.load()/1000),
    (unsigned long long)(gTimePipeline.slowest.load()/1000),(unsigned long long)gTimeLibrary.count.load(),
    (unsigned long long)(gTimeLibrary.total.load()/1000),(unsigned long long)gTimeCompile.count.load(),
    (unsigned long long)(gTimeCompile.total.load()/1000),(unsigned long long)gCompileCached.load(),(unsigned long long)vp[0],
    (unsigned long long)vp[1],(unsigned long long)vp[2],(unsigned long long)vp[3],(unsigned long long)(vp[4]/1000000),
    (unsigned long long)(vp[5]/1000000),(unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],
+   (unsigned long long)sy[0],(unsigned long long)(sy[3]>>10),(unsigned long long)sy[1],(unsigned long long)sy[2],
+   (unsigned long long)gCompileSystem.load(),
    (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),(unsigned long long)gProblems.load());
  });
  dispatch_resume(timer);
@@ -4888,6 +4919,15 @@ static void logClientMemory() {
  dispatch_resume(timer);
 }
 
+extern "C" bool native_bridge_metal_system_cache(const char *reader,const uint32_t *owners,unsigned count,bool writer) {
+ if(gDeviceObject)return false;
+ nmb_cache_readable_by_all(writer);
+ gSystemCacheState=writer?2:0;gSystemCacheText=writer?"filled here":"";
+ if(writer || !reader){(void)nmb_system_cache_open(nullptr,nullptr,0);return writer;}
+ if(nmb_system_cache_open(reader,owners,count)){gSystemCacheState=1;gSystemCacheText=reader;return true;}
+ gSystemCacheState=3;gSystemCacheText=nmb_last_error();
+ return false;
+}
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
@@ -4905,7 +4945,12 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  logClientWork();
  logClientMemory();
  // Where this process's pipeline cache is and whose it is: a cache serves the processes of its user that may write its directory.
- if(diagOn() || logGpuOn())os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d",cache?cache:"none",(int)getuid());
+ // Then the system layer: read from its directory, filled by this process, refused with the level and why, or not named.
+ if(diagOn() || logGpuOn()) {
+  static const char *const kStates[]={"none","read","filled","refused"};
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d system %{public}s %{public}s",cache?cache:"none",(int)getuid(),
+   kStates[gSystemCacheState],gSystemCacheText.c_str());
+ }
  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
@@ -5283,6 +5328,20 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   }
  }
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
+ // Priming's reach and the system shader cache. PRb: the pass's scope (1 the bundles loaded here, 2 the whole system), the libraries
+ // it compiled itself, those it leaves out (other GPUs' driver bundles, or not loaded here), the system cache's state here (0 not
+ // named, 1 read, 2 filled by this process, 3 refused) and what this process published: the entries and KiB its cache directory
+ // took while it is the system layer. SY, in a process that reads the layer: the entries it answered, their KiB, the contents
+ // refused, the levels refused for owner or mode, and the compiler replies it answered.
+ {
+  uint64_t sc[24]={},sy[4]={};
+  if(gDevice)(void)nmb_device_shader_cache_detail(gDevice,sc);
+  (void)nmb_system_cache_counts(sy);
+  row("PRb scope=%u primed=%u left=%u | system %d pub %llu/%lluK",native_prime_scope,native_prime_libraries_primed,
+   native_prime_libraries_skipped,gSystemCacheState,(ull)(gSystemCacheState==2?sc[11]+sc[12]:0),(ull)(gSystemCacheState==2?sc[13]>>10:0));
+  if(gSystemCacheState==1 || gSystemCacheState==3)
+   row("SY read %llu/%lluK rej %llu refused %llu replies %llu",(ull)sy[0],(ull)(sy[3]>>10),(ull)sy[1],(ull)sy[2],(ull)gCompileSystem.load());
+ }
  if(gDevice) {
   // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
   // log waits, encoder ends on the lowering thread.

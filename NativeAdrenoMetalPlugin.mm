@@ -89,6 +89,7 @@ static Gpu *makeGpu(unsigned port) {
     return gpu;
 }
 static std::string gCacheDirectory;   // the runtime's cache directory (the one that opened the device), exported by CacheExport.h
+static bool gFillsSystemCache;        // the render server opened its device in the system shader cache's directory (SharedShaderCache.h)
 // Progress markers 0x68xx (GPU6): 6800 entered, 6801 Turnip found, 6802 device made, 6803 returned to the discovery, 68f1 no Turnip, 68f2 no device.
 static unsigned gDiagBits;
 // Reads of the render server's own state for the framebuffer-format question (diagnostic only, for the exact QuartzCore of the target image; a read
@@ -375,6 +376,11 @@ static id deviceForPort(unsigned port) {
         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         if (!nativeIsRenderServer()) {
+            // The system shader cache the render server fills (SharedShaderCache.h), read for what this process's own cache lacks.
+            // gpu-prime-system=0: no process reads it and the render server keeps its cache and its priming to itself, as before, for
+            // a comparison on the same image.
+            if (!bootArgSet("gpu-prime-system=0"))
+                native_bridge_metal_system_cache(systemcache::kReaderPath, systemcache::kOwners, 2, false);
             device = clientDevice(port);
             if (device) iogpu::install(device, port);
             return device;
@@ -497,7 +503,7 @@ static id deviceForPort(unsigned port) {
         unsetenv("METAL2VULKAN_LOG_PIPELINES");
         CFPreferencesSetAppValue(CFSTR("CAEnableFramebufferCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
         CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
-        char candidates[6][512] = {};
+        char candidates[7][512] = {};
         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
         strlcpy(candidates[2], "/tmp/", sizeof candidates[2]);
@@ -511,18 +517,23 @@ static id deviceForPort(unsigned port) {
             strlcat(candidates[4], "/", sizeof candidates[4]);
         }
         strlcpy(candidates[5], sharedShaderCacheDirectory().c_str(), sizeof candidates[5]);
-        static const unsigned order[] = {5, 4, 0, 1, 2, 3};
+#if TARGET_OS_OSX
+        // First the system shader cache's directory, where the kernel made it for this process (marker 0x6816): what the render
+        // server compiles and primes there, every process reads (SharedShaderCache.h). Not with gpu-prime-system=0.
+        if (!bootArgSet("gpu-prime-system=0")) strlcpy(candidates[6], systemcache::writerDirectory().c_str(), sizeof candidates[6]);
+#endif
+        static const unsigned order[] = {6, 5, 4, 0, 1, 2, 3};
         for (unsigned i : order) {
             if (device) break;
             if (!candidates[i][0]) continue;
             if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}   // as for the clients below
-            if (i != 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
-            mkdir(candidates[i], 0700);
+            if (i < 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
+            if (i != 6) mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
             // Files an earlier image's copying import left half written here (int 590aaee2), which hold memory of the Data disk.
             {
                 static bool once;
-                if (!once && i != 5) {once = true; removeHalfImported(candidates[i]);}
+                if (!once && i < 5) {once = true; removeHalfImported(candidates[i]);}
             }
             // The image's pipeline pack (an earlier boot's export), into this directory before the runtime reads it. Marker 0x6Cnn: files written
             // (saturated at 0xfe), 0x6Cff the pack was refused.
@@ -530,12 +541,14 @@ static id deviceForPort(unsigned port) {
                 const int imported = cacheexport::importPack(pack, candidates[i]);
                 if (imported) gpu->mark(0x6C00 | (imported < 0 ? 0xff : imported > 0xfe ? 0xfe : imported));
             }
+            // What the device writes in the system cache's directory is readable by everyone; in any other, by this user alone.
+            native_bridge_metal_system_cache(nullptr, nullptr, 0, i == 6);
             @try {
                 device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
             } @catch (NSException *exception) {
                 device = nil;
             }
-            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i];}   // which directory served
+            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i]; gFillsSystemCache = i == 6;}   // which directory served
         }
         if (!device) {
             gpu->mark(0x68f2);
@@ -586,7 +599,8 @@ static id deviceForPort(unsigned port) {
                 pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
-                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());
+                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string(),
+                           gFillsSystemCache);
                 return nullptr;
             }, nullptr);
         pthread_attr_destroy(&attributes);

@@ -572,6 +572,102 @@ pub extern "C" fn nmb_stage_ring_read(from: u64, out: *mut metal2vulkan_runtime:
     count
 }
 
+/// Name the read-only system cache layer for the device opened after this call (bridge patch 0036): the directory at `root`, read
+/// only where it, every directory on the way to an entry and the entry are owned by one of the `count` user ids at `owners` and
+/// not writable by group or others, and never through a link. False with the reason in `nmb_last_error` where the directory fails
+/// that test; no layer is named then. A null `root` names none.
+///
+/// # Safety
+/// `root` is null or a C string; `owners` points at `count` user ids.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_system_cache_open(root: *const c_char, owners: *const u32, count: usize) -> bool {
+    guard(false, || {
+        metal2vulkan_runtime::set_system_layer(None);
+        if root.is_null() {
+            return Ok(true);
+        }
+        if owners.is_null() || count == 0 {
+            return Err("system cache: no owner".into());
+        }
+        // SAFETY: the caller's contract.
+        let (root, owners) = unsafe { (CStr::from_ptr(root), std::slice::from_raw_parts(owners, count)) };
+        let layer = metal2vulkan_runtime::SystemLayer::open(&PathBuf::from(root.to_string_lossy().into_owned()), owners)
+            .map_err(|why| format!("system cache: {why}"))?;
+        metal2vulkan_runtime::set_system_layer(Some(std::sync::Arc::new(layer)));
+        Ok(true)
+    })
+}
+
+/// Whether the cache directory of the device opened after this call makes its directories and entries readable by everyone
+/// (0755, 0644) instead of by their owner alone: the directory of the process that fills the system layer.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_cache_readable_by_all(on: bool) {
+    metal2vulkan_runtime::set_cache_readable_by_all(on);
+}
+
+/// The system layer's counts into the caller's four words: entries read from it and accepted, entries whose contents were refused,
+/// levels refused for their kind, owner or mode, and the accepted entries' bytes. False without a layer.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_system_cache_counts(out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        let Some(layer) = metal2vulkan_runtime::system_layer() else {
+            return Ok(false);
+        };
+        let c = layer.counts();
+        // SAFETY: the header's four words.
+        unsafe { std::slice::from_raw_parts_mut(out, 4) }.copy_from_slice(&[c.accepted, c.rejected, c.refused, c.accepted_bytes]);
+        Ok(true)
+    })
+}
+
+/// The bytes of the file at `relative` under the system layer, read by the layer's rules, at most `limit`: a block of `malloc`
+/// the caller frees, its length in `length`; null where there is no layer or the file is absent, refused or longer. The caller
+/// checks the contents and reports the verdict (`nmb_system_cache_verdict`).
+///
+/// # Safety
+/// `relative` is a C string and `length` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_system_cache_read(relative: *const c_char, limit: u64, length: *mut usize) -> *mut u8 {
+    guard(std::ptr::null_mut(), || {
+        if relative.is_null() || length.is_null() {
+            return Err("system cache read: null argument".into());
+        }
+        let Some(layer) = metal2vulkan_runtime::system_layer() else {
+            return Ok(std::ptr::null_mut());
+        };
+        // SAFETY: the caller's contract.
+        let relative = unsafe { CStr::from_ptr(relative) }.to_string_lossy().into_owned();
+        let Some(bytes) = layer.read(std::path::Path::new(&relative), limit) else {
+            return Ok(std::ptr::null_mut());
+        };
+        // SAFETY: a block of the bytes' length (at least one byte), filled from them; `length` is writable.
+        unsafe {
+            let block = libc::malloc(bytes.len().max(1)).cast::<u8>();
+            if block.is_null() {
+                return Err("system cache read: no memory".into());
+            }
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), block, bytes.len());
+            *length = bytes.len();
+            Ok(block)
+        }
+    })
+}
+
+/// Count what the caller made of `bytes` bytes `nmb_system_cache_read` gave: accepted, or refused by its own check.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_system_cache_verdict(accepted: bool, bytes: u64) {
+    if let Some(layer) = metal2vulkan_runtime::system_layer() {
+        if accepted {
+            layer.accepted(bytes);
+        } else {
+            layer.rejected();
+        }
+    }
+}
+
 /// Free the runtime's spare dedicated blocks and kept empty pooled blocks (bridge patch 0021), as Metal gives its resource cache's
 /// memory back when the system reports memory pressure: how many blocks went.
 #[unsafe(no_mangle)]
