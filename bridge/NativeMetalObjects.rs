@@ -1385,10 +1385,53 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
         let mut surface = IoSurfacePlane::new(offset, bytes_per_row, true);
         if chroma_bytes_per_row != 0 {
-            surface = surface.with_ycbcr(IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row));
+            let facts = IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row);
+            // A two-plane YCbCr texture that is only sampled is made over the surface's planes alone where the runtime can
+            // (bridge patch 0035): no converted image of the picture's size is made or kept for it. Any call but a slot binding
+            // makes the texture with its image, as it was always made, and uses that from then on.
+            if ycbcr_planes_on() {
+                let light = buffer.new_texture_with_iosurface_plane(&descriptor, surface.with_ycbcr(facts.with_planes_alone()));
+                let light = light.map_err(e("texture over surface"))?;
+                if !light.is_planes_alone() {
+                    return Ok(boxed(NmbTexture(Resource::tied(light, tie))));
+                }
+                let (buffer, whole) = (Buffer::clone(&buffer), surface.with_ycbcr(facts));
+                let make = move || buffer.new_texture_with_iosurface_plane(&descriptor, whole).map_err(e("texture over surface"));
+                return Ok(boxed(NmbTexture(Resource::forms(light, tie, make))));
+            }
+            surface = surface.with_ycbcr(facts);
         }
         let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surface);
         Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("texture over surface"))?, tie))))
+    })
+}
+
+/// False where `NATIVE_METAL_YCBCR_PLANES=0` (the boot argument `gpu-ycbcr-planes=0`): every two-plane YCbCr surface texture is then
+/// made with its converted image, as before bridge patch 0035, for a comparison on the same image. Read once.
+fn ycbcr_planes_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NATIVE_METAL_YCBCR_PLANES").is_none_or(|value| value != "0"))
+}
+
+/// The process's two-plane YCbCr surface textures, into the caller's fourteen words: made over their planes alone, made with their
+/// converted image, images made later for a texture over its planes at a slot binding that needed one, textures over their planes
+/// that another call made whole, the converted images alive now and the bytes they and their staging copies hold; then the
+/// textures whose planes a function reads in place, and those that keep their image alone by the reason: the device, the layout
+/// (another format, plane 1), a swizzle, the planes' offset, their element count, planes past the surface, no texel buffer view.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_ycbcr_surface_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's fourteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 14) };
+        let (c, w) = (metal2vulkan_runtime::ycbcr_surface_counts(), get(device)?.0.work_counts());
+        out.copy_from_slice(&[c.planes_alone, c.with_image, c.images_later, crate::purge::made_whole(), c.images_alive, c.image_bytes_alive,
+                              w.ycbcr_textures_in_place, w.ycbcr_images_kept_device, w.ycbcr_images_kept_layout,
+                              w.ycbcr_images_kept_swizzle, w.ycbcr_images_kept_alignment, w.ycbcr_images_kept_elements,
+                              w.ycbcr_images_kept_reach, w.ycbcr_images_kept_view]);
+        Ok(true)
     })
 }
 
@@ -1454,7 +1497,7 @@ pub extern "C" fn nmb_texture_release(texture: *mut NmbTexture) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut NmbTextureDescriptor) {
     guard((), || {
-        let t = get(texture)?.0.live()?;
+        let t = get(texture)?.0.slot()?;
         let out = get_mut(out)?;
         *out = NmbTextureDescriptor {
             kind: t.texture_type().as_raw() as u64,
@@ -2867,7 +2910,7 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, texture: *mut NmbTexture, index: u32) -> bool {
     guard(false, || {
-        let texture = optional(texture)?.map(|t| t.0.live()).transpose()?;
+        let texture = optional(texture)?.map(|t| t.0.slot()).transpose()?;
         let texture = texture.as_deref();
         match (get_mut(encoder)?, stage) {
             (NmbEncoder::Compute(c), COMPUTE) => c.set_texture(texture, index),

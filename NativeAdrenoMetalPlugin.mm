@@ -354,6 +354,10 @@ static id deviceForPort(unsigned port) {
         // same image. Read by the bridge as the device opens.
         if (bootArgSet("gpu-purge=0")) setenv("NATIVE_METAL_PURGE", "0", 1);
         else unsetenv("NATIVE_METAL_PURGE");
+        // gpu-ycbcr-planes=0: every two-plane YCbCr surface texture is made with its converted image, as before bridge patch 0035,
+        // for a comparison on the same image. Read by the bridge at the first such texture.
+        if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
+        else unsetenv("NATIVE_METAL_YCBCR_PLANES");
         if (bootArgSet("metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
         else if (bootArgSet("metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
         else unsetenv("NATIVE_METAL_FLOW");

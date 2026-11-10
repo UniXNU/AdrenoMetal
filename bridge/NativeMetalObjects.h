@@ -158,6 +158,10 @@ NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescri
 NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
                                        uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
                                        uint64_t chroma_bytes_per_row);
+/* Two-plane YCbCr surface textures: made over their planes alone, made with their converted image, images made later at a slot
+   binding, textures over their planes another call made whole, converted images alive and their bytes; then textures whose planes
+   are read in place and those that keep their image alone by reason (device, layout, swizzle, offset, elements, reach, view). */
+bool nmb_ycbcr_surface_counts(const NmbDevice *, uint64_t out[14]);
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
