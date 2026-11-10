@@ -11,6 +11,7 @@
 #import <IOSurface/IOSurfaceRef.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include "NativeRenderServer.h"
 #include <os/log.h>
 #include <algorithm>
 #include <array>
@@ -222,7 +223,7 @@ static uint32_t threadCpuUs() {
  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
 }
 static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
-static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
+static bool traceWanted() {static const bool on=diagOn() && nativeIsRenderServer();return on;}
 static void tracePush(const TraceRec &rec) {
  if(!traceWanted())return;
  if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;
@@ -342,7 +343,7 @@ static void traceStartWriter() {
  // The file is the render server's: SpringBoard, which runs as the same user, opened the same path with O_TRUNC and the two processes'
  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
  // Only the render server writes the file; no other process reads its Turnip rings.
- static const bool render=!strcmp(getprogname(),"backboardd");
+ static const bool render=nativeIsRenderServer();
  if(!diagOn() || !render)return;
  bool expected=false;
  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
@@ -559,7 +560,7 @@ static bool logGpuOn() {static const bool on=getenv("SHENG_LOG_GPU")!=nullptr;re
 // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
 // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
 // again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
-static bool isRenderServer() {static const bool renderServer=!strcmp(getprogname(),"backboardd");return renderServer;}
+static bool isRenderServer() {return nativeIsRenderServer();}
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
  if(!isRenderServer() || ending.exchange(true))return;
@@ -927,7 +928,7 @@ static void waitForResource(id resource);
 - (void)countUse;
 @end
 // The render server counts the surfaces it textures in use while the textures live (countUse).
-static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
+static const bool gCountsSurfaceUse=nativeIsRenderServer();
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
 // unmap or reuse pages the GPU still reads or writes.
@@ -4234,8 +4235,25 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
  NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
+// A library file that cannot be read (macOS run36: QuartzCore's default.metallib failed with NSCocoaErrorDomain 260 on a fresh Data
+// volume and WindowServer exited): the path, the read's errno and each component's lstat (mode, device, inode) and link target.
+static void reportUnreadableLibrary(NSString *path) {
+ const char *full=path.fileSystemRepresentation;if(!full)return;
+ const int fd=open(full,O_RDONLY);const int openErrno=fd<0?errno:0;if(fd>=0)close(fd);
+ std::string walk;std::string prefix;
+ for(const char *at=full;*at;) {
+  const char *next=strchr(at+1,'/');const std::string part(at,next?next-at:strlen(at));prefix+=part;
+  struct stat st={};const int r=lstat(prefix.c_str(),&st);char link[256]={};
+  if(r==0 && S_ISLNK(st.st_mode))readlink(prefix.c_str(),link,sizeof link-1);
+  char item[400];snprintf(item,sizeof item," [%s %d %o %d/%llu%s%s]",part.c_str(),r==0?0:errno,st.st_mode,st.st_dev,(unsigned long long)st.st_ino,
+                          link[0]?" ->":"",link);
+  walk+=item;if(!next)break;at=next;
+ }
+ os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal library unreadable: %{public}s open errno %d:%{public}s",full,openErrno,walk.c_str());
+}
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)path error:(NSError **)error {
- NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;if(!bytes)return nil;
+ NSData *bytes=path?[NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error]:nil;
+ if(!bytes){if(path)reportUnreadableLibrary(path);return nil;}
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);

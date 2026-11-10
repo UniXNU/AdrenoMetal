@@ -13,6 +13,7 @@
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <TargetConditionals.h>
 #include <dlfcn.h>
 #include <fts.h>
 #include <mach-o/dyld.h>
@@ -42,7 +43,12 @@ extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_don
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
+#if TARGET_OS_OSX
+// macOS: the system apps are in /System/Applications; the OS cryptex is reached through /System/Cryptexes/OS as on iPadOS.
+static const char *const kRoots[] = {"/System/Library", "/System/Applications", "/Applications", "/System/Cryptexes/OS/System/Library"};
+#else
 static const char *const kRoots[] = {"/System/Library", "/Applications", "/System/Cryptexes/OS/System/Library"};
+#endif
 
 static std::set<std::string> readLines(const std::string &path) {
     std::set<std::string> lines;
