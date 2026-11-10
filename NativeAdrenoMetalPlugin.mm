@@ -198,6 +198,11 @@ static id clientDevice(unsigned port) {
     for (unsigned i : {2u, 0u, 1u}) {
         if (device) break;
         if (!candidates[i][0]) continue;
+        // In the user cache directory the cache sits inside Metal's own shader cache directory (com.apple.metal): a sandboxed process may
+        // write there whenever its profile lets Metal cache shaders at all (macOS iconservicesagent: its profile allows METAL_CACHE_PATH
+        // and denied every write to <cache>/m2v, so each of its launches compiled every pipeline again and it was killed at its memory
+        // limit within seconds).
+        if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}
         if (i != 2) strlcat(candidates[i], "m2v", sizeof candidates[i]);
         mkdir(candidates[i], 0700);
         if (access(candidates[i], W_OK) != 0) continue;
@@ -458,6 +463,7 @@ static id deviceForPort(unsigned port) {
         for (unsigned i : order) {
             if (device) break;
             if (!candidates[i][0]) continue;
+            if (i == 0) {strlcat(candidates[i], "com.apple.metal", sizeof candidates[i]); mkdir(candidates[i], 0700); strlcat(candidates[i], "/", sizeof candidates[i]);}   // as for the clients below
             if (i != 5) strlcat(candidates[i], "m2v", sizeof candidates[i]);
             mkdir(candidates[i], 0700);
             if (access(candidates[i], W_OK) != 0) continue;
