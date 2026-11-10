@@ -45,6 +45,21 @@ bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
  * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
  * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
 bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
+/* The read-only system cache layer of the device opened after this call: the directory at root, read only where it, every directory
+ * on the way to an entry and the entry are owned by one of the count user ids and not writable by group or others, never through a
+ * link. A device asks its own cache directory first and the layer for what that lacks. False with nmb_last_error where the directory
+ * fails the test (no layer then); a null root names none. */
+bool nmb_system_cache_open(const char *root, const uint32_t *owners, size_t count);
+/* The cache directory of the device opened after this call makes its directories and entries readable by everyone (0755, 0644):
+ * the process that fills the system layer through its own directory. */
+void nmb_cache_readable_by_all(bool on);
+/* Entries read from the system layer and accepted, entries whose contents were refused, levels refused for kind, owner or mode,
+ * bytes of the accepted entries. False without a layer. */
+bool nmb_system_cache_counts(uint64_t out[4]);
+/* A file under the system layer by the layer's rules, at most limit bytes: a malloc block the caller frees, or null. The caller
+ * checks the contents and reports its verdict. */
+uint8_t *nmb_system_cache_read(const char *relative, uint64_t limit, size_t *length);
+void nmb_system_cache_verdict(bool accepted, uint64_t bytes);
 /* The translator source the runtime was built from, which keys the shader cache (build-native-metal-bridge.py). */
 const char *nmb_runtime_build(void);
 // Linear images made/refused/refused again, shadowed textures, shadow copies, texels copied back, linear passes in place/through copies.

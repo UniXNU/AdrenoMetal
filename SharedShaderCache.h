@@ -33,6 +33,33 @@ inline std::string sharedShaderCacheDirectory() {
     return path;
 }
 
+// The system shader cache (macOS): one directory the render server fills and every process reads.
+// The render server (WindowServer, the user _windowserver) is not the console user, so the per-user directory above serves it alone,
+// and its sandbox lets it write only its own cache and temporary directories, /private/tmp and /private/var/tmp, while the one
+// directory every sandbox that may use graphics can read is /Library/GPUBundles (system.sb's system-graphics, the WebKit GPU
+// process's profile). No path is both, so the kernel makes the directory at boot where the render server may write it
+// (kWriterPath: owner _windowserver, mode 0755) and shows it read-only where everyone may read it (kReaderPath, a read-only bind
+// mount beside the plugin). The render server opens its device in the first (its cache directory, made readable by everyone) and
+// primes the system's Metal libraries into it; every other process asks the second for what its own cache lacks.
+// A reader trusts the directory only by who can write it: it, every directory on the way to an entry and the entry must be owned by
+// the superuser or the render server's user and not writable by group or others, each opened without following a link (the
+// runtime's system layer, bridge patch 0036). An entry is then checked as one of the process's own cache is (name, build, key,
+// profile, checksum). gpu-prime-system=0 turns all of it off.
+namespace systemcache {
+static const char kWriterPath[] = "/private/var/tmp/NativeAdrenoMetal.cache";
+static const char kReaderPath[] = "/Library/GPUBundles/NativeAdrenoMetal.cache";
+static const uint32_t kOwners[] = {0, 88};   // the superuser and _windowserver
+// The directory this process fills, when the kernel made it for this process's user (or this process is the superuser): never
+// made here, since /private/var/tmp takes anyone's directories.
+inline std::string writerDirectory() {
+    struct stat st = {};
+    if (lstat(kWriterPath, &st) || !S_ISDIR(st.st_mode) || (st.st_mode & 0022)) return {};
+    if (st.st_uid != kOwners[0] && st.st_uid != kOwners[1]) return {};
+    if (st.st_uid != getuid() && getuid() != 0) return {};
+    return access(kWriterPath, W_OK) == 0 ? std::string(kWriterPath) : std::string();
+}
+}  // namespace systemcache
+
 // Call before the first Vulkan device is opened, including the optional smoke path.
 inline void configureShaderDiskCache(const std::string &root) {
     if (root.empty()) return;

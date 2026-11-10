@@ -39,7 +39,10 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 // settle, 3 it opens a library and its functions), libraries done of the list, pipelines made, and the most command buffers the last wait
 // saw in 250 ms.
 extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_done, native_prime_libraries_total, native_prime_made, native_prime_rate,
-               native_prime_functions_resumed;}
+               native_prime_functions_resumed;
+// For the PRb row: the libraries this process's passes compiled, those a pass leaves out, and the pass's scope (1 the bundles loaded
+// in this process, 2 the whole system).
+volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;}
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
@@ -186,6 +189,17 @@ static bool libraryOfLoadedBundle(const std::string &path) {
         if (name && plain(name).compare(0, bundle.size(), bundle) == 0) return true;
     }
     return false;
+}
+// macOS: whether a library is in another GPU's driver bundle (/System/Library/Extensions/<name>.bundle: AGXMetal* and the like, 167 of
+// the 400 libraries of a macOS 27 image). IOGPU loads the bundle of the accelerator found, which here is this plugin, so nothing
+// asks for those libraries on this GPU.
+static bool libraryOfDriverBundle(const std::string &path) {
+    static const char kCryptex[] = "/System/Cryptexes/OS", kExtensions[] = "/System/Library/Extensions/";
+    const char *plain = path.c_str();
+    if (strncmp(plain, kCryptex, sizeof kCryptex - 1) == 0 && plain[sizeof kCryptex - 1] == '/') plain += sizeof kCryptex - 1;
+    if (strncmp(plain, kExtensions, sizeof kExtensions - 1) != 0) return false;
+    const char *slash = strchr(plain + sizeof kExtensions - 1, '/');
+    return slash && slash - plain > 7 && strncmp(slash - 7, ".bundle", 7) == 0;
 }
 #endif
 
@@ -349,7 +363,10 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
 }
 
 // The thread: waits for the desktop to settle, then works through the libraries not finished yet.
-static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath) {
+// `wholeSystem` (macOS): this process fills the system shader cache (SharedShaderCache.h), which every process reads, so every
+// library of the list is primed but those of other GPUs' driver bundles; without it only the libraries of bundles loaded here are,
+// since the cache then serves this process alone.
+static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath, bool wholeSystem) {
     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
     native_bridge_metal_quiet_problems(true);
     while (root.size() > 1 && root.back() == '/') root.pop_back();
@@ -370,6 +387,11 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     const std::string build = buildId();
     appendLine(logPath, note + " build=" + build);
     native_prime_libraries_total = (uint32_t)paths.size();
+#if TARGET_OS_OSX
+    native_prime_scope = wholeSystem ? 2 : 1;
+#else
+    native_prime_scope = 2;   // iPadOS primes every library of the list, whatever its bundle
+#endif
     for (const std::string &path : paths) {
         ++libs;
         native_prime_libraries_done = finished;
@@ -379,10 +401,15 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
         if (done.count(id)) {++finished; continue;}
 #if TARGET_OS_OSX
-        // Counted as done for the telemetry's progress, and not listed as finished (libraryOfLoadedBundle).
-        if (!libraryOfLoadedBundle(path)) {++foreign; ++finished; continue;}
+        // Counted as done for the telemetry's progress, and not listed as finished (libraryOfDriverBundle, libraryOfLoadedBundle).
+        if (wholeSystem ? libraryOfDriverBundle(path) : !libraryOfLoadedBundle(path)) {
+            ++foreign; ++finished;
+            native_prime_libraries_skipped = foreign;
+            continue;
+        }
 #endif
         appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build));
+        native_prime_libraries_primed = native_prime_libraries_primed + 1;
         appendLine(donePath, id);
         done.insert(id);
         ++finished;
@@ -390,7 +417,8 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;
     char line[120];
-    snprintf(line, sizeof line, "pass libraries=%u finished=%u not-loaded=%u ms=%llu", libs, finished, foreign, (unsigned long long)(nowMs() - began));
+    snprintf(line, sizeof line, "pass libraries=%u finished=%u %s=%u ms=%llu", libs, finished, wholeSystem ? "driver-bundles" : "not-loaded",
+             foreign, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
 }
 }  // namespace prime
