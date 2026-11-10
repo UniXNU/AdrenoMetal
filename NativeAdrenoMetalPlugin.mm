@@ -123,8 +123,8 @@ static bool bootArgSet(const char *key) {
     const size_t length = strlen(key);
     return at && (at[length] == 0 || at[length] == ' ');
 }
-[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
-    const uintptr_t site = 0x184461928 + slide;
+// `site` is the slid address of that branch in the running QuartzCore; any other word there is left alone (0x6E41).
+[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t site) {
     uint32_t word = 0;
     if (!readTask(site, &word, sizeof word)) return 0x6E40;
     if (word == 0xd503201f) return 0x6E42;
@@ -444,7 +444,7 @@ static id deviceForPort(unsigned port) {
             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
             const uint8_t off = 0;
             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
+            if (!strcmp(getprogname(), "backboardd") && bootArgSet("fb-bgra=1")) gpu->mark(patchFramebufferBranch(0x184461928 + slide));
             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
@@ -476,6 +476,15 @@ static id deviceForPort(unsigned port) {
                 return nullptr;
             }, gpu) == 0)
                 pthread_detach(reader);
+        }
+#else
+        // macOS 27.3 (26C5035r) with ca-fb-8bit=1: the same one branch in WindowServer. IOMFBDisplay::framebuffer_pixel_format
+        // (0x18e1e1048) keeps 'RGhA' on `tbnz w8, #0` at 0x18e1e1134 while CADeviceIsVirtualized is set, which this board's
+        // vmm-present makes it; not taken, a display without extended colours and without universal buffer compression gets
+        // 'BGRA', the format the display pipes fetch directly. The virtualized answer itself stays for every other reader.
+        if (!strcmp(getprogname(), "WindowServer") && bootArgSet("ca-fb-8bit=1")) {
+            if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart"))
+                gpu->mark(patchFramebufferBranch(0x18e1e1134 + ((uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x18dee9b80)));
         }
 #endif  // !TARGET_OS_OSX
 #endif

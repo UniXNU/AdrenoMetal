@@ -1413,7 +1413,8 @@ NB_RESOURCE_SPI
 // (IOSurfaceGetBaseAddress maps it into the task the first time) and sorting the ranges cost CPU on every commit and completion. The
 // kernel keeps imports right without it: read-only ones are mapped coherent, GPU-written ones are cleaned and invalidated when mapped and
 // unmapped, and write-combined surfaces hold no line at all.
-#if defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && __IPHONE_OS_VERSION_MIN_REQUIRED >= 270000
+#if (defined(__IPHONE_OS_VERSION_MIN_REQUIRED) && __IPHONE_OS_VERSION_MIN_REQUIRED >= 270000) || \
+    (TARGET_OS_OSX && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED >= 270000)
 static constexpr bool kSurfaceFlush=false;
 #else
 static constexpr bool kSurfaceFlush=true;
