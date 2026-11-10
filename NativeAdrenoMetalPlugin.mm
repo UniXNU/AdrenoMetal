@@ -488,14 +488,9 @@ static id deviceForPort(unsigned port) {
                 pthread_detach(reader);
         }
 #else
-        // macOS 27.3 (26C5035r) with ca-fb-8bit=1: the same one branch in WindowServer. IOMFBDisplay::framebuffer_pixel_format
-        // (0x18e1e1048) keeps 'RGhA' on `tbnz w8, #0` at 0x18e1e1134 while CADeviceIsVirtualized is set, which this board's
-        // vmm-present makes it; not taken, a display without extended colours and without universal buffer compression gets
-        // 'BGRA', the format the display pipes fetch directly. The virtualized answer itself stays for every other reader.
-        if (!strcmp(getprogname(), "WindowServer") && bootArgSet("ca-fb-8bit=1")) {
-            if (void *start = dlsym(RTLD_DEFAULT, "CARenderServerStart"))
-                gpu->mark(patchFramebufferBranch(0x18e1e1134 + ((uintptr_t)ptrauth_strip(start, ptrauth_key_function_pointer) - 0x18dee9b80)));
-        }
+        // macOS: the framebuffer format is changed as a fixup of signed text (the board's payload text_fixups), applied when the page
+        // passes code signing validation. A write into the mapped page from here made the page invalid, and code signing killed
+        // WindowServer at its next validation of that page.
 #endif  // !TARGET_OS_OSX
 #endif
         // The runtime's creation log reports each VkPipeline making's time to the device's sink, which the telemetry's V row sums
