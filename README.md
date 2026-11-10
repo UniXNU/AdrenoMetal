@@ -10,7 +10,23 @@ Build and interface details: [documentation](https://unixnu.com/drivers/adreno-m
 
 ## Memory reuse
 
-Unused owned image backing is reused by pooled and dedicated images. Extra spares have no byte limit, expire after ten seconds, and go sooner under memory pressure or when a new block cannot be made. Blocks are freed off the releasing thread on the runtime's free thread, and on the releasing thread once its queue is full. An allocation failure releases kept spares and waits for posted frees before retrying. Imported memory and owner callbacks keep their release ordering.
+Unused owned image backing is reused by pooled and dedicated images. Extra spares have no byte limit, expire after ten seconds, and go sooner under memory pressure or when a new block cannot be made. Blocks are freed off the releasing thread on the runtime's free thread, and on the releasing thread once its queue is full. An allocation failure releases kept spares and waits for posted frees before retrying. Imported memory and owner callbacks keep their release ordering. Released images and buffers the runtime parks for reuse, and kept empty pooled blocks beyond one a pool, go when their time is up even in a process that makes and releases nothing more.
+
+## Purgeable memory
+
+`setPurgeableState:` follows Metal's contract: a resource whose state is Volatile or Empty may lose its contents, and the call answers Empty for contents that were discarded. The bridge discards by releasing the runtime resource and makes it again from the same description, so a batch in flight keeps what it uses and the frontend handle stays valid.
+
+Discarded: a texture or buffer the device made of its own memory, and a heap, where the runtime keeps a purgeable state for it (at least 16 KiB, not memoryless). Never discarded: a texture over a buffer or a surface, a no-copy buffer, a view, a resource placed in a heap, a drawable, and a resource that
+
+- a command buffer being recorded or in flight names,
+- has a live view, a texture over it or a resource placed in it,
+- has handed out its CPU pointer (`contents`) or GPU address (`gpuAddress`), which Metal keeps for the resource's life.
+
+Triggers: the system's memory pressure event (every idle Volatile or Empty resource), and age (idle for the runtime's spare block age, ten seconds).
+
+After a discard: NonVolatile places the resource again and answers Empty; a query answers Empty and places nothing; any other use places it again with zeroed memory and leaves its state Empty. A placement that fails behaves as a failed allocation.
+
+`gpu-purge=0` keeps the state without discarding anything (`NATIVE_METAL_PURGE=0` selects the same in a process).
 
 ## Shader caches and priming
 
@@ -20,7 +36,7 @@ The render server primes Metal libraries in the background while it draws nothin
 
 ## Telemetry table
 
-With `diag=1`, the render server sends its telemetry table to the kernel log (`[metal table]`, shown with `log-gpu=1`) every six seconds and to the system log every thirty (`NativeAdrenoMetal table:`). The kernel keeps the first 48 rows of at most 90 characters. Memory rows come first: `MEM` (MiB by kind and Turnip's BO cache), `MK`, `MKb`, `MKc` (blocks by size class: pooled, empty, spare, dedicated images, dedicated buffers), `ML` (lazily allocated blocks and the MiB the driver backed), `PG` (declared purgeable), `PE` (memory pressure events and held surface imports), `RM`, `PS` and `MA` (allocation call stacks). Compile rows follow: `T` (pipeline, library, compiler and function creation), `VP` (driver pipelines made at creation and at draws, with the driver's time), `V`, `SC`, `PR` (priming) and `FL`. `TH` rows list the threads that used the most CPU since the last table. Other processes write one `NativeAdrenoMetal work:` line to the system log every thirty seconds while their compile counts change.
+With `diag=1`, the render server sends its telemetry table to the kernel log (`[metal table]`, shown with `log-gpu=1`) every six seconds and to the system log every thirty (`NativeAdrenoMetal table:`). The kernel keeps the first 48 rows of at most 90 characters. Memory rows come first: `MEM` (MiB by kind and Turnip's BO cache), `MK`, `MKb`, `MKc` (blocks by size class: pooled, empty, spare, dedicated images, dedicated buffers), `ML` (lazily allocated blocks and the MiB the driver backed), `PG` (declared purgeable), `PGb` (MiB discarded now, by pressure and by age, placed again by request and by another use, Empty answers), `PGc` (MiB declared, MiB never discardable because a pointer or address was handed out, what the last pass left in use, tied or young, failed placements), `PE` (memory pressure events and held surface imports), `RM`, `PS` and `MA` (allocation call stacks). Compile rows follow: `T` (pipeline, library, compiler and function creation), `VP` (driver pipelines made at creation and at draws, with the driver's time), `V`, `SC`, `PR` (priming) and `FL`. `TH` rows list the threads that used the most CPU since the last table. Other processes write one `NativeAdrenoMetal work:` line to the system log every thirty seconds while their compile counts change. They also write a `NativeAdrenoMetal memory:` line each time their runtime blocks pass the next power of two from 64 MiB (blocks, bytes placed, declared purgeable, discarded) and a `NativeAdrenoMetal purge:` line for each pass that discarded something.
 
 ## Frame diagnostics
 
