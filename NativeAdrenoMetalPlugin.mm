@@ -48,12 +48,11 @@ static bool requestedPath(const char *name, char *path, size_t size) {
     Dl_info info = {};
     if (!dladdr(reinterpret_cast<const void *>(&requestedPath), &info) || !info.dli_fname) return false;
     snprintf(path, size, "%s", info.dli_fname);
-    char *slash = strrchr(path, '/');          // the bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal
-    if (!slash) return false;
-    *slash = 0;
-    slash = strrchr(path, '/');
-    if (!slash) return false;
-    snprintf(slash + 1, size - size_t(slash + 1 - path), "%s", name);
+    // The bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal (iOS) or
+    // <dir>/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal (macOS).
+    char *bundle = strstr(path, "/NativeAdrenoMetal.bundle/");
+    if (!bundle) return false;
+    snprintf(bundle + 1, size - size_t(bundle + 1 - path), "%s", name);
     return access(path, R_OK) == 0;
 }
 static bool requested() {
