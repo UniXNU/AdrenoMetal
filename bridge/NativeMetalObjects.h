@@ -128,8 +128,10 @@ void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
 /* A command buffer names the resource from the hold until the unhold (its completion, or its release without a commit): the
- * resource is not discarded meanwhile. The hold comes before the command that names the resource is encoded. */
-void nmb_buffer_hold(const NmbBuffer *);
+ * resource is not discarded meanwhile. The hold comes before the command that names the resource is encoded. It answers true where
+ * the resource is discarded at that moment: its caller names it without having set it NonVolatile first, and the command will find
+ * it placed again, emptied. */
+bool nmb_buffer_hold(const NmbBuffer *);
 void nmb_buffer_unhold(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
@@ -166,7 +168,7 @@ NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, c
 #define NMB_PURGE_AGAIN_FAILED 0x100ull
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
-void nmb_texture_hold(const NmbTexture *);
+bool nmb_texture_hold(const NmbTexture *);
 void nmb_texture_unhold(const NmbTexture *);
 uint64_t nmb_texture_allocated_size(const NmbTexture *);
 uint64_t nmb_device_current_allocated_size(const NmbDevice *);

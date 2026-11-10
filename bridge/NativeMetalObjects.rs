@@ -619,10 +619,10 @@ pub extern "C" fn nmb_device_purge_counts(device: *const NmbDevice, out: *mut u6
 }
 
 /// A command buffer names the buffer from now until `nmb_buffer_unhold`: it is not discarded meanwhile. Called before the command
-/// that names it is encoded.
+/// that names it is encoded. True where the buffer is discarded now: its caller names it without having set it NonVolatile first.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_buffer_hold(buffer: *const NmbBuffer) {
-    guard((), || Ok(get(buffer)?.0.hold()))
+pub extern "C" fn nmb_buffer_hold(buffer: *const NmbBuffer) -> bool {
+    guard(false, || Ok(get(buffer)?.0.hold()))
 }
 
 /// The command buffer that held the buffer completed, or went without a commit.
@@ -633,8 +633,8 @@ pub extern "C" fn nmb_buffer_unhold(buffer: *const NmbBuffer) {
 
 /// `nmb_buffer_hold` for a texture.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_hold(texture: *const NmbTexture) {
-    guard((), || Ok(get(texture)?.0.hold()))
+pub extern "C" fn nmb_texture_hold(texture: *const NmbTexture) -> bool {
+    guard(false, || Ok(get(texture)?.0.hold()))
 }
 
 /// `nmb_buffer_unhold` for a texture.

@@ -606,7 +606,8 @@ int main(int argc, char **argv) {
             // The telemetry's rows of it, each within 90 characters.
             static char text[16384];
             native_bridge_metal_telemetry(text, sizeof text);
-            for (const char *name : {"\nPG req ", "\nPGb out ", "\nPGc decl "}) {
+            // PU0: the caller that read a discarded texture with no NonVolatile first (ageAndUseCase).
+            for (const char *name : {"\nPG req ", "\nPGb out ", "\nPGc decl ", "\nPU0 all "}) {
                 const char *row = strstr(text, name);
                 CHECK(row != nullptr, "telemetry row%s", name + 1);
                 if (row) std::printf("%.*s\n", (int)strcspn(row + 1, "\n"), row + 1);
