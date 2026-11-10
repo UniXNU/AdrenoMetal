@@ -4732,6 +4732,38 @@ static void logClientWork() {
  dispatch_resume(timer);
 }
 
+// With diag=1, a process other than the render server also writes where its GPU memory is each time the runtime's blocks pass the
+// next power of two from 64 MiB up: a process the kernel ends within seconds of its start (iconservicesagent, which reached
+// 450 to 700 MiB of blocks in 2 to 6 s) never reaches the 30 s line above. The line separates what only this stack keeps from what
+// the process holds: the bytes of the pooled blocks against the bytes placed in them (the rest is room the pools keep and
+// fragmentation), the kept empty blocks, the dedicated blocks and the imports; then what the process declared discardable
+// (setPurgeableState:, notePurgeable): requests on buffers, textures and heaps, the bytes volatile and empty now, ever made so,
+// made non-volatile again, and the largest such object. RenderBox keeps its recycled buffers, textures and heaps volatile, so the
+// volatile bytes are what a purge could give back. At most one line per doubling: a 250 ms check that writes nothing else.
+static void logClientMemory() {
+ if(!diagOn() || isRenderServer())return;
+ static dispatch_source_t timer;
+ timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
+ dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,250*NSEC_PER_MSEC),250*NSEC_PER_MSEC,100*NSEC_PER_MSEC);
+ dispatch_source_set_event_handler(timer,^{
+  static uint64_t next=64ull<<20;
+  uint64_t mc[10]={};
+  if(!nmb_device_memory_counts(gDevice,mc))return;
+  const uint64_t blocks=mc[0]+mc[2]+mc[3];
+  if(blocks<next)return;
+  while(next<=blocks)next<<=1;
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal memory: pooled %lluM placed %lluM empty %lluM dedicated %lluM imported %lluM blocks %llu+%llu | "
+   "purgeable req %llu/%llu/%llu volatile %lluM empty %lluM ever %lluM back %lluM largest %lluK",
+   (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
+   (unsigned long long)(mc[4]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
+   (unsigned long long)gPurgeable[0].load(),(unsigned long long)gPurgeable[1].load(),(unsigned long long)gPurgeable[2].load(),
+   (unsigned long long)(gPurgeable[3].load()>>20),(unsigned long long)(gPurgeable[4].load()>>20),
+   (unsigned long long)(gPurgeable[5].load()>>20),(unsigned long long)(gPurgeable[6].load()>>20),
+   (unsigned long long)(gPurgeable[7].load()>>10));
+ });
+ dispatch_resume(timer);
+}
+
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
@@ -4747,6 +4779,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  watchImportPressure();
  logFlowCounts();
  logClientWork();
+ logClientMemory();
  // Where this process's pipeline cache is and whose it is: a cache serves the processes of its user that may write its directory.
  if(diagOn() || logGpuOn())os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d",cache?cache:"none",(int)getuid());
  if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
