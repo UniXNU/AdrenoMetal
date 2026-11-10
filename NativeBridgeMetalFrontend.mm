@@ -650,11 +650,16 @@ static void onLargeStack(void (^body)(void)) {
  if(made)pthread_join(thread,nullptr);else body();
 }
 // A request's reply depends only on its bytes and the compiler, so writable same-user caches share it
-// (Library/Caches/native-metal-shaders/SHA256.reply, SHA-256 of MTLCompiler's LC_UUID, the request type and its bytes): an
+// (native-metal-shaders/SHA256.reply, SHA-256 of MTLCompiler's LC_UUID, the request type and its bytes): an
 // app that compiles its shaders from source at every launch (GFXBench spends minutes of Clang and LLVM loading a test)
 // compiles each one once. A file is the magic, the warning and metallib lengths and the SHA-256 of both, then both; it is
 // written to a temporary name and renamed, and one that does not check out is compiled again. Failures are not kept.
 // NATIVE_METAL_NO_SHADER_CACHE=1 turns it off.
+// The directory is the same-user shared one, else the directory the device's pipeline cache opened in (gCacheRoot), which the
+// plugin has found writable under the process's sandbox, else the user's Caches directory. macOS's iconservicesagent may write
+// its Metal cache directory but not Library/Caches: with the replies only there it kept none, and each of its launches compiled
+// every request again.
+static std::string gCacheRoot;   // the pipeline cache directory the device opened with (native_bridge_metal_open)
 struct NBShaderCacheHeader {uint32_t magic,warningBytes;uint64_t metallibBytes;unsigned char digest[CC_SHA256_DIGEST_LENGTH];};
 static const uint32_t kNBShaderCacheMagic=0x3143534e;   // "NSC1"
 static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,const std::vector<uint8_t> &request) {
@@ -663,9 +668,15 @@ static NSString *shaderCachePath(const unsigned char uuid[16],uint32_t type,cons
  dispatch_once(&once,^{
   if(getenv("NATIVE_METAL_NO_SHADER_CACHE"))return;
   const std::string shared=sharedShaderCacheDirectory();
-  NSString *caches=shared.empty()?NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject:@(shared.c_str());
-  NSString *path=caches?[caches stringByAppendingPathComponent:@"native-metal-shaders"]:nil;
-  if(path && [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil])directory=path;
+  NSMutableArray<NSString *> *roots=[NSMutableArray array];
+  if(!shared.empty())[roots addObject:@(shared.c_str())];
+  if(!gCacheRoot.empty())[roots addObject:@(gCacheRoot.c_str())];
+  if(NSString *caches=NSSearchPathForDirectoriesInDomains(NSCachesDirectory,NSUserDomainMask,YES).firstObject)[roots addObject:caches];
+  for(NSString *root in roots) {
+   NSString *path=[root stringByAppendingPathComponent:@"native-metal-shaders"];
+   if([[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil] &&
+      access(path.fileSystemRepresentation,W_OK)==0){directory=path;break;}
+  }
  });
  if(!directory)return nil;
  CC_SHA256_CTX context;CC_SHA256_Init(&context);
@@ -4693,7 +4704,7 @@ static void logFlowCounts() {
 extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
- if(cache && *cache)configureShaderDiskCache(cache);
+ if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(diagOn() && loader) {
