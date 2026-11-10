@@ -893,33 +893,49 @@ static void answerMissing(NSInvocation *invocation) {
 
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
+// A command buffer names the object from now on (YES) until it completed or went (NO): a buffer or a texture is not discarded
+// meanwhile (nmb_buffer_hold). Nothing for any other object.
+- (void)purgeHold:(BOOL)hold;
 @end
 // What the caller asked of setPurgeableState: (MTLResource, MTLHeap), for the telemetry's PG row: how much memory the process has declared
-// discardable. The runtime keeps the state and never discards (its attributes.rs), so these bytes are what a purge could give back.
-// [0..2] requests on buffers, textures, heaps; [3] bytes volatile now, [4] bytes empty now (an object freed in either state stays
-// counted: an upper bound); [5] bytes ever made volatile or empty, [6] bytes made non-volatile again, [7] the largest such object.
+// discardable. [0..2] requests on buffers, textures, heaps; [3] bytes of the objects whose state is Volatile now, [4] of those whose
+// state is Empty now; [5] bytes ever made volatile or empty, [6] bytes made non-volatile again, [7] the largest such object. An
+// object carries which of [3] and [4] counts it (`counted`), so the two are exact for the states the caller was last told: one the
+// bridge discarded since (NativeMetalPurge.rs) stays under Volatile until the caller asks again, and the bytes discarded now are the
+// PGb row's.
 static std::atomic<uint64_t> gPurgeable[8];
-static void notePurgeable(unsigned kind,MTLPurgeableState before,MTLPurgeableState asked,uint64_t bytes) {
- gPurgeable[kind].fetch_add(1,std::memory_order_relaxed);
- if(asked==MTLPurgeableStateKeepCurrent)return;
- const MTLPurgeableState after=before==MTLPurgeableStateEmpty && asked==MTLPurgeableStateVolatile?MTLPurgeableStateEmpty:asked;
- if(after==before)return;
- const auto slot=[](MTLPurgeableState state){return state==MTLPurgeableStateVolatile?3:state==MTLPurgeableStateEmpty?4:-1;};
- if(slot(before)>=0) {
-  // never below zero: the count is an estimate (see above)
-  uint64_t now=gPurgeable[slot(before)].load(std::memory_order_relaxed);
-  while(!gPurgeable[slot(before)].compare_exchange_weak(now,now>bytes?now-bytes:0,std::memory_order_relaxed)){}
- }
- if(slot(after)>=0) {
-  gPurgeable[slot(after)].fetch_add(bytes,std::memory_order_relaxed);
-  if(slot(before)<0)gPurgeable[5].fetch_add(bytes,std::memory_order_relaxed);
+static void countPurgeable(uint8_t &counted,uint8_t slot,uint64_t bytes) {
+ if(counted==slot)return;
+ if(counted)gPurgeable[counted].fetch_sub(bytes,std::memory_order_relaxed);
+ if(slot)gPurgeable[slot].fetch_add(bytes,std::memory_order_relaxed);
+ if(slot && !counted) {
+  gPurgeable[5].fetch_add(bytes,std::memory_order_relaxed);
   uint64_t big=gPurgeable[7].load(std::memory_order_relaxed);
   while(bytes>big && !gPurgeable[7].compare_exchange_weak(big,bytes,std::memory_order_relaxed)){}
- } else if(slot(before)>=0) gPurgeable[6].fetch_add(bytes,std::memory_order_relaxed);
+ } else if(!slot && counted) gPurgeable[6].fetch_add(bytes,std::memory_order_relaxed);
+ counted=slot;
+}
+static void armPurgeAge();
+// The bridge's answer to setPurgeableState: (0: the call failed) as Metal's, counted. `before` is the state before the call (the
+// state now for a query); the state after is the one asked, but Volatile asked of an Empty object leaves it Empty, as Metal does.
+static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeableState asked,uint64_t bytes,uint8_t &counted,const char *what) {
+ if(!answer){NBLOG(@"native-metal: %s setPurgeableState refused: %@",what,lastError());return (MTLPurgeableState)0;}
+ // The contents were discarded and the object could not be placed again: it stays without memory, the answer is still Empty, and
+ // its next use tries again and fails as an allocation fails.
+ if(answer&NMB_PURGE_AGAIN_FAILED)NBLOG(@"native-metal: %s could not be placed again after its discard: %@",what,lastError());
+ const MTLPurgeableState before=(MTLPurgeableState)(answer&0xff);
+ gPurgeable[kind].fetch_add(1,std::memory_order_relaxed);
+ const MTLPurgeableState after=asked==MTLPurgeableStateKeepCurrent || (answer&NMB_PURGE_AGAIN_FAILED) ||
+                               (before==MTLPurgeableStateEmpty && asked==MTLPurgeableStateVolatile)?before:asked;
+ countPurgeable(counted,after==MTLPurgeableStateVolatile?3:after==MTLPurgeableStateEmpty?4:0,bytes);
+ // An object that may be discarded by age: the timer runs while there is one.
+ if(after==MTLPurgeableStateVolatile || after==MTLPurgeableStateEmpty)armPurgeAge();
+ return before;
 }
 
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
+- (void)purgeHold:(BOOL)hold {(void)hold;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
  NSMethodSignature *signature=[super methodSignatureForSelector:selector];
  return signature?signature:missingSignature(self,selector);
@@ -976,13 +992,19 @@ static void releaseBlock(void *context,void *pointer,uint64_t length) {
  void (^deallocator)(void *,NSUInteger)=(__bridge_transfer void (^)(void *,NSUInteger))context;deallocator(pointer,(NSUInteger)length);
 }
 static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(uintptr_t)context);gSurfaceImportsReleased++;CFRelease((IOSurfaceRef)context);}
-@implementation NBBuffer
+@implementation NBBuffer {
+ uint8_t _purgeCounted;   // which of gPurgeable[3] and [4] counts its bytes (0: neither)
+}
 - (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
 - (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
 - (void)dealloc {
  DetailSpan timing(4,(uintptr_t)_handle);
+ if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_buffer_length(_handle));
  nmb_buffer_release(_handle);
+ // A heap whose last resource went may be discarded now: the age timer runs again if the heap waits for it.
+ if(_parentHeap)armPurgeAge();
 }
+- (void)purgeHold:(BOOL)hold {if(hold)nmb_buffer_hold(_handle);else nmb_buffer_unhold(_handle);}
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
 - (void *)contents {return nmb_buffer_contents(_handle);}
 - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
@@ -992,10 +1014,7 @@ static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(
 - (MTLHazardTrackingMode)hazardTrackingMode {return (MTLHazardTrackingMode)((_options&MTLResourceHazardTrackingModeMask)>>MTLResourceHazardTrackingModeShift);}
 - (void)didModifyRange:(NSRange)range {(void)range;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
- const uint64_t answer=nmb_buffer_set_purgeable_state(_handle,state);
- if(!answer)NBLOG(@"native-metal: buffer setPurgeableState refused: %@",lastError());
- else notePurgeable(0,(MTLPurgeableState)answer,state,[self allocatedSize]);
- return (MTLPurgeableState)answer;
+ return notePurgeable(0,nmb_buffer_set_purgeable_state(_handle,state),state,[self allocatedSize],_purgeCounted,"buffer");
 }
 - (NSUInteger)allocatedSize {return nmb_buffer_length(_handle);}
 - (IOSurfaceRef)iosurface {return nullptr;}   // a buffer is never the backing of a surface here (surfaces back textures)
@@ -1037,6 +1056,51 @@ extern "C" void native_bridge_metal_trim_surface_imports(void) {trimHeldImports(
 // The system's memory pressure events this process got, for the telemetry's PE row: [0] warnings, [1] critical ones, [2] the blocks
 // the runtime gave back at them.
 static std::atomic<uint64_t> gPressureEvents[3];
+// Discards the buffers, textures and heaps the caller declared Volatile or Empty that nothing uses (NativeMetalPurge.rs): all of
+// them for cause 0, the system's memory pressure signal, as the kernel purges volatile memory when it needs pages; for cause 1 those
+// idle for idleMs. The bytes discarded. Nothing with the boot argument gpu-purge=0.
+// With diag=1, a process other than the render server (whose table has the PGb and PGc rows) writes a line for each pass that
+// discarded something: the pass's MiB and cause, then the process's totals (nmb_device_purge_counts): MiB discarded now, at
+// pressure and by age, placed again by a NonVolatile request and by another use (a caller that used a discarded resource without
+// setting it NonVolatile first), Empty answers, MiB never discardable because a pointer or address was handed out, placements again
+// that failed. At most one line a pass, and the age timer passes twice an age.
+extern "C" uint64_t native_bridge_metal_purge(uint32_t cause,uint64_t idleMs) {
+ if(!gDevice)return 0;
+ const uint64_t discarded=nmb_device_purge(gDevice,cause,idleMs);
+ if(discarded && diagOn() && !isRenderServer()) {
+  uint64_t pg[16]={};
+  (void)nmb_device_purge_counts(gDevice,pg);
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal purge: %lluK by %{public}s | out %lluM pressure %lluM age %lluM | again %lluM use %lluM empty %llu | "
+   "pinned %lluM fail %llu",(unsigned long long)(discarded>>10),cause?"age":"pressure",(unsigned long long)(pg[9]>>20),
+   (unsigned long long)(pg[1]>>20),(unsigned long long)(pg[3]>>20),(unsigned long long)(pg[5]>>20),(unsigned long long)(pg[7]>>20),
+   (unsigned long long)pg[8],(unsigned long long)(pg[11]>>20),(unsigned long long)pg[15]);
+ }
+ return discarded;
+}
+extern "C" bool native_bridge_metal_purge_counts(uint64_t out[16]) {return gDevice && nmb_device_purge_counts(gDevice,out);}
+// What a memory pressure event gives back: the surface imports held between frames, what the caller declared discardable (first,
+// so the blocks it empties go with the rest), then the runtime's parked objects and its spare and kept empty blocks (bridge patches
+// 0021 and 0034), as Metal's resource cache gives memory back. The bytes discarded.
+extern "C" uint64_t native_bridge_metal_relieve_memory(void) {
+ trimHeldImports(true);
+ const uint64_t discarded=native_bridge_metal_purge(0,0);
+ if(gDevice)gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);
+ return discarded;
+}
+// Pressure events are rare on a system whose GPU memory is wired (one warning in the five boots of run61's log archive, with 3.1 of
+// 4.72 GiB wired), so what stays Volatile or Empty and idle for the runtime's spare block age goes by age too. The timer runs only
+// while something may still go: armed by a setPurgeableState: that leaves an object Volatile or Empty, and again by a pass that
+// left some. Two passes an age, so an object goes at most half an age late.
+static void armPurgeAge() {
+ static std::atomic<bool> armed;
+ if(!gDevice || !nmb_device_purge_pending(gDevice) || armed.exchange(true))return;
+ const uint64_t age=nmb_purge_age_ms();
+ dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(age/2)*(int64_t)NSEC_PER_MSEC),dispatch_get_global_queue(QOS_CLASS_UTILITY,0),^{
+  armed.store(false);
+  native_bridge_metal_purge(1,age);
+  armPurgeAge();
+ });
+}
 static void watchImportPressure() {
  static dispatch_once_t once;
  // The source lives as long as the process: a source whose last reference goes is taken off its event queue, and this file's
@@ -1046,11 +1110,9 @@ static void watchImportPressure() {
   source=dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE,0,
    DISPATCH_MEMORYPRESSURE_WARN|DISPATCH_MEMORYPRESSURE_CRITICAL,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
   if(!source)return;
-  // The runtime's spare and kept empty memory blocks go too (bridge patch 0021), as Metal's resource cache gives memory back.
   dispatch_source_set_event_handler(source,^{
    gPressureEvents[dispatch_source_get_data(source)&DISPATCH_MEMORYPRESSURE_CRITICAL?1:0]++;
-   trimHeldImports(true);
-   if(gDevice)gPressureEvents[2]+=nmb_device_release_kept_memory(gDevice);
+   native_bridge_metal_relieve_memory();
   });
   dispatch_activate(source);
  });
@@ -1203,7 +1265,10 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  }
  return true;
 }
-@implementation NBTexture
+@implementation NBTexture {
+ uint8_t _purgeCounted;   // as NBBuffer's
+}
+- (void)purgeHold:(BOOL)hold {if(hold)nmb_texture_hold(_handle);else nmb_texture_unhold(_handle);}
 - (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
 - (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
 - (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable: %@",lastError());}
@@ -1211,7 +1276,13 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  const uint64_t s=_descriptor.swizzle;
  return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(s&255),(MTLTextureSwizzle)((s>>8)&255),(MTLTextureSwizzle)((s>>16)&255),(MTLTextureSwizzle)((s>>24)&255));
 }
-- (void)dealloc {DetailSpan timing(5,(uintptr_t)_handle);nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}}
+- (void)dealloc {
+ DetailSpan timing(5,(uintptr_t)_handle);
+ if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_texture_allocated_size(_handle));
+ nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}
+ // What it was made of (a viewed texture, a buffer, a heap) may be discarded now: the age timer runs again if that waits for it.
+ if(_parent || _parentHeap || _buffer)armPurgeAge();
+}
 - (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
@@ -1235,10 +1306,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (id<MTLTexture>)parentTexture {return _parent;}
 - (NSUInteger)rotation {return _descriptor.rotation;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
- const uint64_t answer=nmb_texture_set_purgeable_state(_handle,state);
- if(!answer)NBLOG(@"native-metal: texture setPurgeableState refused: %@",lastError());
- else notePurgeable(1,(MTLPurgeableState)answer,state,[self allocatedSize]);
- return (MTLPurgeableState)answer;
+ return notePurgeable(1,nmb_texture_set_purgeable_state(_handle,state),state,[self allocatedSize],_purgeCounted,"texture");
 }
 NB_RESOURCE_SPI
 - (id<MTLTexture>)view:(NmbTexture *)handle {
@@ -1886,6 +1954,9 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // Runtime handles retain GPU storage, but only the Objective-C owner retains
 // a no-copy deallocator, its memory owner and texture/heap ancestry.
 @property(nonatomic,strong) NSMutableSet *resourceOwners;
+// Adds a resource a command names to resourceOwners, and holds it against a discard until the command buffer completed or went
+// (purgeHold:). Called on the thread that makes the call, before the command reaches the runtime.
+- (void)own:(id)resource;
 // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
@@ -2320,7 +2391,7 @@ static uint64_t encodeCommandOf(id object) {
 // Stage 0 compute, 1 vertex, 2 fragment (the bridge's numbering).
 - (void)buffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset index:(NSUInteger)index stage:(uint32_t)stage {
  if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){[_commandBuffer refuse:@"foreign buffer"];return;}
- if(buffer)[_commandBuffer.resourceOwners addObject:buffer];
+ if(buffer)[_commandBuffer own:buffer];
  if(gDrawStats)[self noteState:kDSBuffer key:stage<<8|(uint32_t)index object:(__bridge const void *)buffer value:offset];
  if(dumpMaybe(_commandBuffer))[self dumpBind:buffer?@[buffer,@(offset)]:nil index:index stage:stage];
  ENCODE([self check:nmb_encoder_set_buffer(self->_handle,stage,buffer?[(NBBuffer *)buffer handle]:nullptr,offset,(uint32_t)index) what:"setBuffer"]);
@@ -2336,7 +2407,7 @@ static uint64_t encodeCommandOf(id object) {
            [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
- if(texture){[_commandBuffer.resourceOwners addObject:texture];}
+ if(texture){[_commandBuffer own:texture];}
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
@@ -2415,7 +2486,7 @@ static uint64_t encodeCommandOf(id object) {
 - (void)dispatchThreadgroups:(MTLSize)t threadsPerThreadgroup:(MTLSize)g {[self dispatch:t group:g threads:false];}
 - (void)dispatchThreadgroupsWithIndirectBuffer:(id<MTLBuffer>)buffer indirectBufferOffset:(NSUInteger)offset threadsPerThreadgroup:(MTLSize)group {
  if(![(id)buffer isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign indirect buffer"];return;}
- [self.commandBuffer.resourceOwners addObject:buffer];
+ [self.commandBuffer own:buffer];
  gDispatches++;self.commandBuffer->encodedWork.dispatches++;
  const std::array<uint64_t,3> g={group.width,group.height,group.depth};
  ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
@@ -2567,7 +2638,7 @@ static uint64_t encodeCommandOf(id object) {
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)n indexType:(MTLIndexType)k indexBuffer:(id<MTLBuffer>)b indexBufferOffset:(NSUInteger)o
                 instanceCount:(NSUInteger)i baseVertex:(NSInteger)v baseInstance:(NSUInteger)bi {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
- [self.commandBuffer.resourceOwners addObject:b];
+ [self.commandBuffer own:b];
  if([self skipDraw])return;
  gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
@@ -2594,7 +2665,7 @@ static uint64_t encodeCommandOf(id object) {
 - (BOOL)own:(id<MTLBuffer>)b what:(NSString *)what {
  if(!b)return YES;
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:[@"foreign " stringByAppendingString:what]];return NO;}
- [self.commandBuffer.resourceOwners addObject:b];return YES;
+ [self.commandBuffer own:b];return YES;
 }
 - (void)setTessellationFactorBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o instanceStride:(NSUInteger)stride {
  if(![self own:b what:@"tessellation factor buffer"])return;
@@ -2647,14 +2718,14 @@ static uint64_t encodeCommandOf(id object) {
 #define NB_OBJECTS(...) ((__unsafe_unretained id[]){__VA_ARGS__})
 - (bool)buffers:(__unsafe_unretained id *)objects count:(size_t)count {
  for(size_t i=0;i<count;i++)if(![objects[i] isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"missing or foreign blit buffer"];return false;}
- for(size_t i=0;i<count;i++)[self.commandBuffer.resourceOwners addObject:objects[i]];
+ for(size_t i=0;i<count;i++)[self.commandBuffer own:objects[i]];
  return true;
 }
 - (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
  for(size_t i=0;i<count;i++) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
-  [self.commandBuffer.resourceOwners addObject:o];
+  [self.commandBuffer own:o];
   if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
  }
  return true;
@@ -2919,7 +2990,17 @@ static char kUserDictionaryKey;
  if(self){traceNumber=++gFrameNumber;createdUs=nowUs();createCpu=threadCpuUs();createTid=threadIdLow();earlyEligible=onRenderServerThread();if(earlyEligible){pthread_t none=nullptr;gEncodeReference.compare_exchange_strong(none,pthread_self());traceThread(1);}frontStage(traceNumber,0,1);}
  return self;
 }
-- (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);nmb_command_buffer_release(_handle);}
+- (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);[self disown];nmb_command_buffer_release(_handle);}
+- (void)own:(id)resource {
+ const NSUInteger before=_resourceOwners.count;
+ [_resourceOwners addObject:resource];
+ if(_resourceOwners.count!=before)[(NBObject *)resource purgeHold:YES];
+}
+// The resources go: the command buffer completed, was refused, or was released without a commit.
+- (void)disown {
+ for(NBObject *resource in _resourceOwners)[resource purgeHold:NO];
+ [_resourceOwners removeAllObjects];
+}
 - (void)watchTexture:(NBTexture *)texture {
  const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
  const size_t length=(size_t)texture.rowBytes*(size_t)texture.descriptor.height;
@@ -3050,13 +3131,13 @@ static char kUserDictionaryKey;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
-  [_resourceOwners addObject:texture];
+  [self own:texture];
   const size_t copiesBefore=resolveCopies.size();
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [_resourceOwners addObject:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
@@ -3107,7 +3188,7 @@ static char kUserDictionaryKey;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=singleSample() && d.defaultRasterSampleCount?1:d.defaultRasterSampleCount;
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
-  [_resourceOwners addObject:d.visibilityResultBuffer];
+  [self own:d.visibilityResultBuffer];
   pass.visibility=[(NBBuffer *)d.visibilityResultBuffer handle];
  }
  NmbCommandBuffer *handle=_handle;
@@ -3175,7 +3256,7 @@ static char kUserDictionaryKey;
  // Actual GPU completion (or a local refusal that never submitted) is the
  // release point. A retained completed command must not pin every old frame.
  frontStage(traceNumber,self.commitIndex,10);
- [_surfaces removeAllObjects];[_resourceOwners removeAllObjects];
+ [_surfaces removeAllObjects];[self disown];
  self.wallpaperOutput=nil;
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
@@ -3926,8 +4007,10 @@ static char dvmMemoryReleaseKey;
 @property(nonatomic) MTLResourceOptions options;
 @property(nonatomic) MTLHeapType heapType;
 @end
-@implementation NBHeap
-- (void)dealloc {DetailSpan timing(19,(uintptr_t)_handle);nmb_heap_release(_handle);}
+@implementation NBHeap {
+ uint8_t _purgeCounted;   // as NBBuffer's
+}
+- (void)dealloc {DetailSpan timing(19,(uintptr_t)_handle);if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_heap_size(_handle));nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
 - (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
 - (NSUInteger)currentAllocatedSize {return nmb_heap_allocated_size(_handle);}
@@ -3939,10 +4022,7 @@ static char dvmMemoryReleaseKey;
 - (MTLHeapType)type {return _heapType;}
 - (uint64_t)protectionOptions {return 0;}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state {
- const uint64_t answer=nmb_heap_set_purgeable_state(_handle,state);
- if(!answer)NBLOG(@"native-metal: heap setPurgeableState refused: %@",lastError());
- else notePurgeable(2,(MTLPurgeableState)answer,state,[self size]);
- return (MTLPurgeableState)answer;
+ return notePurgeable(2,nmb_heap_set_purgeable_state(_handle,state),state,[self size],_purgeCounted,"heap");
 }
 - (id<MTLBuffer>)bufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(uint64_t)offset {
  NmbBuffer *handle=nmb_heap_new_buffer(_handle,length,options,offset);
@@ -4738,8 +4818,10 @@ static void logClientWork() {
 // the process holds: the bytes of the pooled blocks against the bytes placed in them (the rest is room the pools keep and
 // fragmentation), the kept empty blocks, the dedicated blocks and the imports; then what the process declared discardable
 // (setPurgeableState:, notePurgeable): requests on buffers, textures and heaps, the bytes volatile and empty now, ever made so,
-// made non-volatile again, and the largest such object. RenderBox keeps its recycled buffers, textures and heaps volatile, so the
-// volatile bytes are what a purge could give back. At most one line per doubling: a 250 ms check that writes nothing else.
+// made non-volatile again, and the largest such object; then what was done with it (nmb_device_purge_counts): the bytes discarded
+// now, discarded at memory pressure and by age so far, placed again by a NonVolatile request and by another use, and those never
+// discardable because a CPU pointer or GPU address was handed out. RenderBox keeps its recycled buffers, textures and heaps volatile. At most one line per doubling: a
+// 250 ms check that writes nothing else.
 static void logClientMemory() {
  if(!diagOn() || isRenderServer())return;
  static dispatch_source_t timer;
@@ -4747,19 +4829,23 @@ static void logClientMemory() {
  dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,250*NSEC_PER_MSEC),250*NSEC_PER_MSEC,100*NSEC_PER_MSEC);
  dispatch_source_set_event_handler(timer,^{
   static uint64_t next=64ull<<20;
-  uint64_t mc[10]={};
+  uint64_t mc[10]={},pg[16]={};
   if(!nmb_device_memory_counts(gDevice,mc))return;
   const uint64_t blocks=mc[0]+mc[2]+mc[3];
   if(blocks<next)return;
   while(next<=blocks)next<<=1;
+  (void)nmb_device_purge_counts(gDevice,pg);
   os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal memory: pooled %lluM placed %lluM empty %lluM dedicated %lluM imported %lluM blocks %llu+%llu | "
-   "purgeable req %llu/%llu/%llu volatile %lluM empty %lluM ever %lluM back %lluM largest %lluK",
+   "purgeable req %llu/%llu/%llu volatile %lluM empty %lluM ever %lluM back %lluM largest %lluK | "
+   "discarded %lluM pressure %lluM age %lluM again %lluM use %lluM pinned %lluM",
    (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[1]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),
    (unsigned long long)(mc[4]>>20),(unsigned long long)mc[6],(unsigned long long)mc[7],
    (unsigned long long)gPurgeable[0].load(),(unsigned long long)gPurgeable[1].load(),(unsigned long long)gPurgeable[2].load(),
    (unsigned long long)(gPurgeable[3].load()>>20),(unsigned long long)(gPurgeable[4].load()>>20),
    (unsigned long long)(gPurgeable[5].load()>>20),(unsigned long long)(gPurgeable[6].load()>>20),
-   (unsigned long long)(gPurgeable[7].load()>>10));
+   (unsigned long long)(gPurgeable[7].load()>>10),
+   (unsigned long long)(pg[9]>>20),(unsigned long long)(pg[1]>>20),(unsigned long long)(pg[3]>>20),
+   (unsigned long long)(pg[5]>>20),(unsigned long long)(pg[7]>>20),(unsigned long long)(pg[11]>>20));
  });
  dispatch_resume(timer);
 }
@@ -5042,6 +5128,19 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   row("PG req %llu/%llu/%llu | vol %lluM empty %lluM | to %lluM back %lluM big %lluM",(ull)gPurgeable[0].load(),
    (ull)gPurgeable[1].load(),(ull)gPurgeable[2].load(),(ull)(gPurgeable[3].load()>>20),(ull)(gPurgeable[4].load()>>20),
    (ull)(gPurgeable[5].load()>>20),(ull)(gPurgeable[6].load()>>20),(ull)(gPurgeable[7].load()>>20));
+  // What was done with it (nmb_device_purge_counts): MiB discarded and not placed again now; MiB discarded at memory pressure and
+  // by age so far; MiB placed again by a NonVolatile request and by another use; answers of Empty for discarded contents. PGc: of
+  // the MiB that became Volatile or Empty, those never discardable because a CPU pointer or GPU address was handed out; what the
+  // last pass left, in MiB, because it was in use, had a view or a placed resource, or was not idle long enough; placements again
+  // that failed. All zero with the boot argument gpu-purge=0.
+  {
+   uint64_t pg[16]={};
+   (void)nmb_device_purge_counts(gDevice,pg);
+   row("PGb out %lluM | pres %lluM age %lluM | again %lluM use %lluM | empty %llu",(ull)(pg[9]>>20),(ull)(pg[1]>>20),(ull)(pg[3]>>20),
+    (ull)(pg[5]>>20),(ull)(pg[7]>>20),(ull)pg[8]);
+   row("PGc decl %lluM pin %lluM | left use %lluM tie %lluM young %lluM | fail %llu",(ull)(pg[10]>>20),(ull)(pg[11]>>20),
+    (ull)(pg[12]>>20),(ull)(pg[13]>>20),(ull)(pg[14]>>20),(ull)pg[15]);
+  }
   // The system's memory pressure events this process got (warnings, critical ones) and the blocks the runtime gave back at them;
   // then the surface imports held between frames and their MiB, which go back at such an event, and how often Turnip emptied its BO
   // cache (at its own pressure events and when an allocation failed).

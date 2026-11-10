@@ -73,6 +73,21 @@ bool nmb_device_pipeline_counts(const NmbDevice *, uint64_t out[8]);
 size_t nmb_stage_ring_read(uint64_t from, void *out, size_t max, uint64_t *next);
 /* Frees the runtime's spare dedicated blocks and kept empty pooled blocks (memory pressure); returns how many went. */
 size_t nmb_device_release_kept_memory(const NmbDevice *);
+/* Purgeable memory (NativeMetalPurge.rs). A buffer or texture the device made of its own memory, or a heap, whose state is Volatile or
+ * Empty is discarded while nothing uses it: no command buffer that named it is recording or in flight (the holds below), nothing made
+ * of it lives (a view, a texture over it, a resource placed in it), neither its CPU pointer nor its GPU address was handed out, and no
+ * call is inside it. Its handle stays valid: NonVolatile places it again and answers Empty, and any other use of it places it again
+ * with zeroed memory. NATIVE_METAL_PURGE=0 in the environment when the device opens discards nothing.
+ * nmb_device_purge: cause 0 (memory pressure) discards every such resource, cause 1 (age) those idle for idle_ms; the bytes discarded.
+ * nmb_device_purge_pending: the resources a later call may still discard. nmb_purge_age_ms: the age to pass (the runtime's spare
+ * block age). nmb_device_purge_counts, sixteen words: resources and bytes discarded by pressure, then by age; resources and bytes
+ * placed again by a NonVolatile request, then by another use; Empty answers for discarded contents; bytes discarded now; bytes that
+ * became Volatile or Empty so far and those of them never discardable (pointer or address handed out); the bytes the last call left
+ * because they were in use, tied to what was made of them, or not idle long enough; placements again that failed. */
+uint64_t nmb_device_purge(const NmbDevice *, uint32_t cause, uint64_t idle_ms);
+uint64_t nmb_device_purge_pending(const NmbDevice *);
+uint64_t nmb_purge_age_ms(void);
+bool nmb_device_purge_counts(const NmbDevice *, uint64_t out[16]);
 // Call stacks that allocated device memory of 4 MiB or more, most bytes first: records of twelve words (bytes, allocations, ten return
 // addresses); returns how many were written, at most max.
 size_t nmb_allocation_sites(uint64_t *out, size_t max);
@@ -108,9 +123,14 @@ NmbBuffer *nmb_buffer_new_no_copy(NmbDevice *, void *pointer, uint64_t length, u
 NmbBuffer *nmb_buffer_new_no_copy_releasing(NmbDevice *, void *pointer, uint64_t length, uint64_t options,
                                             void (*release)(void *context, void *pointer, uint64_t length), void *context);
 void nmb_buffer_release(NmbBuffer *);
+/* The CPU pointer and the GPU address are the buffer's for its life: once either is handed out the buffer is never discarded. */
 void *nmb_buffer_contents(const NmbBuffer *);
 uint64_t nmb_buffer_length(const NmbBuffer *);
 uint64_t nmb_buffer_gpu_address(const NmbBuffer *);
+/* A command buffer names the resource from the hold until the unhold (its completion, or its release without a commit): the
+ * resource is not discarded meanwhile. The hold comes before the command that names the resource is encoded. */
+void nmb_buffer_hold(const NmbBuffer *);
+void nmb_buffer_unhold(const NmbBuffer *);
 
 struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
@@ -139,9 +159,15 @@ NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescr
 NmbTexture *nmb_texture_new_linear(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, uint64_t bytes_per_image);
 /* whole: a view of every level and slice as format; else levels and slices are {start, count} and kind the view's texture type. */
 NmbTexture *nmb_texture_new_view(NmbTexture *, uint64_t format, uint64_t kind, const uint64_t levels[2], const uint64_t slices[2], bool whole);
-/* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. */
+/* setPurgeableState: with Metal's raw state; the answer's raw state, 0 where it fails. A discarded resource answers Empty: to
+ * NonVolatile after it is placed again, to a query and to Volatile without being placed. Bit 8 (NMB_PURGE_AGAIN_FAILED) is set where
+ * placing it again failed: the low byte is still Empty, the reason is nmb_last_error, and the next use tries again. The heap's
+ * nmb_heap_set_purgeable_state answers the same way. */
+#define NMB_PURGE_AGAIN_FAILED 0x100ull
 uint64_t nmb_texture_set_purgeable_state(const NmbTexture *, uint64_t state);
 uint64_t nmb_buffer_set_purgeable_state(const NmbBuffer *, uint64_t state);
+void nmb_texture_hold(const NmbTexture *);
+void nmb_texture_unhold(const NmbTexture *);
 uint64_t nmb_texture_allocated_size(const NmbTexture *);
 uint64_t nmb_device_current_allocated_size(const NmbDevice *);
 bool nmb_texture_make_aliasable(const NmbTexture *);

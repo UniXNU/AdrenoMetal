@@ -56,7 +56,7 @@ int main(int argc, char **argv) {
                 if (!line.compare(0, 3, "MK ") || !line.compare(0, 3, "ML ") || !line.compare(0, 3, "VP ") || !line.compare(0, 3, "TH ")) std::printf("%s\n", line.c_str());
                 begin = end + 1;
             }
-            for (const char *name : {"MEM", "MK", "MKb", "MKc", "ML", "PG", "PE", "PS", "T", "VP", "V", "SC", "PR", "TH", "P0", "S"}) {
+            for (const char *name : {"MEM", "MK", "MKb", "MKc", "ML", "PG", "PGb", "PGc", "PE", "PS", "T", "VP", "V", "SC", "PR", "TH", "P0", "S"}) {
                 const auto found = at.find(name);
                 if (found == at.end() || found->second >= 48) {std::printf("FAIL telemetry row %s missing from the first 48 rows\n", name);return 1;}
             }

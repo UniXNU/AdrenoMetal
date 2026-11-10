@@ -350,6 +350,10 @@ static id deviceForPort(unsigned port) {
         else unsetenv("SHENG_GPU_TRACE");
         // metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
         // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
+        // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
+        // same image. Read by the bridge as the device opens.
+        if (bootArgSet("gpu-purge=0")) setenv("NATIVE_METAL_PURGE", "0", 1);
+        else unsetenv("NATIVE_METAL_PURGE");
         if (bootArgSet("metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
         else if (bootArgSet("metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
         else unsetenv("NATIVE_METAL_FLOW");

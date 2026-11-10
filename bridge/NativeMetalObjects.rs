@@ -23,6 +23,7 @@ use metal2vulkan_runtime::{
     Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
     SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
+use crate::purge::{Cause, Purge, Resource};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-fn set_error(why: String) {
+pub(crate) fn set_error(why: String) {
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -156,7 +157,7 @@ pub unsafe extern "C" fn nmb_function_constant_air(length: *mut usize) -> *const
 
 // ---- device ----
 
-pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<NoCopyPages>);
+pub struct NmbDevice(Device, std::sync::OnceLock<PrivateProperties>, std::sync::Mutex<NoCopyPages>, std::sync::Arc<Purge>);
 
 impl NmbDevice {
     /// The runtime judges the private properties by the family rows once.
@@ -278,7 +279,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         if let Some(records) = records {
             device.warm(records.take_earlier(), u64::MAX);
         }
-        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default())))
+        let purge = Purge::new(&device);
+        Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default(), purge)))
     })
 }
 
@@ -575,6 +577,70 @@ pub extern "C" fn nmb_stage_ring_read(from: u64, out: *mut metal2vulkan_runtime:
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_release_kept_memory(device: *const NmbDevice) -> usize {
     guard(0, || Ok(get(device)?.0.release_kept_memory()))
+}
+
+/// Discard the device's resources that are Volatile or Empty and idle (NativeMetalPurge.rs): `cause` 0 for the system's memory
+/// pressure signal, which takes every such resource, 1 for the age timer, which takes those idle for `idle_ms`. The bytes discarded.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_purge(device: *const NmbDevice, cause: u32, idle_ms: u64) -> u64 {
+    guard(0, || {
+        let cause = match cause {
+            0 => Cause::Pressure,
+            1 => Cause::Age,
+            _ => return Err(format!("purge cause {cause}")),
+        };
+        Ok(get(device)?.3.sweep(cause, Duration::from_millis(idle_ms)))
+    })
+}
+
+/// How many of the device's resources a later sweep may still discard: Volatile or Empty with memory, in use or not idle long enough.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_purge_pending(device: *const NmbDevice) -> u64 {
+    guard(0, || Ok(get(device)?.3.pending() as u64))
+}
+
+/// The age an idle Volatile or Empty resource is discarded at, in milliseconds: the runtime's spare block age.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_purge_age_ms() -> u64 {
+    Purge::age().as_millis() as u64
+}
+
+/// What the device discarded and placed again, into the caller's sixteen words (`Purge::counts`).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_purge_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's sixteen words.
+        get(device)?.3.counts(unsafe { std::slice::from_raw_parts_mut(out, 16) });
+        Ok(true)
+    })
+}
+
+/// A command buffer names the buffer from now until `nmb_buffer_unhold`: it is not discarded meanwhile. Called before the command
+/// that names it is encoded.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_hold(buffer: *const NmbBuffer) {
+    guard((), || Ok(get(buffer)?.0.hold()))
+}
+
+/// The command buffer that held the buffer completed, or went without a commit.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_buffer_unhold(buffer: *const NmbBuffer) {
+    guard((), || Ok(get(buffer)?.0.unhold()))
+}
+
+/// `nmb_buffer_hold` for a texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_hold(texture: *const NmbTexture) {
+    guard((), || Ok(get(texture)?.0.hold()))
+}
+
+/// `nmb_buffer_unhold` for a texture.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_texture_unhold(texture: *const NmbTexture) {
+    guard((), || Ok(get(texture)?.0.unhold()))
 }
 
 /// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
@@ -878,23 +944,31 @@ pub extern "C" fn nmb_device_vendor_name(device: *const NmbDevice, out: *mut c_c
 
 // ---- buffers ----
 
-pub struct NmbBuffer(Buffer);
+/// A buffer: the runtime's, behind what keeps its purgeable state (NativeMetalPurge.rs), and whether it has a CPU pointer.
+pub struct NmbBuffer(Resource<Buffer>, bool);
+
+impl NmbBuffer {
+    fn of(buffer: Resource<Buffer>) -> Result<NmbBuffer, String> {
+        let cpu = buffer.live()?.contents().is_some();
+        Ok(NmbBuffer(buffer, cpu))
+    }
+}
 
 /// # Safety
 /// `bytes` is null or holds `length` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_buffer_new(device: *mut NmbDevice, length: u64, options_word: u64, bytes: *const c_void) -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
-        let device = &get(device)?.0;
+        let device = get(device)?;
         let options = options(options_word)?;
         let buffer = if bytes.is_null() {
-            device.new_buffer(length, options)
+            device.0.new_buffer(length, options)
         } else {
             // SAFETY: the caller's contract.
             let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length as usize) };
-            device.new_buffer_with_bytes(bytes, options)
+            device.0.new_buffer_with_bytes(bytes, options)
         };
-        Ok(boxed(NmbBuffer(buffer.map_err(e("buffer"))?)))
+        Ok(boxed(NmbBuffer::of(Resource::kept(&device.3, buffer.map_err(e("buffer"))?, (length, options)))?))
     })
 }
 
@@ -1071,7 +1145,7 @@ unsafe fn no_copy(device: *mut NmbDevice, pointer: *mut c_void, length: u64, opt
             }
             buffer
         };
-        Ok(boxed(NmbBuffer(buffer.map_err(e("no-copy buffer"))?)))
+        Ok(boxed(NmbBuffer::of(Resource::fixed(buffer.map_err(e("no-copy buffer"))?))?))
     })
 }
 
@@ -1082,34 +1156,47 @@ pub extern "C" fn nmb_buffer_release(buffer: *mut NmbBuffer) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_contents(buffer: *const NmbBuffer) -> *mut c_void {
-    guard(std::ptr::null_mut(), || Ok(get(buffer)?.0.contents().map_or(std::ptr::null_mut(), |p| p.as_ptr() as *mut c_void)))
+    guard(std::ptr::null_mut(), || {
+        let buffer = get(buffer)?;
+        // The pointer is the buffer's for its life, as Metal's is: one handed out keeps the buffer's memory where it is.
+        if buffer.1 {
+            buffer.0.pin();
+        }
+        Ok(buffer.0.live()?.contents().map_or(std::ptr::null_mut(), |p| p.as_ptr() as *mut c_void))
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_length(buffer: *const NmbBuffer) -> u64 {
-    guard(0, || Ok(get(buffer)?.0.length()))
+    guard(0, || Ok(get(buffer)?.0.bytes()))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_gpu_address(buffer: *const NmbBuffer) -> u64 {
-    guard(0, || Ok(get(buffer)?.0.gpu_address().0))
+    guard(0, || {
+        let buffer = &get(buffer)?.0;
+        // The address is the buffer's for its life too.
+        buffer.pin();
+        Ok(buffer.live()?.gpu_address().0)
+    })
 }
 
 // ---- heaps ----
 
-pub struct NmbHeap(Heap);
+pub struct NmbHeap(Resource<Heap>);
 
 /// `newHeapWithDescriptor:`: type (0 automatic, 1 placement), size, resource options. Sparse heaps are not made here.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new(device: *mut NmbDevice, heap_type: u64, size: u64, options_word: u64) -> *mut NmbHeap {
     guard(std::ptr::null_mut(), || {
-        let device = &get(device)?.0;
+        let device = get(device)?;
         let heap_type = HeapType::from_raw(heap_type).map_err(e("heap type"))?;
         if heap_type == HeapType::Sparse {
             return Err("sparse heaps are not implemented".into());
         }
-        let descriptor = HeapDescriptor::new(heap_type, size, options(options_word)?);
-        Ok(boxed(NmbHeap(device.new_heap(&descriptor).map_err(e("heap"))?)))
+        let options = options(options_word)?;
+        let heap = device.0.new_heap(&HeapDescriptor::new(heap_type, size, options)).map_err(e("heap"))?;
+        Ok(boxed(NmbHeap(Resource::kept(&device.3, heap, (heap_type, size, options)))))
     })
 }
 
@@ -1120,29 +1207,42 @@ pub extern "C" fn nmb_heap_release(heap: *mut NmbHeap) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_size(heap: *const NmbHeap) -> u64 {
-    guard(0, || Ok(get(heap)?.0.size()))
+    guard(0, || Ok(get(heap)?.0.bytes()))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_used_size(heap: *const NmbHeap) -> u64 {
-    guard(0, || Ok(get(heap)?.0.used_size()))
+    guard(0, || Ok(get(heap)?.0.peek().map_or(0, |heap| heap.used_size())))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_allocated_size(heap: *const NmbHeap) -> u64 {
-    guard(0, || Ok(get(heap)?.0.current_allocated_size()))
+    guard(0, || Ok(get(heap)?.0.bytes()))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_max_available_size(heap: *const NmbHeap, alignment: u64) -> u64 {
-    guard(0, || Ok(get(heap)?.0.max_available_size(alignment).map_err(e("heap available size"))?))
+    guard(0, || {
+        let heap = &get(heap)?.0;
+        if let Some(heap) = heap.peek() {
+            return heap.max_available_size(alignment).map_err(e("heap available size"));
+        }
+        // A discarded heap holds nothing (no resource placed in it lives): an empty heap's answer, placing nothing.
+        if alignment != 0 && !alignment.is_power_of_two() {
+            return Err(format!("heap available size: alignment {alignment} is not a power of two"));
+        }
+        Ok(match heap.recipe() {
+            Some((HeapType::Automatic, ..)) => heap.bytes(),
+            _ => 0,
+        })
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_set_purgeable_state(heap: *const NmbHeap, state: u64) -> u64 {
     guard(0, || {
         let state = PurgeableState::from_raw(state).map_err(e("purgeable state"))?;
-        Ok(get(heap)?.0.set_purgeable_state(state).map_err(e("heap purgeable state"))?.raw())
+        get(heap)?.0.set_state(state)
     })
 }
 
@@ -1150,10 +1250,11 @@ pub extern "C" fn nmb_heap_set_purgeable_state(heap: *const NmbHeap, state: u64)
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new_buffer(heap: *const NmbHeap, length: u64, options_word: u64, offset: u64) -> *mut NmbBuffer {
     guard(std::ptr::null_mut(), || {
-        let heap = &get(heap)?.0;
+        // The tie comes first: a heap that holds a resource is not discarded.
+        let (tie, heap) = (get(heap)?.0.tie(), get(heap)?.0.live()?);
         let options = options(options_word)?;
         let buffer = if offset == u64::MAX { heap.new_buffer(length, options) } else { heap.new_buffer_at_offset(length, options, offset) };
-        Ok(boxed(NmbBuffer(buffer.map_err(e("heap buffer"))?)))
+        Ok(boxed(NmbBuffer::of(Resource::tied(buffer.map_err(e("heap buffer"))?, tie))?))
     })
 }
 
@@ -1161,10 +1262,10 @@ pub extern "C" fn nmb_heap_new_buffer(heap: *const NmbHeap, length: u64, options
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_heap_new_texture(heap: *const NmbHeap, descriptor: *const NmbTextureDescriptor, offset: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
-        let heap = &get(heap)?.0;
+        let (tie, heap) = (get(heap)?.0.tie(), get(heap)?.0.live()?);
         let descriptor = texture_descriptor(descriptor)?;
         let texture = if offset == u64::MAX { heap.new_texture(&descriptor) } else { heap.new_texture_at_offset(&descriptor, offset) };
-        Ok(boxed(NmbTexture(texture.map_err(e("heap texture"))?)))
+        Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("heap texture"))?, tie))))
     })
 }
 
@@ -1220,7 +1321,7 @@ fn swizzle_of(packed: u64) -> Result<Option<TextureSwizzleChannels>, String> {
 fn swizzle_packed(s: TextureSwizzleChannels) -> u64 {
     (1u64 << 32) | s.red.as_raw() as u64 | (s.green.as_raw() as u64) << 8 | (s.blue.as_raw() as u64) << 16 | (s.alpha.as_raw() as u64) << 24
 }
-pub struct NmbTexture(Texture);
+pub struct NmbTexture(Resource<Texture>);
 
 fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescriptor, String> {
     let d = get(d)?;
@@ -1246,7 +1347,13 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
 pub extern "C" fn nmb_texture_new(device: *mut NmbDevice, descriptor: *const NmbTextureDescriptor) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
-        Ok(boxed(NmbTexture(get(device)?.0.new_texture(&descriptor).map_err(e("texture"))?)))
+        let device = get(device)?;
+        let texture = device.0.new_texture(&descriptor).map_err(e("texture"))?;
+        // A drawable's texture is the display's: never discarded.
+        Ok(boxed(NmbTexture(match descriptor.is_drawable {
+            true => Resource::fixed(texture),
+            false => Resource::kept(&device.3, texture, descriptor),
+        })))
     })
 }
 
@@ -1255,13 +1362,14 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
                                             bytes_per_row: u64, iosurface: bool) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
-        let buffer = &get(buffer)?.0;
+        // The tie comes first: a buffer with a texture over its bytes is not discarded.
+        let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
         let texture = if iosurface {
             buffer.new_texture_with_iosurface_plane(&descriptor, IoSurfacePlane::new(offset, bytes_per_row, false))
         } else {
             buffer.new_texture(&descriptor, offset, bytes_per_row)
         };
-        Ok(boxed(NmbTexture(texture.map_err(e("texture over buffer"))?)))
+        Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("texture over buffer"))?, tie))))
     })
 }
 
@@ -1274,13 +1382,13 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
                                              chroma_offset: u64, chroma_bytes_per_row: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
-        let buffer = &get(buffer)?.0;
+        let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
         let mut surface = IoSurfacePlane::new(offset, bytes_per_row, true);
         if chroma_bytes_per_row != 0 {
             surface = surface.with_ycbcr(IoSurfaceYCbCr::new(pixel_format, plane, [width, height], chroma_offset, chroma_bytes_per_row));
         }
         let texture = buffer.new_texture_with_iosurface_plane(&descriptor, surface);
-        Ok(boxed(NmbTexture(texture.map_err(e("texture over surface"))?)))
+        Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("texture over surface"))?, tie))))
     })
 }
 
@@ -1290,8 +1398,9 @@ pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *co
                                          bytes_per_image: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
-        let texture = get(buffer)?.0.new_linear_texture(&descriptor, offset, bytes_per_row, bytes_per_image);
-        Ok(boxed(NmbTexture(texture.map_err(e("linear texture"))?)))
+        let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
+        let texture = buffer.new_linear_texture(&descriptor, offset, bytes_per_row, bytes_per_image);
+        Ok(boxed(NmbTexture(Resource::tied(texture.map_err(e("linear texture"))?, tie))))
     })
 }
 
@@ -1300,7 +1409,8 @@ pub extern "C" fn nmb_texture_new_linear(buffer: *mut NmbBuffer, descriptor: *co
 pub extern "C" fn nmb_texture_new_view(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64, whole: bool)
                                        -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
-        let t = &get(texture)?.0;
+        // The tie comes first: a texture with a view of it is not discarded, since the view shares its memory.
+        let (tie, t) = (get(texture)?.0.tie(), get(texture)?.0.live()?);
         let format = raw::<PixelFormat>(format, "pixel format")?;
         let view = if whole {
             t.new_texture_view(format)
@@ -1313,16 +1423,17 @@ pub extern "C" fn nmb_texture_new_view(texture: *mut NmbTexture, format: u64, ki
             let ranges = (l[0]..l[0].checked_add(l[1]).ok_or("levels overflow")?, s[0]..s[0].checked_add(s[1]).ok_or("slices overflow")?);
             t.new_texture_view_with_levels_slices(format, raw::<TextureType>(kind, "texture type")?, ranges.0, ranges.1)
         };
-        Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
+        Ok(boxed(NmbTexture(Resource::tied(view.map_err(e("texture view"))?, tie))))
     })
 }
 
-/// `setPurgeableState:` on a texture: the runtime's answer as Metal's raw state, 0 where it fails.
+/// `setPurgeableState:` on a texture: the answer as Metal's raw state, 0 where it fails. Bit 8 is set where the texture's contents
+/// were discarded and placing it again failed: the answer's low byte is still Empty, and the reason is the last error.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_set_purgeable_state(texture: *const NmbTexture, state: u64) -> u64 {
     guard(0, || {
         let state = PurgeableState::from_raw(state).map_err(e("purgeable state"))?;
-        Ok(get(texture)?.0.set_purgeable_state(state).map_err(e("purgeable state"))?.raw())
+        get(texture)?.0.set_state(state)
     })
 }
 
@@ -1331,7 +1442,7 @@ pub extern "C" fn nmb_texture_set_purgeable_state(texture: *const NmbTexture, st
 pub extern "C" fn nmb_buffer_set_purgeable_state(buffer: *const NmbBuffer, state: u64) -> u64 {
     guard(0, || {
         let state = PurgeableState::from_raw(state).map_err(e("purgeable state"))?;
-        Ok(get(buffer)?.0.set_purgeable_state(state).map_err(e("purgeable state"))?.raw())
+        get(buffer)?.0.set_state(state)
     })
 }
 
@@ -1343,7 +1454,7 @@ pub extern "C" fn nmb_texture_release(texture: *mut NmbTexture) {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut NmbTextureDescriptor) {
     guard((), || {
-        let t = &get(texture)?.0;
+        let t = get(texture)?.0.live()?;
         let out = get_mut(out)?;
         *out = NmbTextureDescriptor {
             kind: t.texture_type().as_raw() as u64,
@@ -1394,7 +1505,7 @@ pub unsafe extern "C" fn nmb_texture_replace(texture: *mut NmbTexture, region_wo
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length as usize) };
-        get(texture)?.0.replace_region(region(region_words)?, level, slice, bytes, bytes_per_row, bytes_per_image)
+        get(texture)?.0.live()?.replace_region(region(region_words)?, level, slice, bytes, bytes_per_row, bytes_per_image)
             .map_err(e("replace region"))?;
         Ok(true)
     })
@@ -1411,7 +1522,7 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, length as usize) };
-        get(texture)?.0.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, level, slice)
+        get(texture)?.0.live()?.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, level, slice)
             .map_err(e("get bytes"))?;
         Ok(true)
     })
@@ -2273,7 +2384,8 @@ pub extern "C" fn nmb_command_buffer_release(command_buffer: *mut NmbCommandBuff
 pub extern "C" fn nmb_command_buffer_uses_buffer(command_buffer: *const NmbCommandBuffer, buffer: *const NmbBuffer) -> i32 {
     guard(-1, || {
         let used = get(command_buffer)?.0.used_resources();
-        Ok(i32::from(used.references_resource(get(buffer)?.0.as_resource())))
+        // A discarded buffer is in no command buffer's work: one that named it held it until it completed.
+        Ok(get(buffer)?.0.peek().map_or(0, |buffer| i32::from(used.references_resource(buffer.as_resource()))))
     })
 }
 
@@ -2281,7 +2393,7 @@ pub extern "C" fn nmb_command_buffer_uses_buffer(command_buffer: *const NmbComma
 pub extern "C" fn nmb_command_buffer_uses_texture(command_buffer: *const NmbCommandBuffer, texture: *const NmbTexture) -> i32 {
     guard(-1, || {
         let used = get(command_buffer)?.0.used_resources();
-        Ok(i32::from(used.references_resource(get(texture)?.0.as_resource())))
+        Ok(get(texture)?.0.peek().map_or(0, |texture| i32::from(used.references_resource(texture.as_resource()))))
     })
 }
 
@@ -2584,7 +2696,7 @@ pub struct NmbRenderPassDescriptor {
 }
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
-    if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.clone())) }
+    if a.texture.is_null() { Ok(None) } else { Ok(Some(get(a.texture)?.0.live()?.clone())) }
 }
 
 #[unsafe(no_mangle)]
@@ -2595,7 +2707,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         let mut pass = RenderPassDescriptor::new();
         for (slot, a) in pass.color_attachments.iter_mut().zip(d.colors.iter()) {
             slot.texture = texture_of(a)?;
-            slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.clone());
+            slot.resolve_texture = optional(a.resolve_texture)?.map(|t| t.0.live().map(|t| t.clone())).transpose()?;
             slot.resolve_level = a.resolve_level;
             slot.resolve_slice = a.resolve_slice;
             slot.resolve_depth_plane = a.resolve_depth_plane;
@@ -2608,7 +2720,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         }
         let depth = &mut pass.depth_attachment;
         depth.texture = texture_of(&d.depth)?;
-        depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.clone());
+        depth.resolve_texture = optional(d.depth.resolve_texture)?.map(|t| t.0.live().map(|t| t.clone())).transpose()?;
         depth.resolve_level = d.depth.resolve_level;
         depth.resolve_slice = d.depth.resolve_slice;
         depth.resolve_depth_plane = d.depth.resolve_depth_plane;
@@ -2621,7 +2733,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         depth.clear_depth = d.depth.clear[0];
         let stencil = &mut pass.stencil_attachment;
         stencil.texture = texture_of(&d.stencil)?;
-        stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.clone());
+        stencil.resolve_texture = optional(d.stencil.resolve_texture)?.map(|t| t.0.live().map(|t| t.clone())).transpose()?;
         stencil.resolve_level = d.stencil.resolve_level;
         stencil.resolve_slice = d.stencil.resolve_slice;
         stencil.resolve_depth_plane = d.stencil.resolve_depth_plane;
@@ -2637,7 +2749,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         pass.render_target_array_length = d.array_length;
         pass.default_raster_sample_count = d.samples;
         if !d.visibility.is_null() {
-            pass.visibility_result_buffer = Some(get(d.visibility)?.0.clone());
+            pass.visibility_result_buffer = Some(get(d.visibility)?.0.live()?.clone());
         }
         let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
         Ok(boxed(NmbEncoder::Render(encoder)))
@@ -2703,7 +2815,8 @@ fn bad_stage(stage: u32) -> String {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, buffer: *mut NmbBuffer, offset: u64, index: u32) -> bool {
     guard(false, || {
-        let buffer = optional(buffer)?.map(|b| &b.0);
+        let buffer = optional(buffer)?.map(|b| b.0.live()).transpose()?;
+        let buffer = buffer.as_deref();
         match (get_mut(encoder)?, stage) {
             (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer(buffer, offset, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_buffer(buffer, offset, index),
@@ -2754,7 +2867,8 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, texture: *mut NmbTexture, index: u32) -> bool {
     guard(false, || {
-        let texture = optional(texture)?.map(|t| &t.0);
+        let texture = optional(texture)?.map(|t| t.0.live()).transpose()?;
+        let texture = texture.as_deref();
         match (get_mut(encoder)?, stage) {
             (NmbEncoder::Compute(c), COMPUTE) => c.set_texture(texture, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_texture(texture, index),
@@ -2812,7 +2926,7 @@ pub extern "C" fn nmb_compute_dispatch(encoder: *mut NmbEncoder, size: *const u6
 pub extern "C" fn nmb_compute_dispatch_indirect(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, per_group: *const u64) -> bool {
     guard(false, || {
         let g = triple(per_group)?;
-        compute(encoder)?.dispatch_threadgroups_indirect(&get(buffer)?.0, offset, Size::new(g[0], g[1], g[2]))
+        compute(encoder)?.dispatch_threadgroups_indirect(&*get(buffer)?.0.live()?, offset, Size::new(g[0], g[1], g[2]))
             .map_err(e("indirect dispatch"))?;
         Ok(true)
     })
@@ -2934,7 +3048,7 @@ pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u
                                           offset: u64, instances: u32, base_vertex: i32, base_instance: u32) -> bool {
     guard(false, || {
         render(encoder)?.draw_indexed_primitives(raw::<PrimitiveType>(primitive, "primitive")?, count,
-                                                 raw::<IndexType>(index_type, "index type")?, &get(indices)?.0, offset, instances,
+                                                 raw::<IndexType>(index_type, "index type")?, &*get(indices)?.0.live()?, offset, instances,
                                                  base_vertex, base_instance).map_err(e("indexed draw"))?;
         Ok(true)
     })
@@ -2945,8 +3059,8 @@ pub extern "C" fn nmb_render_draw_indexed(encoder: *mut NmbEncoder, primitive: u
 pub extern "C" fn nmb_render_set_tessellation_factor_buffer(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, offset: u64, instance_stride: u64)
                                                             -> bool {
     guard(false, || {
-        let buffer = if buffer.is_null() { None } else { Some(&get(buffer)?.0) };
-        render(encoder)?.set_tessellation_factor_buffer(buffer, offset, instance_stride).map_err(e("tessellation factor buffer"))?;
+        let buffer = optional_buffer(buffer)?;
+        render(encoder)?.set_tessellation_factor_buffer(buffer.as_deref(), offset, instance_stride).map_err(e("tessellation factor buffer"))?;
         Ok(true)
     })
 }
@@ -2959,8 +3073,8 @@ pub extern "C" fn nmb_render_set_tessellation_factor_scale(encoder: *mut NmbEnco
     })
 }
 
-fn optional_buffer<'a>(buffer: *mut NmbBuffer) -> Result<Option<&'a Buffer>, String> {
-    if buffer.is_null() { Ok(None) } else { Ok(Some(&get(buffer)?.0)) }
+fn optional_buffer<'a>(buffer: *mut NmbBuffer) -> Result<Option<crate::purge::Live<'a, Buffer>>, String> {
+    if buffer.is_null() { Ok(None) } else { get(buffer)?.0.live().map(Some) }
 }
 
 /// The four patch draws: `indirect` null takes `patch_start`, `patch_count`, `instances` and `base_instance`, otherwise reads them from
@@ -2973,8 +3087,9 @@ pub extern "C" fn nmb_render_draw_patches(encoder: *mut NmbEncoder, control_poin
                                           indirect_offset: u64) -> bool {
     guard(false, || {
         let r = render(encoder)?;
-        let patch_index = optional_buffer(patch_index)?;
-        let result = match (optional_buffer(control_point_index)?, optional_buffer(indirect)?) {
+        let (patch_index, points, indirect) = (optional_buffer(patch_index)?, optional_buffer(control_point_index)?, optional_buffer(indirect)?);
+        let patch_index = patch_index.as_deref();
+        let result = match (points.as_deref(), indirect.as_deref()) {
             (None, None) => r.draw_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, instances, base_instance),
             (None, Some(indirect)) => r.draw_patches_indirect(control_points, patch_index, patch_index_offset, indirect, indirect_offset),
             (Some(points), None) => r.draw_indexed_patches(control_points, patch_start, patch_count, patch_index, patch_index_offset, points,
@@ -2991,7 +3106,7 @@ pub extern "C" fn nmb_render_draw_patches(encoder: *mut NmbEncoder, control_poin
 pub extern "C" fn nmb_blit_copy_buffer(encoder: *mut NmbEncoder, source: *mut NmbBuffer, source_offset: u64, destination: *mut NmbBuffer,
                                        destination_offset: u64, size: u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_buffer_to_buffer(&get(source)?.0, source_offset, &get(destination)?.0, destination_offset, size)
+        blit(encoder)?.copy_from_buffer_to_buffer(&*get(source)?.0.live()?, source_offset, &*get(destination)?.0.live()?, destination_offset, size)
             .map_err(e("buffer copy"))?;
         Ok(true)
     })
@@ -3000,7 +3115,7 @@ pub extern "C" fn nmb_blit_copy_buffer(encoder: *mut NmbEncoder, source: *mut Nm
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_blit_fill_buffer(encoder: *mut NmbEncoder, buffer: *mut NmbBuffer, start: u64, end: u64, value: u8) -> bool {
     guard(false, || {
-        blit(encoder)?.fill_buffer(&get(buffer)?.0, start..end, value).map_err(e("fill"))?;
+        blit(encoder)?.fill_buffer(&*get(buffer)?.0.live()?, start..end, value).map_err(e("fill"))?;
         Ok(true)
     })
 }
@@ -3021,8 +3136,8 @@ pub extern "C" fn nmb_blit_copy_texture(encoder: *mut NmbEncoder, source: *mut N
                                         source_origin: *const u64, extent: *const u64, destination: *mut NmbTexture,
                                         destination_slice: u64, destination_level: u64, destination_origin: *const u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_texture_to_texture(&get(source)?.0, source_slice, source_level, origin(source_origin)?, size(extent)?,
-                                                    &get(destination)?.0, destination_slice, destination_level,
+        blit(encoder)?.copy_from_texture_to_texture(&*get(source)?.0.live()?, source_slice, source_level, origin(source_origin)?, size(extent)?,
+                                                    &*get(destination)?.0.live()?, destination_slice, destination_level,
                                                     origin(destination_origin)?).map_err(e("texture copy"))?;
         Ok(true)
     })
@@ -3034,8 +3149,8 @@ pub extern "C" fn nmb_blit_buffer_to_texture(encoder: *mut NmbEncoder, source: *
                                              bytes_per_image: u64, extent: *const u64, destination: *mut NmbTexture, slice: u64,
                                              level: u64, destination_origin: *const u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_buffer_to_texture(&get(source)?.0, offset, bytes_per_row, bytes_per_image, size(extent)?,
-                                                   &get(destination)?.0, slice, level, origin(destination_origin)?, BlitOption::None)
+        blit(encoder)?.copy_from_buffer_to_texture(&*get(source)?.0.live()?, offset, bytes_per_row, bytes_per_image, size(extent)?,
+                                                   &*get(destination)?.0.live()?, slice, level, origin(destination_origin)?, BlitOption::None)
             .map_err(e("buffer to texture"))?;
         Ok(true)
     })
@@ -3047,8 +3162,8 @@ pub extern "C" fn nmb_blit_texture_to_buffer(encoder: *mut NmbEncoder, source: *
                                              source_origin: *const u64, extent: *const u64, destination: *mut NmbBuffer, offset: u64,
                                              bytes_per_row: u64, bytes_per_image: u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_texture_to_buffer(&get(source)?.0, slice, level, origin(source_origin)?, size(extent)?,
-                                                   &get(destination)?.0, offset, bytes_per_row, bytes_per_image, BlitOption::None)
+        blit(encoder)?.copy_from_texture_to_buffer(&*get(source)?.0.live()?, slice, level, origin(source_origin)?, size(extent)?,
+                                                   &*get(destination)?.0.live()?, offset, bytes_per_row, bytes_per_image, BlitOption::None)
             .map_err(e("texture to buffer"))?;
         Ok(true)
     })
@@ -3057,7 +3172,7 @@ pub extern "C" fn nmb_blit_texture_to_buffer(encoder: *mut NmbEncoder, source: *
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *mut NmbTexture) -> bool {
     guard(false, || {
-        blit(encoder)?.generate_mipmaps(&get(texture)?.0).map_err(e("mipmaps"))?;
+        blit(encoder)?.generate_mipmaps(&*get(texture)?.0.live()?).map_err(e("mipmaps"))?;
         Ok(true)
     })
 }
@@ -3066,7 +3181,7 @@ pub extern "C" fn nmb_blit_generate_mipmaps(encoder: *mut NmbEncoder, texture: *
 pub extern "C" fn nmb_texture_new_view_swizzle(texture: *mut NmbTexture, format: u64, kind: u64, levels: *const u64, slices: *const u64,
                                                swizzle: u64) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
-        let t = &get(texture)?.0;
+        let (tie, t) = (get(texture)?.0.tie(), get(texture)?.0.live()?);
         if levels.is_null() || slices.is_null() {
             return Err("null levels or slices".into());
         }
@@ -3076,34 +3191,34 @@ pub extern "C" fn nmb_texture_new_view_swizzle(texture: *mut NmbTexture, format:
         let channels = swizzle_of(swizzle)?.unwrap_or(TextureSwizzleChannels::DEFAULT);
         let view = t.new_texture_view_with_swizzle(raw::<PixelFormat>(format, "pixel format")?, raw::<TextureType>(kind, "texture type")?,
                                                    ranges.0, ranges.1, channels);
-        Ok(boxed(NmbTexture(view.map_err(e("texture view"))?)))
+        Ok(boxed(NmbTexture(Resource::tied(view.map_err(e("texture view"))?, tie))))
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_make_aliasable(texture: *const NmbTexture) -> bool {
     guard(false, || {
-        get(texture)?.0.make_aliasable().map_err(e("make aliasable"))?;
+        get(texture)?.0.live()?.make_aliasable().map_err(e("make aliasable"))?;
         Ok(true)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_is_aliasable(texture: *const NmbTexture) -> bool {
-    guard(false, || Ok(get(texture)?.0.is_aliasable()))
+    guard(false, || Ok(get(texture)?.0.live()?.is_aliasable()))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_make_aliasable(buffer: *const NmbBuffer) -> bool {
     guard(false, || {
-        get(buffer)?.0.make_aliasable().map_err(e("make aliasable"))?;
+        get(buffer)?.0.live()?.make_aliasable().map_err(e("make aliasable"))?;
         Ok(true)
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_buffer_is_aliasable(buffer: *const NmbBuffer) -> bool {
-    guard(false, || Ok(get(buffer)?.0.is_aliasable()))
+    guard(false, || Ok(get(buffer)?.0.live()?.is_aliasable()))
 }
 
 #[unsafe(no_mangle)]
@@ -3164,7 +3279,7 @@ pub extern "C" fn nmb_render_set_scissors(encoder: *mut NmbEncoder, values: *con
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_allocated_size(texture: *const NmbTexture) -> u64 {
-    guard(0, || Ok(get(texture)?.0.backing_allocation_size()))
+    guard(0, || Ok(get(texture)?.0.bytes()))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_current_allocated_size(device: *const NmbDevice) -> u64 {
