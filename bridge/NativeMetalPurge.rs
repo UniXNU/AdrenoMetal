@@ -302,6 +302,8 @@ pub struct Cell<T: Kind> {
     idle_ms: AtomicU64,
     /// It is in the device's list of candidates. Changed under `slot`'s lock.
     listed: AtomicBool,
+    /// It is discarded now: `slot`'s object is `None`, for a reader that takes no lock ([`Resource::hold`]).
+    out: AtomicBool,
     me: Weak<Cell<T>>,
 }
 
@@ -353,6 +355,7 @@ impl<T: Kind> Cell<T> {
                 counts.out_bytes.fetch_sub(self.bytes, Relaxed);
                 slot.object = Some(made);
                 slot.since = Instant::now();
+                self.out.store(false, SeqCst);
                 self.list();
                 return Ok(slot);
             }
@@ -448,6 +451,7 @@ impl<T: Kind> Candidate for Cell<T> {
         slot.since = now;
         slot.lost = true;
         self.listed.store(false, SeqCst);
+        self.out.store(true, SeqCst);
         drop(slot);
         // The runtime's release: the placement is returned once no batch in flight uses it.
         drop(object);
@@ -560,6 +564,7 @@ impl<T: Kind> Resource<T> {
             pinned: AtomicBool::new(false),
             idle_ms: AtomicU64::new(0),
             listed: AtomicBool::new(false),
+            out: AtomicBool::new(false),
             me: me.clone(),
         }))
     }
@@ -618,10 +623,15 @@ impl<T: Kind> Resource<T> {
     }
 
     /// A command buffer names the resource from now until [`unhold`](Self::unhold): it is not discarded meanwhile. Counted before
-    /// the command's own use reads the resource's object.
-    pub fn hold(&self) {
-        if let Resource::Kept(cell) = self {
-            cell.holds.fetch_add(1, SeqCst);
+    /// the command's own use reads the resource's object. Whether the resource is discarded now: the command's caller names it
+    /// without having set it NonVolatile, and the command's use will place it again, emptied.
+    pub fn hold(&self) -> bool {
+        match self {
+            Resource::Fixed(..) => false,
+            Resource::Kept(cell) => {
+                cell.holds.fetch_add(1, SeqCst);
+                cell.out.load(SeqCst)
+            }
         }
     }
 

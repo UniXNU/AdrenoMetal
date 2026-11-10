@@ -894,8 +894,8 @@ static void answerMissing(NSInvocation *invocation) {
 @interface NBObject : NSObject
 @property(atomic,copy) NSString *label;
 // A command buffer names the object from now on (YES) until it completed or went (NO): a buffer or a texture is not discarded
-// meanwhile (nmb_buffer_hold). Nothing for any other object.
-- (void)purgeHold:(BOOL)hold;
+// meanwhile (nmb_buffer_hold). YES where the object is discarded as the hold begins. Nothing for any other object.
+- (BOOL)purgeHold:(BOOL)hold;
 @end
 // What the caller asked of setPurgeableState: (MTLResource, MTLHeap), for the telemetry's PG row: how much memory the process has declared
 // discardable. [0..2] requests on buffers, textures, heaps; [3] bytes of the objects whose state is Volatile now, [4] of those whose
@@ -916,6 +916,43 @@ static void countPurgeable(uint8_t &counted,uint8_t slot,uint64_t bytes) {
  counted=slot;
 }
 static void armPurgeAge();
+// A command names a buffer or texture that is discarded: its caller did not set it NonVolatile first, which Metal's contract asks
+// for, and the command will find the resource placed again and emptied (what a purged resource shows on any GPU). Such a caller
+// shows wrong pixels wherever the system purges, and here whenever a resource stays Volatile and idle for the purge age, so the
+// first four distinct callers are kept with their call stacks, taken on the calling thread: for the telemetry's PU rows in the
+// render server, and one line each in the system log of any process with diag=1 or log-gpu=1.
+struct LateUse {uint64_t count;int depth;void *frames[10];};
+static std::mutex gLateUseLock;
+static LateUse gLateUses[4];
+static unsigned gLateUseSites;
+static std::atomic<uint64_t> gLateUseCount;
+// A return address as its image and offset, for a line that names a caller without symbols.
+static void lateUseFrame(const void *address,char *out,size_t size) {
+ Dl_info info={};
+ if(dladdr(address,&info) && info.dli_fbase) {
+  const char *name=info.dli_fname?strrchr(info.dli_fname,'/'):nullptr;
+  snprintf(out,size,"%.14s+%llx",name?name+1:"?",(unsigned long long)((uintptr_t)address-(uintptr_t)info.dli_fbase));
+ } else snprintf(out,size,"%llx",(unsigned long long)(uintptr_t)address);
+}
+__attribute__((noinline)) static void noteLateUse() {
+ gLateUseCount++;
+ void *stack[12];
+ const int depth=backtrace(stack,12);
+ // Without this function and the command buffer's own: : the frontend method that named the resource, then its callers.
+ const int skip=2,kept=std::max(0,std::min(depth-skip,10));
+ std::lock_guard<std::mutex> lock(gLateUseLock);
+ for(unsigned i=0;i<gLateUseSites;i++)
+  if(gLateUses[i].depth==kept && !memcmp(gLateUses[i].frames,stack+skip,sizeof(void *)*(size_t)kept)){gLateUses[i].count++;return;}
+ if(gLateUseSites==4)return;
+ LateUse &site=gLateUses[gLateUseSites++];
+ site.count=1;site.depth=kept;memcpy(site.frames,stack+skip,sizeof(void *)*(size_t)kept);
+ if(!diagOn() && !logGpuOn())return;
+ char text[10][32]={};
+ for(int f=0;f<kept;f++)lateUseFrame(site.frames[f],text[f],sizeof text[f]);
+ os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal late use: a command names a discarded resource whose caller did not set it NonVolatile | "
+  "%{public}s %{public}s %{public}s %{public}s %{public}s %{public}s %{public}s %{public}s",text[0],text[1],text[2],text[3],text[4],
+  text[5],text[6],text[7]);
+}
 // The bridge's answer to setPurgeableState: (0: the call failed) as Metal's, counted. `before` is the state before the call (the
 // state now for a query); the state after is the one asked, but Volatile asked of an Empty object leaves it Empty, as Metal does.
 static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeableState asked,uint64_t bytes,uint8_t &counted,const char *what) {
@@ -935,7 +972,7 @@ static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeabl
 
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
-- (void)purgeHold:(BOOL)hold {(void)hold;}
+- (BOOL)purgeHold:(BOOL)hold {(void)hold;return NO;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
  NSMethodSignature *signature=[super methodSignatureForSelector:selector];
  return signature?signature:missingSignature(self,selector);
@@ -1004,7 +1041,7 @@ static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(
  // A heap whose last resource went may be discarded now: the age timer runs again if the heap waits for it.
  if(_parentHeap)armPurgeAge();
 }
-- (void)purgeHold:(BOOL)hold {if(hold)nmb_buffer_hold(_handle);else nmb_buffer_unhold(_handle);}
+- (BOOL)purgeHold:(BOOL)hold {if(hold)return nmb_buffer_hold(_handle);nmb_buffer_unhold(_handle);return NO;}
 - (NSUInteger)length {return nmb_buffer_length(_handle);}
 - (void *)contents {return nmb_buffer_contents(_handle);}
 - (uint64_t)gpuAddress {return nmb_buffer_gpu_address(_handle);}
@@ -1268,7 +1305,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 @implementation NBTexture {
  uint8_t _purgeCounted;   // as NBBuffer's
 }
-- (void)purgeHold:(BOOL)hold {if(hold)nmb_texture_hold(_handle);else nmb_texture_unhold(_handle);}
+- (BOOL)purgeHold:(BOOL)hold {if(hold)return nmb_texture_hold(_handle);nmb_texture_unhold(_handle);return NO;}
 - (NSUInteger)allocatedSize {return nmb_texture_allocated_size(_handle);}
 - (BOOL)isAliasable {return nmb_texture_is_aliasable(_handle);}
 - (void)makeAliasable {if(!nmb_texture_make_aliasable(_handle))NBLOG(@"native-metal: texture makeAliasable: %@",lastError());}
@@ -2994,7 +3031,7 @@ static char kUserDictionaryKey;
 - (void)own:(id)resource {
  const NSUInteger before=_resourceOwners.count;
  [_resourceOwners addObject:resource];
- if(_resourceOwners.count!=before)[(NBObject *)resource purgeHold:YES];
+ if(_resourceOwners.count!=before && [(NBObject *)resource purgeHold:YES])noteLateUse();
 }
 // The resources go: the command buffer completed, was refused, or was released without a commit.
 - (void)disown {
@@ -5140,6 +5177,18 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (ull)(pg[5]>>20),(ull)(pg[7]>>20),(ull)pg[8]);
    row("PGc decl %lluM pin %lluM | left use %lluM tie %lluM young %lluM | fail %llu",(ull)(pg[10]>>20),(ull)(pg[11]>>20),
     (ull)(pg[12]>>20),(ull)(pg[13]>>20),(ull)(pg[14]>>20),(ull)pg[15]);
+  }
+  // Commands that named a discarded resource whose caller had not set it NonVolatile (noteLateUse): how many in all, then the first
+  // two distinct callers, each with its count and its return addresses as image+offset. No row while there was none.
+  if(gLateUseCount.load()) {
+   LateUse sites[2];unsigned n;
+   {std::lock_guard<std::mutex> lock(gLateUseLock);n=std::min(gLateUseSites,2u);memcpy(sites,gLateUses,sizeof(LateUse)*n);}
+   for(unsigned i=0;i<n;i++) {
+    char text[10][32]={};
+    for(int f=0;f<sites[i].depth;f++)lateUseFrame(sites[i].frames[f],text[f],sizeof text[f]);
+    row("PU%u all %llu n%llu %s %s %s",i,(ull)gLateUseCount.load(),(ull)sites[i].count,text[0],text[1],text[2]);
+    row("PU%ub %s %s %s %s",i,text[3],text[4],text[5],text[6]);
+   }
   }
   // The system's memory pressure events this process got (warnings, critical ones) and the blocks the runtime gave back at them;
   // then the surface imports held between frames and their MiB, which go back at such an event, and how often Turnip emptied its BO
