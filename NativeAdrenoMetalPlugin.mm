@@ -526,6 +526,7 @@ static id deviceForPort(unsigned port) {
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         pthread_create(&primer, &attributes, [](void *) -> void * {
+                pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
                            requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string());

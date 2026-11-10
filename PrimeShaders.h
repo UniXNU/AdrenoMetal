@@ -132,6 +132,15 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
 // it (int-250: 12 per 250 ms, 460 pipelines made during the swipes at a 48 ms median). With a fixed 120 Hz vsync the idle desktop draws 6
 // per 250 ms (i516), so the bar is 8: still under any animation, which draws 15 to 30. A desktop that never drops under it still gets one
 // pipeline every 10 s (i513-i515: priming sat at 15/162 for the whole run without making a pipeline). Returns the milliseconds it waited.
+// macOS's WindowServer composes only when something on screen changes: without input the whole system submitted nothing to the GPU in
+// a quarter of a run's two-second windows, and a desktop in use ran at 18 to 20 submissions a second, under the bar above, so priming
+// compiled through it (in four runs' process samples the priming thread was compiling or writing its progress in 88 to 94 % of the
+// samples, in two of them beside the encoding thread's draws). There any command buffer in the window is the render server at work.
+#if TARGET_OS_OSX
+static constexpr unsigned kQuietCommits = 0;
+#else
+static constexpr unsigned kQuietCommits = 8;
+#endif
 static uint64_t waitForQuiet() {
     const uint64_t began = nowMs();
     uint64_t quietSince = 0;
@@ -142,7 +151,7 @@ static uint64_t waitForQuiet() {
         const unsigned commits = native_bridge_metal_recent_commits(250000);
         if (commits > native_prime_rate) native_prime_rate = commits;
         if (now - began >= 10000) return now - began;
-        if (commits > 8) {busy = true; quietSince = 0; native_prime_compiling = 2;}
+        if (commits > kQuietCommits) {busy = true; quietSince = 0; native_prime_compiling = 2;}
         else if (!busy) return 0;
         else if (!quietSince) quietSince = now;
         // After animation, two seconds without it before the next compile, so a pause between two swipes does not let one in.
@@ -150,6 +159,35 @@ static uint64_t waitForQuiet() {
         usleep(100000);
     }
 }
+
+#if TARGET_OS_OSX
+// macOS: whether a library belongs to code loaded in this process. The render server runs as a system user (launchd starts
+// WindowServer with no user name) and the apps as the console user, each user's pipeline cache in a directory of its own that
+// another user's processes are refused (SharedShaderCache.h), so what the render server primes serves the render server alone.
+// A library is its bundle's: the nearest directory above it whose name has an extension (QuartzCore.framework, a .bundle, an
+// .app), which has an image loaded here when this process may ask for the library. Of the 400 libraries of a macOS 27 image, 57 are
+// of frameworks WindowServer loads; 165 are other GPUs' driver bundles, which nothing loads on this GPU. Paths compare without the
+// OS cryptex's prefix. Asked when priming reaches the library: one left out is not listed as finished, so a later start asks again.
+static bool libraryOfLoadedBundle(const std::string &path) {
+    static const char kCryptex[] = "/System/Cryptexes/OS";
+    auto plain = [](const char *text) {
+        return std::string(strncmp(text, kCryptex, sizeof kCryptex - 1) == 0 && text[sizeof kCryptex - 1] == '/' ? text + sizeof kCryptex - 1 : text);
+    };
+    std::string bundle = plain(path.c_str());
+    for (;;) {
+        const size_t slash = bundle.rfind('/');
+        if (slash == std::string::npos || slash == 0) return false;
+        bundle.resize(slash);
+        if (bundle.find('.', bundle.rfind('/') + 1) != std::string::npos) break;
+    }
+    bundle += '/';
+    for (uint32_t index = 0, count = _dyld_image_count(); index < count; ++index) {
+        const char *name = _dyld_get_image_name(index);
+        if (name && plain(name).compare(0, bundle.size(), bundle) == 0) return true;
+    }
+    return false;
+}
+#endif
 
 extern "C" const char *nmb_runtime_build(void);
 
@@ -326,7 +364,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     const std::string functionsPath = root + "/prime-fn";
     const std::set<std::string> functionsDone = readLines(functionsPath);
     const uint64_t began = nowMs();
-    unsigned libs = 0, finished = 0;
+    unsigned libs = 0, finished = 0, foreign = 0;
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
     const std::string build = buildId();
@@ -340,6 +378,10 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
         if (done.count(id)) {++finished; continue;}
+#if TARGET_OS_OSX
+        // Counted as done for the telemetry's progress, and not listed as finished (libraryOfLoadedBundle).
+        if (!libraryOfLoadedBundle(path)) {++foreign; ++finished; continue;}
+#endif
         appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build));
         appendLine(donePath, id);
         done.insert(id);
@@ -348,7 +390,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;
     char line[120];
-    snprintf(line, sizeof line, "pass libraries=%u finished=%u ms=%llu", libs, finished, (unsigned long long)(nowMs() - began));
+    snprintf(line, sizeof line, "pass libraries=%u finished=%u not-loaded=%u ms=%llu", libs, finished, foreign, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
 }
 }  // namespace prime
