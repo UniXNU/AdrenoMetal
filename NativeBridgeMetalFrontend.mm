@@ -4031,6 +4031,7 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 @end
 @interface NBDeviceMethods : NSObject
 @end
+static void fillBaseLimits(id device);
 @implementation NBDeviceMethods
 - (NSString *)name {return gName;}
 // MPSCore reads the GPU core count of every Apple GPU family (no count: no MPS device, and its image cache is nil); the Adreno's
@@ -4073,7 +4074,9 @@ static bool pipelineArchives(NSArray *list,std::vector<NmbBinaryArchive *> &arch
 // and feature tables from a hardware profile (`featureProfile`, `indirectArgumentBufferCapabilities`, a table of Apple GPUs) that this device
 // has not got: running them would claim an Apple GPU's capabilities. They are empty here, so a limit or feature the runtime measured is answered
 // by this file's own answers (installAnswers) and any other stays the base class's neutral 0/NO. Nothing is claimed that nothing measured.
-- (void)initLimits {}
+// The limits are the exception to "empty": some system code reads the base class's limits structure itself instead of asking the getters
+// (fillBaseLimits below), so the measured answers are written into it.
+- (void)initLimits {fillBaseLimits(self);}
 - (void)initFeatureQueries {}
 - (void)initGPUFamilySupport {}
 - (void)initWorkarounds {}
@@ -4546,6 +4549,63 @@ static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
   if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
  }
  return gFamilyAnswer(self,_cmd,family);
+}
+// The base class keeps its limits in one plain structure inside the device object ([device limits] returns its address) and its own getters
+// read their fields from it. This device answers the getters itself, but macOS's IconRendering reads the 2D texture bounds from the structure:
+// finding 0 x 0 it treated every icon texture as too large ("Attempting to create too large MTLTexture (max: 0x0)"), and iconservicesagent
+// grew to 450 MB within seconds, was killed for it and started again, without end (sheng macOS run49).
+// The original initLimits fills the structure from an Apple GPU table. Here every field a base getter reads gets the answer this device
+// gives for the same selector: the field is found by writing a marker into the structure and calling the base class's getter, so no
+// offset of any OS version is assumed. A selector whose base getter does not read one field of it is left alone; fields without an answer stay 0.
+static void fillBaseLimits(id device) {
+ Class base=objc_getClass("_MTLDevice");
+ SEL limitsSel=sel_registerName("limits");
+ if(!base || !device || ![device isKindOfClass:base] || !class_getInstanceMethod(base,limitsSel))return;
+ uint8_t *limits=((uint8_t *(*)(id,SEL))objc_msgSend)(device,limitsSel);
+ const ptrdiff_t at=limits-(uint8_t *)(__bridge void *)device;
+ const ptrdiff_t instance=(ptrdiff_t)class_getInstanceSize(base);
+ if(!limits || at<=0 || at>=instance)return;
+ // The structure ends where the next instance variable of the base class begins.
+ ptrdiff_t end=instance;bool found=false;
+ unsigned count=0;Ivar *ivars=class_copyIvarList(base,&count);
+ for(unsigned i=0;i<count;i++) {
+  const ptrdiff_t offset=ivar_getOffset(ivars[i]);
+  if(offset==at)found=true;
+  else if(offset>at && offset<end)end=offset;
+ }
+ free(ivars);
+ if(!found || end-at<8)return;
+ const size_t size=(size_t)(end-at);
+ unsigned filled=0;
+ for(const auto &answer:gAnswers) {
+  const char *name=sel_getName(answer.first);
+  if(strncmp(name,"max",3) && strncmp(name,"min",3))continue;
+  Method own=class_getInstanceMethod(object_getClass(device),answer.first),original=class_getInstanceMethod(base,answer.first);
+  if(!own || !original || method_getTypeEncoding(own)[0]!='Q' || method_getNumberOfArguments(original)!=2)continue;
+  NSUInteger (*getter)(id,SEL)=(NSUInteger (*)(id,SEL))method_getImplementation(original);
+  for(size_t offset=0;offset+4<=size;offset+=4) {
+   uint32_t saved;memcpy(&saved,limits+offset,4);
+   const uint32_t marker=0x5a17c000u|(uint32_t)(offset&0xfff);
+   memcpy(limits+offset,&marker,4);
+   const NSUInteger seen=getter(device,answer.first);
+   memcpy(limits+offset,&saved,4);
+   if((uint32_t)seen!=marker || (seen>>32)!=0)continue;
+   // A 64-bit field also reads the next four bytes.
+   bool wide=false;
+   if(offset+8<=size) {
+    uint32_t next,one=1;memcpy(&next,limits+offset+4,4);
+    memcpy(limits+offset,&marker,4);memcpy(limits+offset+4,&one,4);
+    wide=(getter(device,answer.first)>>32)==1;
+    memcpy(limits+offset,&saved,4);memcpy(limits+offset+4,&next,4);
+   }
+   const uint64_t value=answer.second;
+   if(wide)memcpy(limits+offset,&value,8);
+   else {const uint32_t narrow=value>UINT32_MAX?UINT32_MAX:(uint32_t)value;memcpy(limits+offset,&narrow,4);}
+   ++filled;
+   break;
+  }
+ }
+ NBLOG(@"native-metal: base limits: %u fields of %zu bytes filled from the device's answers",filled,size);
 }
 static void installAnswers(Class cls) {
  uint32_t kind=0;
