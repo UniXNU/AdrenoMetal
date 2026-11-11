@@ -317,10 +317,7 @@ static id deviceForPort(unsigned port) {
         if (tried) return device;
         tried = true;
         exceptiondiag::start(); // the throw site of an uncaught exception, for the kernel's THROW row (ExceptionDiag.h)
-        // No concurrent binning in any Metal process: with it BV ran ahead of BR and the two stopped waiting on each other inside a pass
-        // (int-261p, int-262, and in system memory int-265). Without it Turnip's autotune picks tile memory (GMEM) or system memory per
-        // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
-        // runtime keeps within a texture's rows (bridge patch 0016).
+        // /private/var/ngpu/tu_debug, when present, holds TU_DEBUG for every Metal process (the boot argument tu-debug= comes after it).
         if (FILE *flags = fopen("/private/var/ngpu/tu_debug", "r")) {
             char line[128] = {};
             if (fgets(line, sizeof line, flags)) {line[strcspn(line, "\n")] = 0; setenv("TU_DEBUG", line, 1);}
@@ -336,6 +333,13 @@ static id deviceForPort(unsigned port) {
                     strlcpy(value, at + strlen("tu-debug="), sizeof value);
                     value[strcspn(value, " ")] = 0;
                     setenv("TU_DEBUG", value, 1);
+                    // Turnip's log (what perf and the other flags print) goes to the system log and to a file of this process beside
+                    // the frame trace: a daemon's stderr goes nowhere, and the system log keeps warnings and errors only.
+                    setenv("MESA_LOG", "file,syslog", 0);
+                    char log[96];
+                    mkdir("/private/var/tmp/NativeAdrenoMetal.trace", 0755);
+                    snprintf(log, sizeof log, "/private/var/tmp/NativeAdrenoMetal.trace/mesa-%s-%d.log", getprogname(), (int)getpid());
+                    setenv("MESA_LOG_FILE", log, 0);
                 }
         }
         // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
