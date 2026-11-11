@@ -36,6 +36,15 @@ thread_local! {
 }
 
 pub(crate) fn set_error(why: String) {
+    // A refusal on a lost device names the place in the runtime that first recorded the loss.
+    let why = match metal2vulkan_runtime::Device::lost_at() {
+        // The place within the runtime's sources, not the build tree's path before them.
+        Some((file, line)) if why.contains("DeviceLost") => {
+            let file = file.rfind("/src/").map_or(file, |at| &file[at + 5..]);
+            format!("{why} (lost at {file}:{line})")
+        }
+        _ => why,
+    };
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -968,7 +977,7 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         }
         "supportsYCBCRFormats12" => format_supported(PixelFormat::YCBCR124202P) as u64,
         "supportsYCBCRPackedFormats12" => format_supported(PixelFormat::YCBCR124202PPACKED) as u64,
-        "minimumLinearTextureAlignmentForPixelFormat:" => p
+        "minimumLinearTextureAlignmentForPixelFormat:" => d
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(arg, "pixel format")?)
             .map_err(e("minimum linear texture alignment"))?,
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
@@ -1008,7 +1017,6 @@ pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, form
     guard(0, || {
         let d = &get(device)?.0;
         let alignment = d
-            .properties()
             .minimum_linear_texture_alignment_for_pixel_format(raw::<PixelFormat>(format, "pixel format")?)
             .map_err(e("linear texture"))?;
         let info = d.pixel_format_info(format);
