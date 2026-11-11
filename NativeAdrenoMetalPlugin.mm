@@ -367,6 +367,9 @@ static id deviceForPort(unsigned port) {
         // for a comparison on the same image. Read by the bridge at the first such texture.
         if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
         else unsetenv("NATIVE_METAL_YCBCR_PLANES");
+        // Turnip compiles inside vkCreate*Pipelines on the calling thread: the runtime makes the call there instead of on a thread it
+        // starts for it (its relay exists for a driver whose compiler service takes the asking thread's class).
+        setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
         {
             // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
             char args[1100] = {}, flow[16] = "";
