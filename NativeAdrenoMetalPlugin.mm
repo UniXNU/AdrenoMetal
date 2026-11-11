@@ -359,9 +359,18 @@ static id deviceForPort(unsigned port) {
         // for a comparison on the same image. Read by the bridge at the first such texture.
         if (bootArgSet("gpu-ycbcr-planes=0")) setenv("NATIVE_METAL_YCBCR_PLANES", "0", 1);
         else unsetenv("NATIVE_METAL_YCBCR_PLANES");
-        if (bootArgSet("metal-flow=0")) setenv("NATIVE_METAL_FLOW", "0", 1);
-        else if (bootArgSet("metal-flow=1")) setenv("NATIVE_METAL_FLOW", "1", 1);
-        else unsetenv("NATIVE_METAL_FLOW");
+        {
+            // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
+            char args[1100] = {}, flow[16] = "";
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "metal-flow=")) {
+                    strlcpy(flow, at + strlen("metal-flow="), sizeof flow);
+                    flow[strcspn(flow, " ")] = 0;
+                }
+            if (flow[0]) setenv("NATIVE_METAL_FLOW", flow, 1);
+            else unsetenv("NATIVE_METAL_FLOW");
+        }
         if (bootArgSet("wallpaper-freeze=1")) setenv("NATIVE_METAL_FREEZE_WALLPAPER", "1", 1);
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
