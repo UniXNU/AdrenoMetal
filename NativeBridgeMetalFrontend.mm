@@ -354,7 +354,11 @@ static void traceStartWriter() {
  std::thread([]{
   pthread_setname_np("frame-trace");
   int fd=-1;
-  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace"};
+  // The render server's trace file: backboardd's cache on iPadOS; on macOS a directory of its own under /private/var/tmp, which
+  // WindowServer may write (its shader cache lies beside it).
+  static const char *const paths[]={"/private/var/mobile/Library/Caches/com.apple.backboardd/m2v/frames.trace","/private/var/root/Library/Caches/com.apple.backboardd/m2v/frames.trace",
+   "/private/var/tmp/NativeAdrenoMetal.trace/frames.trace"};
+  mkdir("/private/var/tmp/NativeAdrenoMetal.trace",0755);
   uint32_t written=0;
   struct PassRec {uint64_t ns;uint32_t seq;uint16_t width,height;uint8_t mode,colors,flags,swap;uint16_t draws,format;uint32_t kpx;uint64_t gpuBegin,gpuEnd;uint16_t fsInstrs,fsTex,fsSy,fsSs;int8_t fsWaves,fsRegs;uint8_t samples,ds;uint32_t bandwidth,verts,fsHash;};
   struct SubRec {uint64_t ns;uint32_t seq,fence,syncWaitUs,callUs,spaceWaitUs;uint16_t busy;uint8_t chunks,buffers;};
@@ -467,6 +471,9 @@ static void traceStartWriter() {
     if(write(fd,&gTrace[written%16384],n*sizeof(TraceRec))<0)break;
     written+=n;fileBytes+=n*sizeof(TraceRec);
    }
+   // A test boot ends in a reset, not a shutdown: what was written reaches the disk every two seconds at the latest.
+   static uint64_t syncedBytes=0;static uint32_t turns=0;
+   if(++turns%8==0 && syncedBytes!=fileBytes){fsync(fd);syncedBytes=fileBytes;}
   }
  }).detach();
 }
