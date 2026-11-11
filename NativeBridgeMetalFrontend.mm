@@ -168,6 +168,10 @@ static std::atomic<uint64_t> gCommits,gCommitFailures,gPipelines,gProblems,gComp
 // What the render server actually asks of the GPU (int-141: 59 commits in 200 s, and a desktop that behaves like CPU compositing): render passes,
 // draws, the pixels of their first colour attachment, compute dispatches, blits and the largest pass (pixels).
 static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBiggestPass,gFullScreenPasses;
+// What the screen-size passes (2 Mpx and up) could draw on, for the SA row: how many ended, of them those whose draws' scissors reach
+// 90 % of the target and those that drew nothing, and the pixels of the targets and of the scissors' bounding boxes. A bound from above:
+// a draw may cover less than its scissor, and a pass that never sets one counts whole.
+static std::atomic<uint64_t> gBigPassesEnded,gBigPassesWhole,gBigPassesEmpty,gBigPassTargetPixels,gBigPassScissorPixels;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
 static uint64_t nowUs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000;}
@@ -2560,10 +2564,41 @@ static uint64_t encodeCommandOf(id object) {
 - (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
-@interface NBRenderEncoder : NBEncoder
+@interface NBRenderEncoder : NBEncoder {
+ @public
+ // The pass's target size, its current scissor (x0, y0, x1, y1; the whole target until set) and the bounding box of the scissors its
+ // draws ran under (empty until a draw), for the SA row.
+ uint32_t _targetW,_targetH,_scissor[4],_drawn[4];
+}
 @property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
 @end
 @implementation NBRenderEncoder
+- (void)noteDrawArea {
+ if(!_targetW)return;
+ if(_drawn[2]<=_drawn[0] || _drawn[3]<=_drawn[1]){memcpy(_drawn,_scissor,sizeof _drawn);return;}
+ _drawn[0]=std::min(_drawn[0],_scissor[0]);_drawn[1]=std::min(_drawn[1],_scissor[1]);
+ _drawn[2]=std::max(_drawn[2],_scissor[2]);_drawn[3]=std::max(_drawn[3],_scissor[3]);
+}
+- (void)noteScissor:(const MTLScissorRect *)r count:(NSUInteger)count {
+ if(!_targetW)return;
+ uint32_t box[4]={UINT32_MAX,UINT32_MAX,0,0};
+ for(NSUInteger i=0;i<count;i++) {
+  const uint64_t x1=std::min<uint64_t>(r[i].x+r[i].width,_targetW),y1=std::min<uint64_t>(r[i].y+r[i].height,_targetH);
+  box[0]=std::min<uint32_t>(box[0],(uint32_t)std::min<uint64_t>(r[i].x,_targetW));box[1]=std::min<uint32_t>(box[1],(uint32_t)std::min<uint64_t>(r[i].y,_targetH));
+  box[2]=std::max<uint32_t>(box[2],(uint32_t)x1);box[3]=std::max<uint32_t>(box[3],(uint32_t)y1);
+ }
+ memcpy(_scissor,box,sizeof _scissor);
+}
+- (void)endEncoding {
+ if(_targetW) {
+  const uint64_t target=(uint64_t)_targetW*_targetH;
+  const uint64_t drawn=_drawn[2]>_drawn[0] && _drawn[3]>_drawn[1]?(uint64_t)(_drawn[2]-_drawn[0])*(_drawn[3]-_drawn[1]):0;
+  gBigPassesEnded++;gBigPassTargetPixels+=target;gBigPassScissorPixels+=drawn;
+  if(!drawn)gBigPassesEmpty++;else if(drawn*10>=target*9)gBigPassesWhole++;
+  _targetW=0;
+ }
+ [super endEncoding];
+}
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
  if(dumpRange().first)self.dumpPipeline=state;
@@ -2625,12 +2660,14 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)setScissorRects:(const MTLScissorRect *)r count:(NSUInteger)count {
  if(!r || !count || count>16){[self.commandBuffer refuse:@"invalid scissor array"];return;}
+ [self noteScissor:r count:count];
  std::vector<uint64_t> values;values.reserve(count*4);
  for(NSUInteger i=0;i<count;i++)values.insert(values.end(),{r[i].x,r[i].y,r[i].width,r[i].height});
  ENCODE([self check:nmb_render_set_scissors(self.handle,values.data(),count) what:"setScissorRects"]);
 }
 - (void)setScissorRect:(MTLScissorRect)r {
  const std::array<uint64_t,4> values={r.x,r.y,r.width,r.height};
+ [self noteScissor:&r count:1];
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1))dumpLine(self.commandBuffer,[NSString stringWithFormat:@"pass %u scissor %lu,%lu %lux%lu",self.commandBuffer.dumpPasses,
                                                  (unsigned long)r.x,(unsigned long)r.y,(unsigned long)r.width,(unsigned long)r.height]);
  if(gDrawStats)[self noteState:kDSViewport key:1 object:nullptr value:hashBytes(values.data(),sizeof values)];
@@ -2689,7 +2726,7 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)n instanceCount:(NSUInteger)i baseInstance:(NSUInteger)b {
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];[self noteDrawArea];
  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"prim %lu start %lu count %lu instances %lu base %lu",(unsigned long)t,(unsigned long)s,(unsigned long)n,
                  (unsigned long)i,(unsigned long)b]];
  ENCODE([self check:nmb_render_draw(self.handle,t,(uint32_t)s,(uint32_t)n,(uint32_t)i,(uint32_t)b) what:"drawPrimitives"]);
@@ -2705,7 +2742,7 @@ static uint64_t encodeCommandOf(id object) {
  if(![(id)b isKindOfClass:[NBBuffer class]]){[self.commandBuffer refuse:@"foreign index buffer"];return;}
  [self.commandBuffer own:b];
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];[self noteDrawArea];
  if(dumpMaybe(self.commandBuffer) && dumpShown(self.dumpDraws+1)) {
   const uint8_t *indices=(const uint8_t *)b.contents;const unsigned size=k==MTLIndexTypeUInt16?2:4;
   NSMutableString *first=[NSMutableString string];
@@ -2743,7 +2780,7 @@ static uint64_t encodeCommandOf(id object) {
           points:(id<MTLBuffer>)ci offset:(NSUInteger)co instances:(NSUInteger)instances base:(NSUInteger)base indirect:(id<MTLBuffer>)ib offset:(NSUInteger)io {
  if(![self own:pi what:@"patch index buffer"] || ![self own:ci what:@"control point index buffer"] || ![self own:ib what:@"indirect buffer"])return;
  if([self skipDraw])return;
- gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];
+ gDraws++;self.commandBuffer->encodedWork.draws++;if(gDrawStats)[self noteDraw];[self noteDrawArea];
  if(dumpMaybe(self.commandBuffer))[self dumpDraw:[NSString stringWithFormat:@"patches %lu start %lu count %lu instances %lu base %lu%@",(unsigned long)points,(unsigned long)start,
                  (unsigned long)count,(unsigned long)instances,(unsigned long)base,ib?@" indirect":@""]];
  ENCODE([self check:nmb_render_draw_patches(self.handle,(uint32_t)points,(uint32_t)start,(uint32_t)count,pi?[(NBBuffer *)pi handle]:nullptr,po,
@@ -3262,6 +3299,11 @@ static char kUserDictionaryKey;
   ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
   id<MTLTexture> t0=d.colorAttachments[0].texture;
   const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
+  if(big) {
+   NBRenderEncoder *encoder=(NBRenderEncoder *)made;
+   encoder->_targetW=(uint32_t)t0.width;encoder->_targetH=(uint32_t)t0.height;
+   encoder->_scissor[0]=encoder->_scissor[1]=0;encoder->_scissor[2]=encoder->_targetW;encoder->_scissor[3]=encoder->_targetH;
+  }
   ((NBRenderEncoder *)made).passKey=(t0?(uint64_t)t0.pixelFormat:0)|((uint64_t)d.colorAttachments[0].loadAction<<16)|
    (uint64_t)([(id)t0 isKindOfClass:[NBTexture class]] && ((NBTexture *)t0).surface?1:0)<<18|big<<19;
  }
@@ -5381,6 +5423,10 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (ull)gCompleted.load(),(ull)gPipelines.load(),(ull)gProblems.load(),(ull)gPasses.load(),
   (ull)gDraws.load(),(ull)gFullScreenPasses.load(),(ull)(gBiggestPass.load()>>10),
   (ull)gDispatches.load(),(ull)gBlits.load());
+ // The screen-size passes that ended: how many, those whose draws' scissors reach 90 % of the target, those that drew nothing; then the
+ // targets' megapixels and the megapixels inside the draws' scissors (a bound from above on what the passes drew on).
+ row("SA big %llu whole %llu empty %llu | target %lluM scissors %lluM",(ull)gBigPassesEnded.load(),(ull)gBigPassesWhole.load(),
+  (ull)gBigPassesEmpty.load(),(ull)(gBigPassTargetPixels.load()/1000000),(ull)(gBigPassScissorPixels.load()/1000000));
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(ull)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
   ms(gTimeEncodeToCommit.slowest.load()),(ull)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
  for(int k=0;k<3;k++) {
