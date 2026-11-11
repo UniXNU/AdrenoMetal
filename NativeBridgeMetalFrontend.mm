@@ -22,6 +22,7 @@
 #include <atomic>
 #include <optional>
 #include <mutex>
+#include <set>
 #include <pthread.h>
 #include <functional>
 #include <string>
@@ -907,6 +908,9 @@ static void journal(const std::string &line) {
  std::lock_guard<std::mutex> lock(gJournalLock);
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
 }
+ // A test boot ends in a reset: every 32 lines the file is synced to disk.
+ static uint32_t lines=0;
+ if(++lines%32==0){const int fd=open(gJournalPath.c_str(),O_RDONLY);if(fd>=0){fsync(fd);close(fd);}}
 
 // A selector this file lacks (iPadOS 27's QuartzCore sends setResponsibleTaskIDs:count: to every command buffer, which 17 never did): answered
 // once as a no-op returning nil/0, and noted once, instead of the NSInvalidArgumentException that ended the render server. respondsToSelector:
@@ -4713,6 +4717,23 @@ static void reportUnreadableLibrary(NSString *path) {
  NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
  id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
  handler(state,reflection,error);
+ // With diagnostics on: which Metal functions the program Turnip just built for this pipeline belongs to (tu_darwin_last_program gives
+ // the vertex and fragment shader hashes of the last program this thread built; the pass records of the frame trace name a pass's
+ // heaviest fragment shader by the same hash). One line per fragment hash, at most 512.
+ if(handle && diagOn()) {
+  static void (*lastProgram)(uint32_t *,uint32_t *)=nullptr;static std::atomic<bool> looked{false};
+  if(!looked.load() && !gLoaderPath.empty()) {
+   if(void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD)){lastProgram=(void (*)(uint32_t *,uint32_t *))dlsym(turnip,"tu_darwin_last_program");looked.store(true);}
+  }
+  uint32_t vs=0,fs=0;
+  if(lastProgram)lastProgram(&vs,&fs);
+  if(fs) {
+   static std::mutex seenLock;static std::set<uint32_t> seen;
+   bool fresh=false;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<512 && seen.insert(fs).second;}
+   if(fresh)os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal shader fs %{public}08x vs %{public}08x | frag %{public}@ vert %{public}@ | %llu us",fs,vs,
+                   d.fragmentFunction.name,d.vertexFunction.name,(unsigned long long)(nowUs()-pipelineBegan));
+  }
+ }
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
@@ -5000,7 +5021,14 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
   os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal cache: %{public}s uid %d system %{public}s %{public}s",cache?cache:"none",(int)getuid(),
    kStates[gSystemCacheState],gSystemCacheText.c_str());
  }
- if(cache && logGpuOn()){gJournalPath=std::string(cache)+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();}
+ if(cache && logGpuOn()) {
+  // The render server's journal lies beside its frame trace where that directory exists (macOS: the test run reads it back from there).
+  std::string directory=cache;
+  if(nativeIsRenderServer() && (mkdir("/private/var/tmp/NativeAdrenoMetal.trace",0755)==0 || errno==EEXIST) &&
+     access("/private/var/tmp/NativeAdrenoMetal.trace",W_OK)==0)directory="/private/var/tmp/NativeAdrenoMetal.trace";
+  gJournalPath=directory+"/pipelines-"+std::to_string(getpid())+".log";gJournalBegan=nowUs();
+  if(directory!=cache)unlink(gJournalPath.c_str());   // one boot's journal: the render server has the same pid at every boot
+ }
  char name[128]={};nmb_device_name(gDevice,name,sizeof name);gName=[NSString stringWithUTF8String:name];gRegistryID=registryID;
  // The target families supportsFamily: answers true, with the rows of Apple's tables the device does not meet in them (nmb_device_family_waivers).
  {char waived[4096]={};nmb_device_family_waivers(gDevice,waived,sizeof waived);
