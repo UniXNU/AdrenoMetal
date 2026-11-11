@@ -189,35 +189,6 @@ static void *streamTelemetry(void *arg) {
     }
     return nullptr;
 }
-// log-gpu=1 in a client process: where its GPU memory is, every 20 s while it has any, to the system log (the MEM, MK, MKb, MKc, ML
-// PG and RM rows of the telemetry table: the runtime's pooled, empty, spare and dedicated blocks, what was declared discardable and
-// how many passes rendered in tile memory).
-// A row that reads as it did last time is not logged again.
-static void *reportClientMemory(void *) {
-    pthread_setname_np("native-metal-memory");
-    pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-    static char table[8192], last[8][96];
-    for (;;) {
-        sleep(20);
-        native_bridge_metal_telemetry(table, sizeof table);
-        unsigned kept = 0;
-        for (char *line = table; *line && kept < 8;) {
-            char *end = strchr(line, '\n');
-            if (end) *end = 0;
-            if (!strncmp(line, "MEM ", 4) || !strncmp(line, "MK", 2) || !strncmp(line, "ML ", 3) || !strncmp(line, "PG ", 3) ||
-                !strncmp(line, "RM ", 3)) {
-                if (strncmp(last[kept], line, sizeof last[kept] - 1)) {
-                    strlcpy(last[kept], line, sizeof last[kept]);
-                    os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal memory: %{public}s", line);
-                }
-                ++kept;
-            }
-            if (!end) break;
-            line = end + 1;
-        }
-    }
-    return nullptr;
-}
 static unsigned gClientPort;
 static void clientFailure(unsigned port, const char *step, const char *detail) {
     if (Gpu *gpu = makeGpu(port)) {
@@ -412,10 +383,6 @@ static id deviceForPort(unsigned port) {
                 native_bridge_metal_system_cache(systemcache::kReaderPath, systemcache::kOwners, 2, false);
             device = clientDevice(port);
             if (device) iogpu::install(device, port);
-            if (device && bootArgSet("log-gpu=1")) {
-                pthread_t memory;
-                if (!pthread_create(&memory, nullptr, reportClientMemory, nullptr)) pthread_detach(memory);
-            }
             return device;
         }
 #else
