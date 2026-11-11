@@ -1,0 +1,40 @@
+diff --git a/crates/metal2vulkan-runtime/src/device/compiles.rs b/crates/metal2vulkan-runtime/src/device/compiles.rs
+--- a/crates/metal2vulkan-runtime/src/device/compiles.rs
++++ b/crates/metal2vulkan-runtime/src/device/compiles.rs
+@@ -292,12 +292,35 @@
+     (made, messages)
+ }
+ 
++/// Whether a call that may compile is made on this thread whatever its class: the host says its
++/// driver compiles inside the call, on the calling thread (`METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1`),
++/// so there is no compiler service whose class would follow the asking thread's, and a thread
++/// started for the call only makes the asking thread wait for one of a lower priority than its
++/// own (a render server's main thread, which has no class, waited 40 to 170 ms for it on a busy
++/// system). A thread with less than 2 MiB of stack still hands the call over: the driver's
++/// compiler runs deep, and the runtime's thread has the room.
++#[cfg(any(target_os = "macos", target_os = "ios"))]
++fn compiles_here() -> bool {
++    static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let host = *HOST.get_or_init(|| {
++        std::env::var_os("METAL2VULKAN_COMPILE_ON_ASKING_THREAD").is_some_and(|value| value == "1")
++    });
++    // SAFETY: the calling thread's own handle.
++    host && unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) } >= 2 << 20
++}
++
++/// Never: no class here, so every call is made on the asking thread already.
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
++fn compiles_here() -> bool {
++    false
++}
++
+ /// Run `call`, one Vulkan call that may compile, at the user-initiated quality of service or
+ /// above (the module docs). It runs here where this thread is at that class, and otherwise on a
+ /// thread of the runtime's own at it while this thread waits. It runs here too where no thread
+ /// starts or the process is exiting.
+ pub(super) fn at_user_initiated<R: Send>(call: impl FnOnce() -> R + Send) -> R {
+-    if exit_guard::at_least_user_initiated() {
++    if exit_guard::at_least_user_initiated() || compiles_here() {
+         return call();
+     }
+     // The driver diagnostics this thread's call is measured to report: the driver reports them
