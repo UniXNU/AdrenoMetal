@@ -338,18 +338,22 @@ static id deviceForPort(unsigned port) {
                     setenv("TU_DEBUG", value, 1);
                 }
         }
-        // Every pass renders in tile memory (GMEM) wherever Turnip can tile it: attachments are loaded and stored once per tile instead of
-        // every draw going to system memory, and memoryless attachments take no memory at all. The colour order of GMEM loads and stores is
-        // the image's own swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch: 0.0 % of lock screen tiles exchanged).
-        // A pass Turnip cannot tile still renders in system memory; the RM row of the memory log counts both. tu-debug= overrides this.
-        setenv("TU_DEBUG", "gmem,nocb", 0);
+        // Turnip chooses each pass's rendering: tile memory (GMEM) or system memory, by its own rules (a pass with a memoryless
+        // attachment or a feedback loop in tile memory, a pass of few draws in system memory, the others by the bandwidth each would
+        // take), with concurrent binning. A pass in system memory has no tile load and store, which is what a screen-size pass that
+        // draws on a small part of its target otherwise pays for whole. The colour order of GMEM loads and stores is the image's own
+        // swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch). The RM row of the memory log counts both kinds;
+        // tu-debug= (for instance gmem,nocb: every pass in tile memory, no concurrent binning) overrides this.
+        // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
+        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. nocb in tu-debug= turns it off.
+        setenv("tu_allow_concurrent_binning", "true", 0);
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
-        // metal-flow=1 enables the lowering thread, commit submission and the warm pass; =0 states the default. Either logs the FL counts
+        // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
         // (native_bridge_metal_open), so two runs compare without diag=1's own cost.
         // gpu-purge=0: the bridge discards nothing of what callers declare Volatile (NativeMetalPurge.rs), for a comparison on the
         // same image. Read by the bridge as the device opens.
