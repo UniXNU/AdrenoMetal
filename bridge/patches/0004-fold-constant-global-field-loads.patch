@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-air/src/canon/mod.rs b/crates/metal2vulkan-air/src/canon/mod.rs
-index 18909066e4ae67721b3896390ba569c3d198863d..b2e8c821f668c024ef8b469df242d54d4b1b8bab 100644
+index a685b0dcb..4c2dcbc68 100644
 --- a/crates/metal2vulkan-air/src/canon/mod.rs
 +++ b/crates/metal2vulkan-air/src/canon/mod.rs
-@@ -528,6 +528,7 @@ pub fn specialize_dynamic(
+@@ -557,6 +557,7 @@ pub fn specialize_dynamic(
      let emap = erase::erase_consts(&mut parts.consts, m)?;
      erase::erase_globals(parts.globals.values_mut(), &emap);
      erase_functions(&mut parts, &emap, m)?;
@@ -10,7 +10,7 @@ index 18909066e4ae67721b3896390ba569c3d198863d..b2e8c821f668c024ef8b469df242d54d
      let inlined = inline::inline(
          &parts.funcs,
          (&parts.types, &parts.symbols),
-@@ -589,16 +590,20 @@ pub fn specialize_dynamic(
+@@ -620,16 +621,20 @@ pub fn specialize_dynamic(
      } = solved;
      // A pointer loaded from a field of a constant global is the field's constant: a `constexpr
      // sampler` that SCCP's folded select picked is its sampler state. SCCP runs again over a body
@@ -40,7 +40,7 @@ index 18909066e4ae67721b3896390ba569c3d198863d..b2e8c821f668c024ef8b469df242d54d
      // Loops whose trip count the constants decided, unrolled where their counters decide a branch
      // of their body; SCCP after each round folds what the copies decide. The unrolled body is
      // kept only where it comes out no larger than the loops it replaces (`unroll::live_size`).
-@@ -850,6 +855,60 @@ fn erased_entry(
+@@ -893,6 +898,60 @@ fn erased_entry(
  }
  
  /// Erase every defined function's body in place, one at a time, each body replaced freed.
