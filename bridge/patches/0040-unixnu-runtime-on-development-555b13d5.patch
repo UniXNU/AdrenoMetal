@@ -1,3 +1,51 @@
+diff --git a/crates/metal2vulkan-conformance/src/device.rs b/crates/metal2vulkan-conformance/src/device.rs
+index aae72dcd5..93b87d1a2 100644
+--- a/crates/metal2vulkan-conformance/src/device.rs
++++ b/crates/metal2vulkan-conformance/src/device.rs
+@@ -260,8 +260,9 @@ fn loader() -> Option<PathBuf> {
+ /// **Neither changes a native answer.** The device's native arithmetic and value answers are the
+ /// contract under both (AGENTS.md, rule 1): no switch emulates Metal's bits where the device has a
+ /// native form, so the notes that state the device's own answer fire alike under either policy
+-/// ([`crate::replay::NATIVE_NOTES`]). The one arithmetic switch, `half_chains`, acts only on a
+-/// device without `shaderFloat16`, which has no native `half` to answer with.
++/// ([`crate::replay::NATIVE_NOTES`]). The one arithmetic switch, `half_chains`, acts on a device
++/// without `shaderFloat16`, which has no native `half` to answer with, and on one whose 16-bit
++/// floats keep no denormals, where it chooses between two statements of the device's own `half`.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum Policy {
+     /// `DevicePolicy::exact_answers()`: the accurate form of each of the runtime's
+diff --git a/crates/metal2vulkan-runtime/src/batch_order.rs b/crates/metal2vulkan-runtime/src/batch_order.rs
+index 1fef73096..97da33d27 100644
+--- a/crates/metal2vulkan-runtime/src/batch_order.rs
++++ b/crates/metal2vulkan-runtime/src/batch_order.rs
+@@ -23,6 +23,13 @@
+ //! - RADV (Mesa 26.0.8) on the Radeon 780M and the RX 7900 XTX;
+ //! - NVIDIA's driver (615.71.09) on the RTX 5080 Laptop GPU.
+ //!
++//! Turnip on an Adreno runs them so by construction, read in its source and not measured: the GPU
++//! has one command processor, which executes a ring's indirect buffers in the order the kernel
++//! wrote them, and Turnip gives each `VkQueue` one kernel submit queue whose submissions go to
++//! one ring in submission order (Mesa's `tu_queue.cc`, `tu_queue_submit` to
++//! `tu_knl::queue_submit`; `drm/msm`'s `msm_gpu_submit`, or a port's own kernel driver behind
++//! `tu_knl`). No two submissions of a queue overlap there, with or without a barrier.
++//!
+ //! On those drivers ([`ends_order`]) the default form orders batches by their ends: every batch
+ //! ends with [`Barrier::to_all`], every write before every access of every later command of its
+ //! `VkQueue`, so the tracker plans no barrier after an access of an earlier batch there
+@@ -50,7 +57,12 @@ pub(crate) fn by_ends(policy: &DevicePolicy, driver: Option<DriverId>) -> bool {
+ fn ends_order(driver: Option<DriverId>) -> bool {
+     matches!(
+         driver,
+-        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV | DriverId::NVIDIA_PROPRIETARY)
++        Some(
++            DriverId::INTEL_OPEN_SOURCE_MESA
++                | DriverId::MESA_RADV
++                | DriverId::NVIDIA_PROPRIETARY
++                | DriverId::MESA_TURNIP
++        )
+     )
+ }
+ 
 diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
 index eb53071c2..b9d67e9e7 100644
 --- a/crates/metal2vulkan-runtime/src/buffer.rs
@@ -994,7 +1042,7 @@ index bf7b0911b..8875b45df 100644
  /// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels:
  /// the texels lie with no byte between them ([`holding`]), and its last subresource ends at their
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index 1d1143c66..45ba25979 100644
+index 1d1143c66..3c5cdc9ff 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
 @@ -233,6 +233,57 @@ const DEDICATED_SLACK: u64 = 4;
@@ -1055,7 +1103,19 @@ index 1d1143c66..45ba25979 100644
  /// What memory a resource needs.
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
  pub(super) enum MemoryClass {
-@@ -1065,6 +1116,14 @@ impl<T> Pool<T> {
+@@ -568,7 +619,10 @@ pub(super) const ZERO_INITIALIZE: vk::MemoryAllocateFlags = vk::MemoryAllocateFl
+ /// timed, the submission's fence read after both. On ANV (Mesa 26.2.4, the UHD 770 of RPL-S) the
+ /// bind took 0.2 to 1.8 us and the view 1.8 to 5.1 us; on RADV (Mesa 26.0.8) 0.0 to 0.6 us and
+ /// 0.6 to 2.0 us on the Radeon 780M and the RX 7900 XTX; the submission still pending after both
+-/// in every round, as with a fresh block. There ([`binds_wait`]) such an image shares a pooled
++/// in every round, as with a fresh block. Turnip's bind waits for nothing either, read in its
++/// source and not measured: `tu_image_bind` (Mesa's `tu_image.cc`) records the memory, the offset
++/// and the image's address and makes no kernel call and takes no lock, and `tu_CreateImageView`
++/// none either. There ([`binds_wait`]) such an image shares a pooled
+ /// block ([`allocate_image_while_queued`]), and every submission names one buffer object fewer
+ /// to the kernel for each.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -1065,6 +1119,14 @@ impl<T> Pool<T> {
          }
      }
  
@@ -1070,7 +1130,7 @@ index 1d1143c66..45ba25979 100644
      /// Whether a pooled block has room for `size` bytes at the largest alignment asked of the
      /// pool so far: whether [`Pool::room`] is that long.
      ///
-@@ -1307,13 +1366,18 @@ impl<T> Pool<T> {
+@@ -1307,13 +1369,18 @@ impl<T> Pool<T> {
      /// imports, whatever else they are.
      fn count_into(&self, census: &mut Census, imported: impl Fn(&T) -> bool) {
          for block in self.blocks.iter().flatten() {
@@ -1094,7 +1154,7 @@ index 1d1143c66..45ba25979 100644
          }
      }
  }
-@@ -1353,6 +1417,53 @@ impl FreeCause {
+@@ -1353,6 +1420,53 @@ impl FreeCause {
      pub(super) const COUNT: usize = 7;
  }
  
@@ -1148,7 +1208,7 @@ index 1d1143c66..45ba25979 100644
  /// A device's live `VkDeviceMemory` blocks, by kind ([`Memory::census`]): each one buffer
  /// object the driver lists in every submission where it lists every allocation (ANV on i915).
  #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-@@ -1366,6 +1477,13 @@ pub(super) struct Census {
+@@ -1366,6 +1480,13 @@ pub(super) struct Census {
      pub(super) dedicated: u64,
      /// The caller's host memory imported ([`import_host`]), a block each.
      pub(super) imported: u64,
@@ -1162,7 +1222,7 @@ index 1d1143c66..45ba25979 100644
  }
  
  /// A host pointer the runtime may send between threads: the mapping of a block it owns.
-@@ -1526,6 +1644,11 @@ struct BlockAddresses {
+@@ -1526,6 +1647,11 @@ struct BlockAddresses {
  }
  
  impl Block {
@@ -1174,7 +1234,7 @@ index 1d1143c66..45ba25979 100644
      /// Whether another placement may take its memory once its own went: memory the runtime
      /// allocated for itself, neither an import nor a buffer's dedicated allocation
      /// (`VkMemoryDedicatedAllocateInfo`, which binds that buffer alone).
-@@ -2548,6 +2671,60 @@ impl Memory {
+@@ -2548,6 +2674,60 @@ impl Memory {
          census
      }
  
@@ -1235,7 +1295,7 @@ index 1d1143c66..45ba25979 100644
      /// Whether one of the memory types `allowed` names is of `class`.
      pub(super) fn has_type(&self, allowed: u32, class: MemoryClass) -> bool {
          self.class_types(allowed, class) != 0
-@@ -2950,13 +3127,11 @@ impl Memory {
+@@ -2950,13 +3130,11 @@ impl Memory {
          pool.add_as(size, dedicated, block, used, zeroed)
      }
  
@@ -1253,7 +1313,7 @@ index 1d1143c66..45ba25979 100644
      }
  
      /// The bytes of each live pooled block that holds `holds`, of every memory type, for the
-@@ -3018,6 +3193,21 @@ impl Memory {
+@@ -3018,6 +3196,21 @@ impl Memory {
              .collect()
      }
  
@@ -1275,7 +1335,7 @@ index 1d1143c66..45ba25979 100644
      /// What making a block takes, copied out so that the block is made with the memory's lock
      /// released ([`place`], [`keep_room`]).
      fn maker(&self) -> BlockMaker {
-@@ -3026,7 +3216,6 @@ impl Memory {
+@@ -3026,7 +3219,6 @@ impl Memory {
              .fold(0, |bits, (index, _)| bits | 1 << index);
          BlockMaker {
              block_bytes: self.block_bytes,
@@ -1283,7 +1343,7 @@ index 1d1143c66..45ba25979 100644
              host_visible,
              fd_types: self.fd_buffer_types.unwrap_or(0),
              page_types: self.page_buffer_types.unwrap_or(0),
-@@ -3222,7 +3411,9 @@ impl Memory {
+@@ -3222,7 +3414,9 @@ impl Memory {
          let spare = self
              .kept_budget(heap)
              .saturating_sub(self.kept_in_heap(heap));
@@ -1294,7 +1354,7 @@ index 1d1143c66..45ba25979 100644
          let reusable = |block: &Block| block.reusable() && block.size > half;
          let pool = self.pool(holds, type_index);
          let freed = pool.release(block, (offset, size), now, spare, reusable);
-@@ -3310,6 +3501,21 @@ impl Memory {
+@@ -3310,6 +3504,21 @@ impl Memory {
          count
      }
  
@@ -1316,7 +1376,7 @@ index 1d1143c66..45ba25979 100644
      /// Over every pool: the block slots the room queries have walked and the free ranges they
      /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
      /// where it derived per call ([`Pool::room_per_call`]).
-@@ -3383,10 +3589,18 @@ impl Memory {
+@@ -3383,10 +3592,18 @@ impl Memory {
          };
          let (heap, size) = (self.heap_of(block.type_index), block.size);
          let Some(parking) = &self.parking else {
@@ -1335,7 +1395,7 @@ index 1d1143c66..45ba25979 100644
                  return after;
              };
              let Block {
-@@ -3403,6 +3617,9 @@ impl Memory {
+@@ -3403,6 +3620,9 @@ impl Memory {
                  size,
              };
              // SAFETY: the caller's.
@@ -1345,7 +1405,7 @@ index 1d1143c66..45ba25979 100644
              return unsafe { frees.post_or_free(posted, device) };
          };
          self.say_block(
-@@ -3647,8 +3864,6 @@ impl Memory {
+@@ -3647,8 +3867,6 @@ impl Memory {
  struct BlockMaker {
      /// A pooled block's size ([`BLOCK_BYTES`], or the device's largest allocation).
      block_bytes: u64,
@@ -1354,7 +1414,7 @@ index 1d1143c66..45ba25979 100644
      /// The host-visible memory types, as bits: a block of one is mapped whole.
      host_visible: u32,
      /// The memory types whose [`Holds::FdBuffers`] blocks are allocated exportable, as bits.
-@@ -3668,14 +3883,6 @@ struct BlockMaker {
+@@ -3668,14 +3886,6 @@ struct BlockMaker {
  }
  
  impl BlockMaker {
@@ -1369,7 +1429,16 @@ index 1d1143c66..45ba25979 100644
      /// A new block of `size` bytes of memory type `type_index` that holds `holds`, with a buffer
      /// of addresses where `addressed` gives the counts of such buffers made (its memory then as
      /// long as that buffer requires, if longer), allocated zero-initialized where it holds images
-@@ -4624,13 +4831,19 @@ fn place(
+@@ -4460,7 +4670,7 @@ pub(super) fn allocate_image_while_queued(
+ fn binds_wait(driver: Option<DriverId>) -> bool {
+     !matches!(
+         driver,
+-        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV)
++        Some(DriverId::INTEL_OPEN_SOURCE_MESA | DriverId::MESA_RADV | DriverId::MESA_TURNIP)
+     )
+ }
+ 
+@@ -4624,13 +4834,19 @@ fn place(
          let pool = (holds, type_index);
          let block_size = match dedicated {
              true => size,
@@ -1390,7 +1459,7 @@ index 1d1143c66..45ba25979 100644
                  ready_after_placing(&mut guard, pool, size);
                  return Ok(guard.mark_overflowed(placement, overflowing));
              }
-@@ -4673,6 +4886,10 @@ fn place(
+@@ -4673,6 +4889,10 @@ fn place(
          };
          match made {
              Ok(block) => {
@@ -1401,7 +1470,7 @@ index 1d1143c66..45ba25979 100644
                  let mut memory = lock(memory);
                  if !dedicated && memory.makes_ahead(pool) {
                      memory.ahead.made_in_place(holds);
-@@ -4691,8 +4908,16 @@ fn place(
+@@ -4691,8 +4911,16 @@ fn place(
                  memory.say_placement("placed", &placement, Some(class));
                  return Ok(memory.mark_overflowed(placement, overflowing));
              }
@@ -1420,7 +1489,7 @@ index 1d1143c66..45ba25979 100644
          }
      }
      Err(failure)
-@@ -4713,6 +4938,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
+@@ -4713,6 +4941,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
      released > 0 || waited
  }
  
@@ -1433,7 +1502,7 @@ index 1d1143c66..45ba25979 100644
  /// Let `memory` keep no block from now on ([`Memory::keep_none`]): those it keeps empty freed, and
  /// those still being made ahead stopped, each waited for with the lock released (its making
  /// reads its pages), and freed.
-@@ -4789,7 +5020,7 @@ pub(super) fn keep_room(
+@@ -4789,7 +5023,7 @@ pub(super) fn keep_room(
          .filter(|&&(holds, _)| holds != own && holds != Holds::FdBuffers && !page(holds));
      for &pool in first.chain(rest) {
          let addressed = pool.0.buffers().then_some(&**counts);
@@ -3095,7 +3164,7 @@ index 195b83a42..e3b7d7027 100644
      pub(super) fn source(&self) -> (YCbCrPlanes, Range<u64>) {
          (self.source.0, self.source.1.clone())
 diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
-index e0a9a6af8..1698c24c7 100644
+index e0a9a6af8..650064ca8 100644
 --- a/crates/metal2vulkan/src/cache/mod.rs
 +++ b/crates/metal2vulkan/src/cache/mod.rs
 @@ -60,7 +60,7 @@ mod tests;
@@ -3103,15 +3172,72 @@ index e0a9a6af8..1698c24c7 100644
  /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
  /// history.
 -pub const SEMANTICS_VERSION: u32 = 2020;
-+pub const SEMANTICS_VERSION: u32 = 2021;
++pub const SEMANTICS_VERSION: u32 = 2022;
  
  /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
  /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
+@@ -93,7 +93,7 @@ pub const ARTIFACT_FORMAT_VERSION: u32 = 500;
+ /// changes no behaviour, and then updates that hash alone with the commit saying why, or changes
+ /// behaviour and also bumps this version. The commit that bumps it says what changed; this comment
+ /// keeps no history.
+-pub const RUNTIME_VERSION: u32 = 2016;
++pub const RUNTIME_VERSION: u32 = 2017;
+ 
+ /// The digest of the sources this build of the crate was compiled from: SHA-256, as lowercase hex,
+ /// of the manifest, the build script, and exactly the files the crate roots' module tree compiles
+diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
+index 8d6c42df8..1231754ad 100644
+--- a/crates/metal2vulkan/src/device/driver_facts.rs
++++ b/crates/metal2vulkan/src/device/driver_facts.rs
+@@ -753,6 +753,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
+ /// `intel-irisxe-rplp-anv`).
+ pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
+ 
++/// Qualcomm's `vendorID`.
++const QUALCOMM_VENDOR_ID: u32 = 0x5143;
++
++/// The `deviceID` Turnip reports for the Adreno 740: its chip id (Mesa's `tu_device.cc`,
++/// `props->deviceID = pdevice->dev_id.chip_id`; `freedreno_devices.py`, `FD740`).
++pub(crate) const ADRENO_740: u32 = 0x4305_0a01;
++
+ /// The row of `fact` measured on Mesa's `driver` on the GPU `(vendor, device)`.
+ const fn mesa_on<F>(fact: F, driver: DriverId, (vendor, device): (u32, u32)) -> Measured<F> {
+     Measured {
+@@ -1947,6 +1954,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
+ /// row, ANV, Mesa 26.2.4, on the Iris Xe (RPL-P). Not listed: NVIDIA's 615.71.09, whose RTX 3080
+ /// left a third answer; RADV on the RX 7900 XTX, clean at dd718a7905 at Mesa 26.0.8 but not
+ /// measured since; and every GPU not measured, which store with `STORE`.
++/// Turnip on the Adreno 740 takes it by its source, not by that measurement (as
++/// `DontCareStoreIsMetals` is read in MoltenVK's): an attachment's store is its store operation
++/// being `STORE` and nothing else (`tu_pass.cc`, `attachment_set_ops`: `att->store = (store_op ==
++/// VK_ATTACHMENT_STORE_OP_STORE)`); a pass rendered in tile memory writes an attachment's memory
++/// only in its tile store, which returns before any command for one not stored
++/// (`tu_clear_blit.cc`, `tu_store_gmem_attachment`: `if (!dst->store && !dst->store_stencil)
++/// return;`), so every texel is the earlier one; a pass rendered in system memory
++/// (`tu_cmd_buffer.cc`, `tu_cmd_render_sysmem`) clears and draws into the attachment's own
++/// memory, so every texel is the one `STORE` leaves. Turnip chooses one of the two for a whole
++/// pass (`use_sysmem_rendering`).
+ ///
+ /// `InterlockOrdersDraws`, measured with no barrier between such draws on any driver (a scratch
+ /// build of the commit that adds it), by `runtime_lane::interlocked_draw_order` (passes of 84
+@@ -2251,6 +2268,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
+         DriverId::INTEL_OPEN_SOURCE_MESA,
+         (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
+     ),
++    // Read in Mesa's source, not measured (the docs above).
++    mesa_on(
++        DriverFact::DontCareStoreIsOneOfMetals,
++        DriverId::MESA_TURNIP,
++        (QUALCOMM_VENDOR_ID, ADRENO_740),
++    ),
+     mesa_on(
+         DriverFact::ColorBlockDecodeIsMetals,
+         DriverId::MESA_RADV,
 diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
-index 50a33bc70..01371592d 100644
+index 50a33bc70..87e34d010 100644
 --- a/crates/metal2vulkan/src/device/policy.rs
 +++ b/crates/metal2vulkan/src/device/policy.rs
-@@ -327,6 +327,14 @@ pub enum HostPageTexturePolicy {
+@@ -327,13 +327,26 @@ pub enum HostPageTexturePolicy {
      /// texels into before each use and merge back after each write, whose copies touch the
      /// texels alone.
      Shadow,
@@ -3126,6 +3252,20 @@ index 50a33bc70..01371592d 100644
  }
  
  /// How a chain of `half` additions, subtractions and products rounds on a device without
+ /// `shaderFloat16`, where a module computes each in `float` on its operands held widened and
+ /// rounds its result by the device's `OpQuantizeToF16` (`PrecisionNote::NativeHalfQuantize`):
+-/// capability emulation, as the device has no 16-bit arithmetic. A device with `shaderFloat16`
+-/// computes `half` as it does under either value. Changes emitted code: the profile carries it.
++/// capability emulation, as the device has no 16-bit arithmetic. On a device with `shaderFloat16`
++/// whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits) it chooses how a `half`
++/// operation the device has an instruction for is stated: its `float` result decorated
++/// `RelaxedPrecision`, the device's own 16-bit precision (`AtExits`), or the operation in `float`
++/// converted to 16 bits and back (`EachOperation`); `PrecisionNote::NativeHalfConversion` either
++/// way. Every other device with `shaderFloat16` computes `half` as it does under either value.
++/// Changes emitted code: the profile carries it.
+ #[non_exhaustive]
+ #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+ #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 diff --git a/crates/metal2vulkan/src/lower/access/blob.rs b/crates/metal2vulkan/src/lower/access/blob.rs
 index 1ed5aed39..130f80ccf 100644
 --- a/crates/metal2vulkan/src/lower/access/blob.rs
@@ -3181,6 +3321,186 @@ index 1ed5aed39..130f80ccf 100644
  }
  
  /// A leaf load of AIR type `ty` with alignment `align` through blob pointer `ptr`.
+diff --git a/crates/metal2vulkan/src/lower/arith/chunk.rs b/crates/metal2vulkan/src/lower/arith/chunk.rs
+index 6c072b07c..fcdd9c5b6 100644
+--- a/crates/metal2vulkan/src/lower/arith/chunk.rs
++++ b/crates/metal2vulkan/src/lower/arith/chunk.rs
+@@ -413,7 +413,7 @@ pub fn dot(
+         });
+     }
+     let sum = sum.ok_or_else(operand_error)?;
+-    narrow::round(fb, elem, sum)
++    narrow::round_native(fb, elem, sum)
+ }
+ 
+ /// The words of [`dot`] on `lanes` lanes of `elem`.
+diff --git a/crates/metal2vulkan/src/lower/arith/divide.rs b/crates/metal2vulkan/src/lower/arith/divide.rs
+index f94247315..f35f17e0f 100644
+--- a/crates/metal2vulkan/src/lower/arith/divide.rs
++++ b/crates/metal2vulkan/src/lower/arith/divide.rs
+@@ -56,7 +56,7 @@ pub fn native(fb: &mut FunctionBuilder<'_>, f: Form, x: Value, y: Value) -> BRes
+     let q = fb.binary(BinOp::FDiv, x, y)?;
+     match f.float_fmt() {
+         Some(FloatFmt::F32) => Ok(q),
+-        Some(FloatFmt::Half) => narrow::round(fb, f, q),
++        Some(FloatFmt::Half) => narrow::round_native(fb, f, q),
+         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
+     }
+ }
+diff --git a/crates/metal2vulkan/src/lower/arith/fma.rs b/crates/metal2vulkan/src/lower/arith/fma.rs
+index c36613d53..0f1137956 100644
+--- a/crates/metal2vulkan/src/lower/arith/fma.rs
++++ b/crates/metal2vulkan/src/lower/arith/fma.rs
+@@ -171,7 +171,7 @@ pub fn emit(fb: &mut FunctionBuilder<'_>, fma: Fma, args: &[Value]) -> BResult<V
+         (Route::Native, Some(FloatFmt::F32)) => fb.glsl(GlslOp::Fma, &[a, b, c]),
+         (Route::Native, Some(FloatFmt::Half)) => {
+             let r = fb.glsl(GlslOp::Fma, &[a, b, c])?;
+-            narrow::round(fb, fma.form, r)
++            narrow::round_native(fb, fma.form, r)
+         }
+         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
+     }
+diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
+index 22a0042ed..f0755e81f 100644
+--- a/crates/metal2vulkan/src/lower/arith/math.rs
++++ b/crates/metal2vulkan/src/lower/arith/math.rs
+@@ -1304,10 +1304,21 @@ pub fn float_fn(
+     let r = match op {
+         _ if op.closed_on_narrow() => r,
+         // A `half` `mix`, the device's `FMix` in `float`, rounds once.
+-        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round(fb, f, r)?,
++        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round_native(fb, f, r)?,
+         // Rounded per step below.
+         F::Mix | F::MulAdd | F::Fract | F::FastFract => r,
+-        F::Dot => narrow::round(fb, f.scalar_form(), r)?,
++        F::Dot => narrow::round_native(fb, f.scalar_form(), r)?,
++        // One device instruction on the operands: the device's own at its 16-bit precision
++        // where the module leaves `half` results to it.
++        F::Sqrt
++        | F::FastSqrt
++        | F::Rsqrt
++        | F::FastRsqrt
++        | F::Exp
++        | F::Exp2
++        | F::Log
++        | F::Log2
++        | F::FastLog2 => narrow::round_native(fb, f, r)?,
+         _ => narrow::round(fb, f, r)?,
+     };
+     Ok(r)
+@@ -1416,9 +1427,9 @@ fn float_fn_core(
+         F::MulAdd => {
+             // A narrow form takes the unfused choice, each step rounded once by the device.
+             let p = bin(fb, BinOp::FMul, a, arg(args, 1)?)?;
+-            let p = narrow::round(fb, f, p)?;
++            let p = narrow::round_native(fb, f, p)?;
+             let r = bin(fb, BinOp::FAdd, p, arg(args, 2)?)?;
+-            narrow::round(fb, f, r)
++            narrow::round_native(fb, f, r)
+         }
+         F::Sqrt => g1(fb, GlslOp::Sqrt),
+         F::Fma if f.float_fmt() == Some(FloatFmt::BFloat) => {
+diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
+index 1065191ea..3cc7fdfeb 100644
+--- a/crates/metal2vulkan/src/lower/arith/mod.rs
++++ b/crates/metal2vulkan/src/lower/arith/mod.rs
+@@ -702,6 +702,10 @@ pub struct ArithPlan {
+     /// Whether [`ArithPlan::quantize`] is the device's own rounding (native half rounding,
+     /// [`narrow::native_rounding`]), decided with it by [`finish`].
+     pub native_half: bool,
++    /// Whether the result of a `half` operation the device has an instruction for is left to
++    /// the device's own 16-bit precision ([`narrow::relaxes`], [`narrow::round_native`]), decided
++    /// by [`finish`].
++    pub relaxed_half: bool,
+     /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
+     /// through the conversion under the float controls ([`QuantizeForm::Controlled`]): a `half`
+     /// texel takes the rounding's NaN (`narrow::round_texel`). Decided by [`finish`], on every
+@@ -785,6 +789,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+     cx.families.arith.wide = legal::holds_wide(cx.profile);
+     cx.families.arith.quantize = narrow::quantize_form(cx.profile);
+     cx.families.arith.native_half = narrow::native_rounding(cx.families.arith.quantize).is_some();
++    cx.families.arith.relaxed_half = narrow::relaxes(cx.profile);
+     // Under the float controls a `half`'s NaN is the device's conversion's.
+     cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled;
+     // An extended-range, padded or bfloat texel's conversion is the device's arithmetic.
+diff --git a/crates/metal2vulkan/src/lower/arith/narrow.rs b/crates/metal2vulkan/src/lower/arith/narrow.rs
+index 800f97607..5a7eed682 100644
+--- a/crates/metal2vulkan/src/lower/arith/narrow.rs
++++ b/crates/metal2vulkan/src/lower/arith/narrow.rs
+@@ -133,6 +133,48 @@ pub fn round(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value>
+     }
+ }
+ 
++/// Whether profile `p`'s modules leave the result of a `half` operation the device has an
++/// instruction for to the device's own 16-bit precision ([`round_native`]): a profile with
++/// `shaderFloat16` whose 16-bit floats do not keep denormals (no `DenormPreserve` for 16 bits, so
++/// no float controls make its conversion Metal's and the module rounds in
++/// [`QuantizeForm::Converted`]) and whose conversion and 16-bit arithmetic no measurement
++/// makes Metal's (`DriverDeviation::MetalHalfConversion`, `MetalHalfArithmetic`: MoltenVK's stay
++/// as they are), under `HalfChainPolicy::AtExits` (the default).
++/// `HalfChainPolicy::EachOperation` (`DevicePolicy::exact_answers`) keeps the conversion pair
++/// after every operation.
++pub fn relaxes(p: &DeviceProfile) -> bool {
++    let fields = p.fields();
++    // A device whose conversion or 16-bit arithmetic is measured to be Metal's keeps it.
++    let measured = p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
++        || p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfArithmetic);
++    fields.half_chains == crate::device::HalfChainPolicy::AtExits
++        && !measured
++        && fields.leaf.float16
++        && !fields.float_controls.f16.denorm_preserve
++        && quantize_form(p) == QuantizeForm::Converted
++}
++
++/// [`round`] of `x`, the result of ONE device instruction on `half` operands held widened (a
++/// `half` `+ - * /`, `fma`, `dot`, `mix`, or a function the device has an instruction for).
++/// Where the module leaves such results to the device (`ModuleBuilder::relaxed_half`,
++/// [`relaxes`]) the result is `x` itself, recorded for the serializer to decorate
++/// `RelaxedPrecision`: the device computes the instruction at its 16-bit precision, on its
++/// 16-bit registers, in place of computing it in `float` and converting to 16 bits and back (a
++/// pair Mesa's compiler folds into nothing, the result then not rounded at all). Recorded as
++/// `PrecisionNote::NativeHalfConversion`. A `half` a routine of several instructions computes in
++/// `float`, a conversion from `float` and a texel are not this form: they take [`round`] and
++/// [`round_measured`], whose operand may be a `float` the function also reads at full precision.
++pub fn round_native(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value> {
++    if f.held == Held::Float(FloatFmt::Half)
++        && fb.module().relaxed_half()
++        && fb.module().quantize_form() == QuantizeForm::Converted
++    {
++        fb.module().note_relaxed(x);
++        return Ok(x);
++    }
++    round(fb, f, x)
++}
++
+ /// How profile `p`'s modules round an `f32` to `half` ([`QuantizeForm`]): the device's conversion
+ /// to 16 bits and back under the float controls that make it Metal's by the Vulkan spec where the
+ /// profile has `shaderFloat16` and them ([`QuantizeForm::Controlled`], [`controlled_modes`]), else
+diff --git a/crates/metal2vulkan/src/lower/arith/ops.rs b/crates/metal2vulkan/src/lower/arith/ops.rs
+index 98c9ff27f..59ad8c3ad 100644
+--- a/crates/metal2vulkan/src/lower/arith/ops.rs
++++ b/crates/metal2vulkan/src/lower/arith/ops.rs
+@@ -252,7 +252,7 @@ pub fn float_binary(
+         _ => BinOp::FRem,
+     };
+     let r = fb.binary_with(o, a, b, contract)?;
+-    narrow::round(fb, f, r)
++    narrow::round_native(fb, f, r)
+ }
+ 
+ /// The census name of a `half` operator on the device's 16-bit arithmetic
+diff --git a/crates/metal2vulkan/src/lower/emit.rs b/crates/metal2vulkan/src/lower/emit.rs
+index 1ada9dd92..7b40368b9 100644
+--- a/crates/metal2vulkan/src/lower/emit.rs
++++ b/crates/metal2vulkan/src/lower/emit.rs
+@@ -105,6 +105,7 @@ fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
+     // And every `half` rounding's quantize the device's form.
+     mb.set_quantize_form(plan.families.arith.quantize);
+     mb.set_native_half(plan.families.arith.native_half);
++    mb.set_relaxed_half(plan.families.arith.relaxed_half);
+     mb.set_native_half_nans(plan.families.arith.native_half_nans);
+     let mut d = Declared::default();
+     let modes = &mut d.modes;
 diff --git a/crates/metal2vulkan/src/memory/plan.rs b/crates/metal2vulkan/src/memory/plan.rs
 index 2108cca50..e9164f0aa 100644
 --- a/crates/metal2vulkan/src/memory/plan.rs
@@ -3257,6 +3577,204 @@ index 2108cca50..e9164f0aa 100644
                  grow(out, 1, m)?;
                  out.push(ConstGlobalPlan { global: g, form });
              }
+diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
+index 26810ac09..90c6283e7 100644
+--- a/crates/metal2vulkan/src/pipeline/compile.rs
++++ b/crates/metal2vulkan/src/pipeline/compile.rs
+@@ -2808,9 +2808,13 @@ fn compile_kept<K>(
+     // Metal's (`DriverDeviation::MetalHalfConversion`) and every such rounding is of a form the
+     // measurement covers (a `float` the function converts, or an image instruction's texel),
+     // which the module then requires.
++    // A `half` result left to the device's own 16-bit precision (`narrow::round_native`) is
++    // within the same note, and no measurement covers it.
++    let relaxed = !module.relaxed().is_empty();
+     let converts = quantize == crate::spirv::builder::QuantizeForm::Converted
+-        && crate::lower::arith::narrow::rounds_by_conversion(&module, m)?;
++        && (relaxed || crate::lower::arith::narrow::rounds_by_conversion(&module, m)?);
+     let measured_conversion = converts
++        && !relaxed
+         && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
+         && !crate::lower::arith::narrow::rounds_unmeasured(&module, m)?;
+     // A `half` read from its bits by the device's widening, or encoded to them by its narrowing
+diff --git a/crates/metal2vulkan/src/spirv/builder/module.rs b/crates/metal2vulkan/src/spirv/builder/module.rs
+index 5ff8d5781..1edd8fb07 100644
+--- a/crates/metal2vulkan/src/spirv/builder/module.rs
++++ b/crates/metal2vulkan/src/spirv/builder/module.rs
+@@ -106,6 +106,9 @@ pub struct ModuleBuilder {
+     /// (`ModuleBuilder::note_measured_rounding`). Nothing emitted depends on it: the compile
+     /// reads it to decide `PrecisionNote::NativeHalfConversion`.
+     pub(super) measured_roundings: BTreeSet<Value>,
++    /// The results of `half` operations the device computes at its own 16-bit precision
++    /// (`ModuleBuilder::note_relaxed`): the serializer decorates each `RelaxedPrecision`.
++    pub(super) relaxed: BTreeSet<Value>,
+     /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`), whose
+     /// stored NaN the write's own notes account for (`lower::texture::half_write_nans` and
+     /// `half_storage_facts`). Nothing emitted depends on it: the compile reads it to decide
+@@ -178,6 +181,9 @@ pub struct ModuleBuilder {
+     /// Whether a `half`'s NaN bits are the device's conversion's under the float controls
+     /// ([`ModuleBuilder::native_half_nans`]).
+     native_half_nans: bool,
++    /// Whether a `half` operation's result is left to the device's own 16-bit precision
++    /// ([`ModuleBuilder::relaxed_half`]).
++    relaxed_half: bool,
+ }
+ 
+ /// How a float multiply the device must round on its own and never fuse is emitted
+@@ -318,6 +324,28 @@ impl ModuleBuilder {
+         self.native_half = native;
+     }
+ 
++    /// Leave the result of a `half` operation the device has an instruction for to the device's
++    /// own 16-bit precision (`narrow::round_native`): decorated `RelaxedPrecision`, with no
++    /// conversion pair. Emission sets it before any instruction, from the profile
++    /// (`narrow::relaxes`); a builder that never sets it rounds every result in its
++    /// [`QuantizeForm`].
++    pub fn set_relaxed_half(&mut self, relaxed: bool) {
++        self.relaxed_half = relaxed;
++    }
++
++    /// Whether a `half` operation's result is left to the device's own 16-bit precision
++    /// ([`ModuleBuilder::set_relaxed_half`]).
++    pub fn relaxed_half(&self) -> bool {
++        self.relaxed_half
++    }
++
++    /// Record `result`, an `f32` holding the result of a `half` operation, as computed at the
++    /// device's own 16-bit precision: the serializer decorates it `RelaxedPrecision`
++    /// (`narrow::round_native`).
++    pub fn note_relaxed(&mut self, result: Value) {
++        self.relaxed.insert(result);
++    }
++
+     /// Record `narrowed`, the narrowing to 16 bits of a conversion pair that rounds a `half` in a
+     /// form measured to answer Metal's where the driver takes
+     /// `DriverDeviation::MetalHalfConversion` (`narrow::round_measured`).
+@@ -393,6 +421,7 @@ impl ModuleBuilder {
+             )
+             + tree_bytes(self.non_uniform.len(), std::mem::size_of::<Value>())
+             + tree_bytes(self.measured_roundings.len(), std::mem::size_of::<Value>())
++            + tree_bytes(self.relaxed.len(), std::mem::size_of::<Value>())
+             + tree_bytes(self.stored_texels.len(), std::mem::size_of::<Value>())
+             + map_bytes(&self.bits)
+             + map_bytes(&self.lanes)
+@@ -1401,6 +1430,7 @@ impl ModuleBuilder {
+             enabling: self.enabling,
+             non_uniform: self.non_uniform,
+             measured_roundings: self.measured_roundings,
++            relaxed: self.relaxed,
+             stored_texels: self.stored_texels,
+             #[cfg(test)]
+             uniform_vars: self.uniform_vars,
+diff --git a/crates/metal2vulkan/src/spirv/interp/sched.rs b/crates/metal2vulkan/src/spirv/interp/sched.rs
+index 95b2a23cb..c28b18c43 100644
+--- a/crates/metal2vulkan/src/spirv/interp/sched.rs
++++ b/crates/metal2vulkan/src/spirv/interp/sched.rs
+@@ -588,6 +588,18 @@ impl Lane {
+ 
+     /// Set the current frame's value `v`.
+     pub(super) fn set(&mut self, p: &Prog<'_>, v: Value, val: Val) -> IResult<()> {
++        // A result decorated `RelaxedPrecision` (`narrow::round_native`): the model of a device
++        // that computes it on 16-bit floats, its `f32` result rounded to `half` to nearest even,
++        // denormals kept. A device may flush them and round otherwise
++        // (`PrecisionNote::NativeHalfConversion`).
++        let val = if p.m.relaxed().contains(&v) {
++            super::eval::map1(&val, |x| {
++                let h = super::float::f64_to_f16(super::float::to_f64(x, 32)?);
++                super::float::from_f64(super::float::f16_to_f64(h), 32)
++            })?
++        } else {
++            val
++        };
+         self.top_mut()?.define(p, v, val)
+     }
+ 
+diff --git a/crates/metal2vulkan/src/spirv/ir/edit.rs b/crates/metal2vulkan/src/spirv/ir/edit.rs
+index 0b3ea69b4..6fe143e6f 100644
+--- a/crates/metal2vulkan/src/spirv/ir/edit.rs
++++ b/crates/metal2vulkan/src/spirv/ir/edit.rs
+@@ -406,6 +406,7 @@ impl TypedModule {
+         let values = &self.values;
+         self.non_uniform.retain(|v| !removed(v, values));
+         self.measured_roundings.retain(|v| !removed(v, values));
++        self.relaxed.retain(|v| !removed(v, values));
+         self.stored_texels.retain(|v| !removed(v, values));
+         self.loops.retain(|l| at(&bmap, l.header.index()).is_some());
+         for l in &mut self.loops {
+diff --git a/crates/metal2vulkan/src/spirv/ir/module.rs b/crates/metal2vulkan/src/spirv/ir/module.rs
+index 5a8926bee..f29707485 100644
+--- a/crates/metal2vulkan/src/spirv/ir/module.rs
++++ b/crates/metal2vulkan/src/spirv/ir/module.rs
+@@ -1438,6 +1438,9 @@ pub struct TypedModule {
+     /// to answer Metal's where the driver takes `DriverDeviation::MetalHalfConversion`
+     /// (`ModuleBuilder::measured_roundings`), recorded as the builder emits them.
+     pub(in crate::spirv) measured_roundings: std::collections::BTreeSet<Value>,
++    /// The results of `half` operations left to the device's own 16-bit precision
++    /// (`ModuleBuilder::note_relaxed`), decorated `RelaxedPrecision`.
++    pub(in crate::spirv) relaxed: std::collections::BTreeSet<Value>,
+     /// The texels the texture family's writes store, whose stored NaN the write's own notes
+     /// account for (`ModuleBuilder::stored_texels`), recorded as the builder emits them.
+     pub(in crate::spirv) stored_texels: std::collections::BTreeSet<Value>,
+@@ -1472,6 +1475,12 @@ impl TypedModule {
+         &self.measured_roundings
+     }
+ 
++    /// The results of `half` operations left to the device's own 16-bit precision, decorated
++    /// `RelaxedPrecision` (`ModuleBuilder::note_relaxed`).
++    pub fn relaxed(&self) -> &std::collections::BTreeSet<Value> {
++        &self.relaxed
++    }
++
+     /// The texels the texture family's writes store (`ModuleBuilder::note_stored_texel`).
+     pub fn stored_texels(&self) -> &std::collections::BTreeSet<Value> {
+         &self.stored_texels
+diff --git a/crates/metal2vulkan/src/spirv/roll/mod.rs b/crates/metal2vulkan/src/spirv/roll/mod.rs
+index 1d3a63ed7..c2dae4d3f 100644
+--- a/crates/metal2vulkan/src/spirv/roll/mod.rs
++++ b/crates/metal2vulkan/src/spirv/roll/mod.rs
+@@ -1855,6 +1855,7 @@ fn verify(
+                 if m.value(x)?.ty != m.value(y)?.ty
+                     || m.non_uniform.contains(&x) != m.non_uniform.contains(&y)
+                     || m.measured_roundings.contains(&x) != m.measured_roundings.contains(&y)
++                    || m.relaxed.contains(&x) != m.relaxed.contains(&y)
+                     || m.stored_texels.contains(&x) != m.stored_texels.contains(&y)
+                 {
+                     return Ok(None);
+diff --git a/crates/metal2vulkan/src/spirv/serialize/mod.rs b/crates/metal2vulkan/src/spirv/serialize/mod.rs
+index e0b02378e..f8067e12c 100644
+--- a/crates/metal2vulkan/src/spirv/serialize/mod.rs
++++ b/crates/metal2vulkan/src/spirv/serialize/mod.rs
+@@ -1684,6 +1684,7 @@ impl Ser<'_> {
+         // A copy shares its operand's id, so one id may carry several values: each decoration is
+         // written once per id.
+         let mut non_uniform = std::collections::BTreeSet::new();
++        let mut relaxed = std::collections::BTreeSet::new();
+         for f in &m.functions {
+             for p in &f.params {
+                 if self.is_psb_pointer(self.value_ty(*p)?)? {
+@@ -1726,6 +1727,11 @@ impl Ser<'_> {
+                     if m.non_uniform.contains(&r) && non_uniform.insert(self.val(r)?) {
+                         self.decorate(w, self.val(r)?, Decoration::NonUniform, &[])?;
+                     }
++                    // The result of a `half` operation at the device's own 16-bit precision
++                    // (`narrow::round_native`).
++                    if m.relaxed.contains(&r) && relaxed.insert(self.val(r)?) {
++                        self.decorate(w, self.val(r)?, Decoration::RelaxedPrecision, &[])?;
++                    }
+                 }
+             }
+         }
+diff --git a/crates/metal2vulkan/src/spv.rs b/crates/metal2vulkan/src/spv.rs
+index bc26130e3..0d469d1e7 100644
+--- a/crates/metal2vulkan/src/spv.rs
++++ b/crates/metal2vulkan/src/spv.rs
+@@ -5841,6 +5841,7 @@ pub enum ImageFormat {
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+ #[repr(u32)]
+ pub enum Decoration {
++    RelaxedPrecision = 0,
+     SpecId = 1,
+     Block = 2,
+     ColMajor = 5,
 diff --git a/crates/metal2vulkan/src/tests/engine_arena.rs b/crates/metal2vulkan/src/tests/engine_arena.rs
 index d06163b78..aa26abc1f 100644
 --- a/crates/metal2vulkan/src/tests/engine_arena.rs
@@ -3310,6 +3828,73 @@ index d06163b78..aa26abc1f 100644
 +        assert_eq!(run_both(&module, &res).expect("table output"), want);
 +    }
 +}
+diff --git a/crates/metal2vulkan/src/tests/engine_native_half.rs b/crates/metal2vulkan/src/tests/engine_native_half.rs
+index f23510ff5..026ac4aad 100644
+--- a/crates/metal2vulkan/src/tests/engine_native_half.rs
++++ b/crates/metal2vulkan/src/tests/engine_native_half.rs
+@@ -1001,3 +1001,62 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
+     }
+     assert_eq!(forms.len(), 3, "a profile of each form: {forms:?}");
+ }
++
++/// The `OpDecorate`s of `RelaxedPrecision` in `words`.
++fn relaxed_decorations(words: &[u32]) -> usize {
++    let mut at = 5;
++    let mut n = 0;
++    while let Some(first) = words.get(at) {
++        let (count, op) = ((first >> 16) as usize, first & 0xFFFF);
++        // OpDecorate %target RelaxedPrecision
++        if op == 71 && words.get(at + 2) == Some(&0) {
++            n += 1;
++        }
++        at += count.max(1);
++    }
++    n
++}
++
++/// On lavapipe (`shaderFloat16`, no `DenormPreserve` for 16 bits, no measured conversion) a `half`
++/// sum is left to the device's own 16-bit precision by default: its `float` result is decorated
++/// `RelaxedPrecision` and no conversion pair rounds it, recorded `NativeHalfConversion`
++/// (`narrow::round_native`). Under `exact_answers` (`HalfChainPolicy::EachOperation`) the sum
++/// keeps its conversion to 16 bits and back and nothing is decorated. A conversion from `float`
++/// alone is never decorated, under either policy: its operand is a `float` the function holds.
++/// MoltenVK, whose conversion is measured to be Metal's, and RADV, whose float controls make it
++/// so, decorate nothing.
++#[test]
++fn a_half_operation_is_the_devices_16_bit_one_by_default_without_denorm_preserve() {
++    let Some(bc) = bitcode() else {
++        return;
++    };
++    let exact = DevicePolicy::default().exact_answers();
++    let fast = profile("lavapipe", DevicePolicy::default()).expect("profile");
++    let kept = profile("lavapipe", exact).expect("profile");
++    assert!(crate::lower::arith::narrow::relaxes(&fast));
++    assert!(!crate::lower::arith::narrow::relaxes(&kept));
++    let sum = compile(&bc, "half_sum", &fast).expect("half_sum");
++    link_and_validate(&sum, &fast).expect("L3");
++    assert_eq!(relaxed_decorations(&sum.module.words), 1);
++    assert!(sum.precision.contains(&PrecisionNote::NativeHalfConversion));
++    // The two `fptrunc`s keep their pairs; the sum has none.
++    let (r, k) = (
++        rounding(&sum.module.words),
++        rounding(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
++    );
++    assert_eq!((r.narrowings, k.narrowings), (2, 3));
++    assert_eq!(
++        relaxed_decorations(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
++        0
++    );
++    for p in [&fast, &kept] {
++        let narrow = compile(&bc, "half_narrow", p).expect("half_narrow");
++        assert_eq!(relaxed_decorations(&narrow.module.words), 0);
++    }
++    for stem in ["moltenvk-m3", "amd-780m-radv", "swiftshader"] {
++        let p = profile(stem, DevicePolicy::default()).expect("profile");
++        assert!(!crate::lower::arith::narrow::relaxes(&p), "{stem}");
++        let a = compile(&bc, "half_sum", &p).expect(stem);
++        assert_eq!(relaxed_decorations(&a.module.words), 0, "{stem}");
++    }
++}
 diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
 index aa37a1f92..fd70016e4 100644
 --- a/crates/metal2vulkan/src/tests/fast_paths.rs
@@ -3323,11 +3908,50 @@ index aa37a1f92..fd70016e4 100644
          choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
          choice!(p.ycbcr_in_place_reads: YCbCrInPlacePolicy { Model, Exact }),
          choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
+diff --git a/docs/API.md b/docs/API.md
+index 6a4573d91..f5389e0e7 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -123,8 +123,14 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
+   operation whose flags hold `contract` and `reassoc` and whose result only such operations read
+   is left unrounded: the chain rounds where a value leaves it, one quantize per exit instead of
+   one per operation, recorded `FastMathRewrites`. `half_chains = HalfChainPolicy::EachOperation`,
+-  which `exact_answers()` selects, rounds every operation. A device with `shaderFloat16` computes
+-  `half` alike under either value.
++  which `exact_answers()` selects, rounds every operation. On a device with `shaderFloat16`
++  whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits; Turnip on Adreno 6xx
++  and 7xx), the same switch chooses how a `half` operation the device has an instruction for
++  (`+ - * /`, `fma`, `dot`, `mix`, `sqrt`, `rsqrt`, `exp`, `exp2`, `log`, `log2`) is stated: under
++  `AtExits` its `float` result is decorated `RelaxedPrecision` and the device computes it at its
++  own 16-bit precision (`narrow::round_native`), recorded `NativeHalfConversion`; under
++  `EachOperation` it is computed in `float` and converted to 16 bits and back, as before. Every
++  other device with `shaderFloat16` computes `half` alike under either value.
+ - **Batches of a queue ordered by their ends** (`BatchOrderPolicy::Ends`, the runtime's choice; no
+   pipeline differs). On ANV, RADV and NVIDIA's driver, each measured to start no kernel submission
+   of a `VkQueue` before the one before it completed, each batch of command buffers ends with a
 diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
-index 1f13b41f8..eab7cf99a 100644
+index 1f13b41f8..4ce04b50c 100644
 --- a/docs/FAST-PATHS.md
 +++ b/docs/FAST-PATHS.md
-@@ -117,6 +117,11 @@ known. The rest of the differences are docs/API.md section 9's precision notes.
+@@ -35,14 +35,15 @@ three consumer pipelines: A2X (`a2x-s4`, `a2x-s96`), Xgc14 (`xgc14-bgra8`) and X
+ | A blend into a packed 16-bit attachment the device renders through its word view (`A1BGR5Unorm`, `ABGR4Unorm` on the RTX 5080; `WordAttachment`), which the function computes in the interlocked storage form, reads the attachment's codes, where Metal's tile holds the pass's clear and each earlier blend's result as a `half`, finer; under fast math it also sums a few states otherwise than Metal. Every device rendering such an attachment. | The in-shader blend over the codes (no switch) | **Not built yet:** the extended-range attachments' `half` shadow (`render/extended_shadow.rs`, `VariantKey::extended_shadows`) taken by word attachments: the runtime's shadow start and end, its load of the codes and the clear's halves, and the word's shadowed variant in `lower::fragment::fetch`, for a single-sampled pass and a multisampled one (an extended-range color's shadow holds per sample, from the pass's clear). Fast math's regrouped sums have no model | One code: without fast math exact over a loaded attachment (the 2,891 states of the M3 sweep, every channel), under fast math 3,527 of 94,732,288 channels a code apart; after a clear or an earlier blend in the pass, a code apart where the two readings store different codes. `DeviceColorConversion` (`device-color-conversion`) | Not measured. Expected from the shadow's form: an `R16G16B16A16_SFLOAT` image of the pass's extent per such color (8 bytes a pixel, 16.6 MB at 1920x1080), set at the draw it starts by a fill or a load dispatch, and an 8-byte storage read and write per blended fragment inside the interlock beside the word's |
+ | A heap's colour texture that Metal keeps losslessly compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage, 16 texels or more a side), on a driver whose compressed images may keep their texels apart from the memory they are bound to (`DriverFact::CompressedImagesHideAliasedWrites`: ANV), is the driver's compressed optimal image, its compression and fast clears kept. A texture Metal keeps uncompressed takes the uncompressed image under either value. The runtime's choice: no pipeline differs. | `heap_compression = HeapCompressionPolicy::Compressed` | `heap_compression = HeapCompressionPolicy::Uncompressed`: an image the driver keeps uncompressed in the heap's bytes, as for a texture Metal keeps uncompressed: host-transfer usage where the device enabled `hostImageCopy` (`heap-texture-host-transfer`), else a linear image (`heap-texture-linear`), else the optimal one (`heap-texture-hides-aliased-writes`) | A write through a buffer or another texture over the texture's bytes may leave its texels as they were or change them otherwise than as written, where Metal's texture reads opaque magenta (`0xffff00ff`) in every texel of drawn content the write covers and the written bytes where it held only a clear; the texture's own writes may show in those bytes compressed. Within Metal's contract: Metal documents such a texture's layout as its own (`allowGPUOptimizedContents` lets it "adjust the private layout"), so no write through another view over its bytes has a defined result there either. `HeapTextureCompressed` (`heap-texture-compressed`), announced once per device where such a texture is made; `runtime_lane::heap_textures` | ANV (Iris Xe of RPL-P; `heap_textures::heap_compression_costs`), a 2048x2048 `RGBA8Unorm` render target in a `Private` placement heap: a pass that clears it 26.9 us against 676.2-676.5 us; a copy into another such texture 647.7-649.1 us against 673.9-693.2 us |
+ | Batches of command buffers committed on one queue that the scheduler finds ready together (a backlog) go to the driver in one `vkQueueSubmit`, at most four, only the last signalling the queue's timeline, on a device whose own check finds a submission that signals nothing merged into the next (`submit_check.rs`, once per driver, release and kernel: one `vkQueueSubmit` of four empty infos against four calls of one, merged where the one costs at most 0.6 of the four; Mesa 26.2.6's RADV on the Radeon 780M, the RX 7900 XTX and the RX 550 at 0.33-0.38, ANV on the Iris Xe of RPL-P at 0.39, MoltenVK 1.4.2 on the M3 Max at 0.98; a device whose check has not answered, or that does not merge, takes the ungrouped form under either value of the switch): one kernel submission, where ANV on i915 lists every `VkDeviceMemory` in each (the consumer's guest drag on the Iris Xe: about 300 entries per execbuffer, 260 of them its host imports, at 112 to 128 execbuffers a frame). A batch's event signals ride to the group's end, which signals each event's semaphore to the highest index the batches held signal it to (an event's indices rise in commit order). A batch that signals a binary semaphore, takes a fence, binds a sparse update, does first work, names the caller's wrapped image, or waits for anything not seen complete (an event, another queue's work) goes alone, after the batches held: a batch with a wait leads a group, never joins one. So that checked command buffers (the consumer checks each) are found ready together, the submission checks of up to three batches right behind a line's head that goes run with the head's, in commit order, none committed after another queue's batch: such a check runs before the previous batch's `vkQueueSubmit` rather than after it, in the scheduler pass that submits its own batch. A pass that finds no batch ready sends the batches held, unless two or more earlier submissions of their `VkQueue` are not seen complete: the GPU runs those first in any case, so the batches stay held, and those committed meanwhile join them, until one submission is left in flight (a completion turn wakes the scheduler at its value), the group fills, a later batch sends it, a head waits for the GPU, or a thread waits for one of their command buffers' completion, which sends them at once; nor are they kept where the scheduler's thread runs next a submission handler of another queue's command buffer: they go first, as Metal schedules a queue's command buffers whatever another queue's handler does (an M3 Max, probe `cross_queue_handler_waits`); a batch that ends a command buffer with a switch of storage forms riding on it, which settles by its submission's outcome, is never kept so. A batch a committing thread submits (`CommandBuffer::commit_and_submit`) goes alone where its `VkQueue` runs at most one earlier submission not seen complete, as the pass that held it would send the group at once; where two or more run it is left to the scheduler's thread, which holds it. A held batch that ends its command buffer is `Scheduled` as it is held, its submission handlers run first, then its scheduled handlers, and its kernel end time set, as an M3 Max schedules a command buffer committed behind running work 0.04 to 0.18 ms after its commit. The runtime's: no pipeline differs. | `completion = CompletionPolicy::Grouped` | `completion = CompletionPolicy::Exact`: one submission per batch, each signalling its own values; each line's head checked alone | Each command buffer of a submission but the last is seen complete (status, completed handlers, waits), and the event values it signals are reached (by the GPU waits on other queues, the host's waits, value reads and listeners), once the last completed: late by the GPU time of at most three later batches (about 0.1 to 0.2 ms each in the consumer's compositor frames on the Iris Xe; about 20 ms behind a 20 ms batch), never early, in commit order. Metal's contract states no bound on when completion is seen (an M3 Max reports a command buffer complete, its handlers, status, waits and event listeners alike, 0.04 to 0.10 ms after its GPU end), and no member but the first waits, so no wait holds a member back: a valid program sees only later completion, as of slower GPU work. A batch kept while earlier work runs is seen complete within the same bound, and, where the one submission left in flight ends before its group reaches the GPU, late besides by that gap: at most a completion turn's reaction and the group's `vkQueueSubmit`. Commands, barriers and GPU times are unchanged. `GroupedCompletion` (`grouped-completion`), announced once per device at its first such submission; `runtime_lane::grouped_submissions` | ANV (Iris Xe of RPL-P; `frame_costs::frame_costs_over_imports`, the checked device, 67 command buffers a frame, GPU at 467-783 MHz), with 520 host imports live, where the Exact form's submissions fall behind the commits as the guest's do: 32.0-33.2 kernel submissions a frame against 67.0, 3.4-3.5 ms of execbuffer ioctl a frame against 6.9-7.9 ms, the scheduler thread's CPU 61-63 us a command buffer against 121-136 us, a frame through completion 4.7-5.9 ms against 8.6-9.7 ms; in the guest's shape with 520 (a second queue taking every 20th command buffer, each signalling a shared event, every 10th waiting for one): 26.2-26.7 kernel submissions a frame against 67.0, 2.8 ms of ioctl a frame against 6.9-7.0 ms, the scheduler 52-53 us a command buffer against 122-123 us, a frame through completion 6.0 ms against 8.7 ms; with 260, where it keeps up, 64.9-66.3 kernel submissions a frame against 67.0, the CPU and wall times alike. The cost (`grouped_submissions::grouped_completion_delays`, 8 command buffers of 0.3-0.5 ms of GPU work ready together): the host saw each but a group's last complete later by the later ones' GPU time, the last 0.1-0.3 ms later than alone (the completion turn's per-command-buffer work for the group, done at its end). Keeping a group while earlier work runs (UHD 770 of RPL-S, ANV, the guest's shape with 520 host imports, a submission handler on every command buffer and a 16 MiB fill ahead of each, about 1.3 ms of GPU each; the kept form against the batches sent as found): committed every 1 ms, 18.1-18.2 groups kept a frame, 24.9-25.0 kernel submissions a frame against 57.9, 2.18-2.90 ms of execbuffer ioctl a frame against 4.64-5.43 ms, the scheduler thread's CPU 67-82 us a command buffer against 113-118 us, the GPU idle within a frame's span 0.61 ms against 0.68-0.69 ms, a frame through completion 89.5-89.6 ms alike, completion seen later (GPU end to completed handler: mean 1.82-1.86 ms against 0.43-0.46 ms, p50 1.57-1.60 against 0.11-0.13, p99 4.35-4.37 against 4.09-4.11, max 4.52-4.55 against 4.18-4.23); committed at once, 18.0 kernel submissions a frame against 23.4; with no fill, 18.0 against 20.6, the GPU idle 0.59 ms against 0.58-0.66 ms. In the consumer's guest drag on the Iris Xe (i9-13900H; three passes each way): 24.4-27.5 kernel submissions a frame against 42.4-43.8, the scheduler thread 0.4-1.7 ms of CPU a frame less, 15.7-17.3 frames a second against 16.4-17.6: the frame rate alike within noise, as the scheduler thread does not bound that frame. A batch a committing thread submits alone (RADV, Mesa 26.2.6, RX 7900 XTX, whose check finds submissions merged; two rounds each against the form that left every batch that may wait in a group to the scheduler's thread, `tests::completion_latency`): a checked fill's `commit_and_submit` to its submission handler p50 30.4-32.8 us, p90 32.3-35.9, p99 48.8-57.8 against 36.2-55.7, 56.4-176.3 and 112.1-198.5, the call returning after its submission (32-34 us against 4-8); committed 2 ms apart between two shapes of `commit`, its commit to submission p50 31.9-36.1 us, p90 102.6-135.7 against 39.2-50.1 and 152.1-169.7, and the `commit`s beside it alike (p50 32.1-47.3 us against 38.9-46.7, the scheduler thread's wake p50 4.0-4.5 us against 4.1), as the committing thread wakes that thread after a batch it submitted alone, as the batch's hand-off to it would have. On lavapipe, whose check finds no merge, the two forms alike, the scheduler's thread woken alike (a checked fill's p50 12.5-13.4 us against 12.4-13.4). |
+-| Batches of command buffers on one `VkQueue`, on a driver measured to start no kernel submission of a queue before the one before it completed (ANV, RADV and NVIDIA's; `batch_order.rs`), are ordered by their ends: each ends with a barrier ordering its work before every later command of its `VkQueue` (the exact form's end orders it before the host's reads and writes alone), so a batch that depends on an earlier one there begins with no barrier of its own, often no command buffer of barriers, and its first encoder's GPU start is written at the bottom of the pipe, once everything before it completed. Metal starts an independent command buffer committed behind running work while that work runs (an M3 Max under macOS 27.0.1, probe `gpustart`); those drivers ran two batches of independent work one after the other under every shape measured (no end barrier, the host's or the widened one; in one `vkQueueSubmit` or two, merged into one kernel submission or not), where two dispatches of one command buffer ran side by side. The runtime's: no pipeline differs. | `batch_order = BatchOrderPolicy::Ends` | `batch_order = BatchOrderPolicy::Exact`: a barrier for each dependency of a batch's work on an earlier batch's of its `VkQueue`, the end's barrier to the host's reads and writes alone, the GPU start written at the top of the pipe; every other driver takes it under either value | None: on those drivers each batch starts once the one before it completed under either value, so the work's order, its results and its GPU times are the same, and a batch's GPU start is the end of the work before it, when such a driver starts it. Not announced; `runtime_lane::commit_work` and `runtime_lane::gpu_times` test both values | UHD 770 (ANV, RPL-S), the consumer's frame shape over 520 host imports, 67 command buffers a frame, Grouped completion, the widened end barrier against the exact form (a probe build of each): with no fill ahead of each command buffer, 67.0 command buffers submitted a frame against 129.3-129.7, the GPU's span a frame 1.84-1.90 ms against 1.99-2.06 ms, a frame through completion 2.13-2.22 ms against 2.27-2.38 ms; with a 1 MiB fill ahead of each, 134.0 against 262.9, 8.03-8.22 ms against 8.32-8.42 ms, 9.00-9.15 ms against 9.25-9.36 ms. Radeon 780M (RADV, Mesa 26.0.8), this switch: with no fill, 67.0 against 128.9-129.0, a frame through completion 48.3-48.6 ms against 42.6-47.0 ms; with a 16 MiB fill committed at once, 134.0 against 251.0-251.1, 50.6-50.8 ms against 50.8-57.3 ms; committed every 1 ms, 134.0 against 249.7-250.2, 71.3-83.6 ms against 106.3-113.6 ms (each kernel submission there leaves about 2.5 ms of the GPU idle over 520 host imports, which sets these frames) |
++| Batches of command buffers on one `VkQueue`, on a driver measured to start no kernel submission of a queue before the one before it completed (ANV, RADV and NVIDIA's; Turnip by its source, one command processor running a queue's ring in order; `batch_order.rs`), are ordered by their ends: each ends with a barrier ordering its work before every later command of its `VkQueue` (the exact form's end orders it before the host's reads and writes alone), so a batch that depends on an earlier one there begins with no barrier of its own, often no command buffer of barriers, and its first encoder's GPU start is written at the bottom of the pipe, once everything before it completed. Metal starts an independent command buffer committed behind running work while that work runs (an M3 Max under macOS 27.0.1, probe `gpustart`); those drivers ran two batches of independent work one after the other under every shape measured (no end barrier, the host's or the widened one; in one `vkQueueSubmit` or two, merged into one kernel submission or not), where two dispatches of one command buffer ran side by side. The runtime's: no pipeline differs. | `batch_order = BatchOrderPolicy::Ends` | `batch_order = BatchOrderPolicy::Exact`: a barrier for each dependency of a batch's work on an earlier batch's of its `VkQueue`, the end's barrier to the host's reads and writes alone, the GPU start written at the top of the pipe; every other driver takes it under either value | None: on those drivers each batch starts once the one before it completed under either value, so the work's order, its results and its GPU times are the same, and a batch's GPU start is the end of the work before it, when such a driver starts it. Not announced; `runtime_lane::commit_work` and `runtime_lane::gpu_times` test both values | UHD 770 (ANV, RPL-S), the consumer's frame shape over 520 host imports, 67 command buffers a frame, Grouped completion, the widened end barrier against the exact form (a probe build of each): with no fill ahead of each command buffer, 67.0 command buffers submitted a frame against 129.3-129.7, the GPU's span a frame 1.84-1.90 ms against 1.99-2.06 ms, a frame through completion 2.13-2.22 ms against 2.27-2.38 ms; with a 1 MiB fill ahead of each, 134.0 against 262.9, 8.03-8.22 ms against 8.32-8.42 ms, 9.00-9.15 ms against 9.25-9.36 ms. Radeon 780M (RADV, Mesa 26.0.8), this switch: with no fill, 67.0 against 128.9-129.0, a frame through completion 48.3-48.6 ms against 42.6-47.0 ms; with a 16 MiB fill committed at once, 134.0 against 251.0-251.1, 50.6-50.8 ms against 50.8-57.3 ms; committed every 1 ms, 134.0 against 249.7-250.2, 71.3-83.6 ms against 106.3-113.6 ms (each kernel submission there leaves about 2.5 ms of the GPU idle over 520 host imports, which sets these frames) |
+ | Command queues on a device whose GPU idles when consecutive work comes from another `VkQueue` share `VkQueue`s by choice (`queue_share.rs`): the runtime's own self-check, not a `DriverFact` row, measures that idling once per driver, release and runtime on a thread of its own and keeps its verdict (`Idles`, `DoesNotIdle`, `Unchecked`) in the shader cache's directory, as the in-place check keeps its own (`queue_switch_check.rs`: 48.7 to 51.3 us a switch on the RTX 5080 Laptop GPU, NVIDIA 615.71.09, `Idles` above 20 us). A command queue that makes a command buffer while it holds no other uncompleted one moves onto the busy `VkQueue` of its family whose oldest batch has run under 0.5 ms, the most batches in flight first, so short command buffers of several queues run with no switch between them. A queue one of whose command buffers ran on the GPU for over 2 ms, by its own timestamps (not the host's view of how long it ran as its `VkQueue`'s oldest, which also holds its wait for the GPU to start it and the waiter's lateness to see it complete), or held its `VkQueue` for over 2 ms from the submission of a batch that waited on the GPU for another `VkQueue`'s work (an `MTLEvent`'s signal, the tracker's wait, new resources' first work) to its own GPU end, is long: no queue joins its `VkQueue` while it lives, and it moves once more, at its next idle point, to an idle `VkQueue` no long or unshared queue holds. A queue whose command buffers must never wait behind another queue's (a compositor's beside an application's) is made with `Device::new_command_queue_unshared`: it never moves and no queue joins its `VkQueue`. Presenting queues and a queue that lent its `VkQueue` (`with_vk_queue`) never move. Before the verdict, and where it is not `Idles` or there are no two `VkQueue`s of one family (MoltenVK, RADV, lavapipe), every queue keeps the `VkQueue` it took at its creation; so does every queue of a device whose command buffers write no GPU timestamps it reads (`gpu_times_from_host`, or a driver whose timestamps wait for every queue's), which does not share and is counted (`WorkCounts::queue_sharing_untimed`). The runtime's: no pipeline differs. | `queue_sharing = QueueSharingPolicy::Adaptive` | `queue_sharing = QueueSharingPolicy::PerQueue`: each command queue keeps the `VkQueue` it took at its creation, round robin, and the check does not run | A command buffer waits behind the command buffers of the queues sharing its `VkQueue`, where Metal's queues wait for each other only inside one command. The residual stall: once per logical queue that goes long, for a queue that joined its `VkQueue` during its short phase, about one long command buffer's length: the command buffers committed behind that queue's first long one there wait for its whole length (and those behind its later ones while it holds work, until its next idle point). Measured on the RTX 5080 Laptop GPU beside an application that alternates draws with 30 ms command buffers: a shared compositor's commits at 4,800 a second had 64 completions over 10 ms, at most 26.4 to 30.1 ms, in each of 3 runs of each of two such shapes (one join each), against none over 10 ms under `PerQueue` in those 6 runs (at most 5.6 to 9.7 ms); with 2 ms of draws between long command buffers, none over 10 ms in 3 runs (at most 5.7 to 9.8 ms) against 7, 0 and 0 under `PerQueue` (at most 6.9 to 11.2 ms). On an unshared queue, 0 over 10 ms in every run. A command buffer's GPU start time includes the other queues' work before it. `QueueSharing` (`queue-sharing`), at the device's first join | Command buffers a second on the RTX 5080 Laptop GPU, one-draw command buffers, each thread its own queue, the default against `PerQueue`, runs after a lock hold's first: 8 threads with 3 in flight 50.7k to 54.7k against 27.4k to 28.0k (5 runs each); 8 threads with 1 in flight 47.0k to 50.1k against 13.9k to 14.3k (5); 2 threads with 3 in flight 28.0k to 53.7k against 21.4k to 28.0k (10 each, in turn, the default above `PerQueue` in each pair; no thread's queue marked long), and beside another process's 30 ms command buffers 5.1k to 6.7k against 4.0k to 4.1k (3 each; the host's view marked a thread's queue long in 1 of 3 runs, which then ran at `PerQueue`'s 4.1k); 2 threads with 1 in flight 16.9k to 20.7k against 10.1k to 11.5k (5); one thread over 16 queues in turn 21.7k to 43.3k against 10.2k to 11.1k, over 2,048 20.0k to 39.2k against 10.2k to 11.2k (4). Beside an application whose queue never shared with the compositor (isolation, 300 and 30 dispatches), both 0 over 10 ms |
+ | A chain of `half` additions, subtractions and products on a device without `shaderFloat16` (vk12-floor, SwiftShader, Pascal; capability emulation: the module computes each in `float` and rounds it by the device's `OpQuantizeToF16`): an operation whose flags hold `contract` and `reassoc` and whose result only such operations read is held at `float` precision unrounded, so the chain rounds where a value leaves it (a store, an output, a conversion, a comparison, a call, a phi, a vector move, an operation without both flags), one quantize per exit instead of one per operation (`lower::arith::half_chain`). A device with `shaderFloat16` computes `half` alike under either value. | `half_chains = HalfChainPolicy::AtExits` | `half_chains = HalfChainPolicy::EachOperation`: every operation's result rounded to `half`, as the AIR computes it | The result may differ from the rounded operations' by the roundings the chain skips, each within half a unit in the last place of a `half` at its step, compounded along the chain; a value inside the chain past `half`'s range (65504) stays finite where the rounded operations reach infinity. Within the AIR's flags, which let a compiler regroup and fuse such operations. `FastMathRewrites` (`fast-math-rewrites`) | Not timed. Size on vk12-floor (the fixtures' SPIR-V words, the default against the accurate form): `hfb_filter_bank` 121,270 against 131,766 (1,024 quantizes against 2,464), `grd_half_many_samples` 82,019 against 84,627, `nan_half_fast` 9,808 against 9,832 |
++| A `half` operation the device has one instruction for (`+ - * /`, `fma`, `dot`, `mix`, `sqrt`, `rsqrt`, `exp`, `exp2`, `log`, `log2`) on a device with `shaderFloat16` whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits: Turnip on Adreno 6xx and 7xx), where no float controls make the conversion to 16 bits Metal's: its `float` result is decorated `RelaxedPrecision` and left to the device's own 16-bit precision (`narrow::round_native`, `narrow::relaxes`), in place of a conversion to 16 bits and back after it. Mesa's compiler folds that pair into nothing (`nir_opt_algebraic.py`, the inexact `f2f32` of an `f2f`), so the accurate form computes every such operation in `float` unrounded, on 32-bit registers. | `half_chains = HalfChainPolicy::AtExits` | `half_chains = HalfChainPolicy::EachOperation`: the operation in `float`, then the device's conversion to 16 bits and back | Each such result is the device's 16-bit one: within one unit in the last place of a `half` (a relative 2^-10) of the `float` result at its step, compounded along a chain; a magnitude below the smallest normal half (2^-14) may be zero; a magnitude from 65520 up is infinite. These are the values Metal's own `half` takes but for the denormals. `NativeHalfConversion` (`native-half-conversion`) | Not timed on a device. ir3 for the Adreno 740 (Mesa's own statistics, scalar operations on 16-bit registers of all in the fragment's body, the default against the accurate form): QuartzCore's `glass_background_all_lph` 724 of 1,085 against 113 of 1,010, its registers 12 against 16 and its waves 8 of 128 fibers against 12 of 64; `variable_blur_frag_lph` 620 of 968 against 43 of 902; `narrow_blur_27_frag_lph` 160 of 244 against 12 of 258 |
+ | A texture that samples, reads, renders into it or is written through a shader (`ShaderWrite` or `ShaderAtomic` usage, of texels of 1, 2, 4, 8 or 16 bytes) over host pages (a no-copy buffer's, or a no-copy heap's buffer's, imported by their pointer or as dma-bufs; or a buffer in fresh pages; or a copied host buffer's copy of them, `copied.rs`, its image bound in the copy's memory where the check passed for the pages, and for the copy's fresh pages or, for a `DRM_FORMAT_MOD_LINEAR` image in memory the device allocates, its pooled memory, `WorkCounts::copied_textures_in_place`) is a linear image aliasing the pages in place, where the device makes the image (its format and usage linear, at the pages' pitch) and its own check shows that the operations Vulkan lets read and write every byte bound to it leave every byte alone while the CPU writes beside it: the image's first move (`VUID-VkImageCreateInfo-pNext-01443` makes such an image start `UNDEFINED`), and for one that renders a render pass's load and store operations and its moves into `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT` and back, and for one a shader writes a kernel's storage writes of its texels (which of a linear image a driver may widen past a texel), each access checked apart (a shader's writes of 1- or 2-byte texels apart from those of wider ones, which a driver may store through a wider access), and each apart for texels that share a line of the device's memory (`nonCoherentAtomSize`, "the size and alignment in bytes that bounds concurrent access to host-mapped device memory") with bytes beside them and for texels that share none (their start, their end and, with bytes between rows, each row's start and end on a line; `in_place::RowEnds`): a byte changed beside texels that share none fails both, one changed beside texels that share one fails those alone (the Iris Xe, ANV, Mesa 26.2.6, whose clear and store, and draws, write back whole the 64-byte line that holds a row's last texels, fails renders, and writes, for rows that end inside a line, a byte between rows changed, and passes both for rows that end on one: a 3840x2160 `BGRA8Unorm` surface's 15360-byte rows are 240 lines each). A kernel's writes of a texture over a buffer's rows (no IOSurface plane's) whose rows, each to its pitch, start and end on a line, its buffer holding the last row to its pitch, take a verdict of their own from the same rounds, which a round that changed only bytes of its rows' padding (after a row's last texel, before its pitch, the last row's included) passes (`in_place::Padding`, `Access::BufferWrites`): Metal leaves those bytes to the GPU there (an Intel UHD Graphics 630 under macOS 26.7.1 wrote older values back over the CPU's writes to them under a kernel's writes of a texture over a buffer, the last row's included, where an M3 Max under macOS 27.0.1 and a Radeon Pro 5300M kept them, and all three kept them under draws, clears and stores and over IOSurfaces; `crates/metal2vulkan-conformance/probes/row_padding_writes.m`), and the rule follows the x86 Macs' envelope (docs/API.md, section 10, **Kernels**), so the Iris Xe's written textures over a buffer take the image in place whatever their rows' ends. A deliberate, scoped exception to relying on documented Vulkan behaviour alone, the owner's rulings (2026-10-26, and 2026-10-27 and 2026-11-07 for render targets and written textures: the GPU works on the caller's pages in place as a Mac's does, whatever a linear image costs it, on a discrete GPU too; `in_place.rs`). A texture over a buffer of the runtime's pooled memory whose rows the device's own linear image lays out otherwise (a padded pitch the driver does not take: ANV lays linear rows tight; rows apart only over a buffer that declares them unobserved, `BufferDescriptor::padding_unobserved`) is, by the same rule, a `DRM_FORMAT_MOD_LINEAR` image at Metal's pitch bound in the buffer's memory where the device makes one (no external memory, which Vulkan allows: `VUID-VkImageCreateInfo-tiling-02261`, `VUID-vkBindImageMemory-image-01445`), made `UNDEFINED` (`VUID-VkImageCreateInfo-initialLayout-12478`), whose first move the check's pooled class judges (`PagesClass::Pooled`: a buffer of that memory, its images at Metal's pitch alone; `WorkCounts::pooled_pitched_images`); a texture made before that class's verdict is a shadow that moves to that image once the verdict passes, as one over host pages moves in place (below; `WorkCounts::pooled_textures_moved_in_place`, `pooled_texture_shadows_freed_after_move`). A texture over a buffer whose memory the runtime exports (`exported_memory.rs`: a block that exportable buffers of one handle type share) is, by the same rule, the device's linear image or that `DRM_FORMAT_MOD_LINEAR` image made for the memory's handle type, which an image bound there must name (`VUID-vkBindImageMemory-memory-02728`), and so made `UNDEFINED` (`VUID-VkImageCreateInfo-pNext-01443`), whose first move the check's exported classes judge, one per handle type (`PagesClass::ExportedFd`, `PagesClass::ExportedDmaBuf`: an exportable buffer of that handle type, its textures taking the product's image), a texture made before their verdicts moving to it once they pass as over the pooled memory; a shadow, its notice naming why, where the memory is a buffer's dedicated allocation (`VUID-vkBindImageMemory-memory-10926`) or the device's image format query (`VkPhysicalDeviceExternalImageFormatInfo`) takes the handle type for no such image without a dedicated allocation. A texture over a buffer in a block of the runtime's buffers allocated exportable as an opaque file descriptor and never exported (`memory.rs`'s "Buffers in exportable blocks") is the device's linear image made for that handle type, made `UNDEFINED`, and never a `DRM_FORMAT_MOD_LINEAR` one (RADV asks a dedicated allocation of one made for any handle type), whose first move and accesses the check's class of such blocks judges (`PagesClass::FdBlocks`: a buffer in such a block, its textures taking the product's images, made only where such a block holds every image a texture over a plain block's buffer that keeps its padding takes in place, `texture/fd_blocks_cover.rs`); the device's buffers lie there only where those verdicts give every texture over one what it takes over a plain block's buffer (`in_place::fd_blocks_take`), in plain blocks until they are known, and a buffer that declares its padding unobserved lies in a plain block wherever, so that a texture over it whose rows lie apart keeps its `DRM_FORMAT_MOD_LINEAR` image. A texture that renders over a buffer that declares its padding unobserved, its rows each to its pitch sharing no line with bytes past them, takes the verdict of renders that lets a byte of its rows' padding change (`Access::UnobservedRenders`, `Padding::Unobserved`), which the renders' own rounds give as the writes' give theirs: the declaration lets a pass's load and store write those bytes (the Iris Xe's clear and store write back the 64-byte line that holds a row's last texels whole), and a byte past the last row's pitch, or a texel, fails it. The check runs once per driver and driver version (its record named by the driver and the check's own version, not the runtime release), per class of pages, access and row ends, on a thread of its own, the verdicts it measured kept in the shader cache's directory with those it could not check for a cause that lasts for the driver (the device lacks an extension, a feature, an import, a format or an image of the shape), while one it could not check for a cause that may pass (pages or memory not made, an import refused, its writer thread not started, a move or the stores that failed) is checked again by the next device, its reason noted; a texture made before its verdict is a shadow, made without waiting for the check (its rounds take seconds on some devices and builds; `host_texture_shadows_check_pending`), and moves in place once its class's verdicts pass, at the commit of the device's only uncommitted command buffer, with no copy (`host_textures_moved_in_place`), its shadow's image freed once the command buffer that took the move completed (`host_texture_shadows_freed_after_move`), or, where a view made before the move presents it, a shadow made over it holds it as its truth, or the texture is untracked, once those and the texture went. A texture a shader writes of texels of a width no check stores (none of 1, 2, 4, 8 and 16 bytes), a check that failed or made no image, and a format, usage or pitch no image takes keep the shadow (`shadowed-texture`, its reason named, `WorkCounts::host_texture_shadows_*`, those that render and those a shader writes counted apart in `host_texture_shadows_render_target` and `host_texture_shadows_shader_write`). On a discrete GPU a `Shared` texture and an IOSurface's are in place too, read across the bus, never copied to the device's memory for speed; a `Managed` texture over a no-copy buffer's bytes that only samples or reads, over memory that carries a log of its writes, is a device copy instead (`WorkCounts::device_copy_textures`), the GPU's copy of the two Metal keeps of a `Managed` resource on a Mac with a discrete GPU, its copies in only the rows the log reports changed. | `host_page_textures = HostPageTexturePolicy::InPlace` | `host_page_textures = HostPageTexturePolicy::Shadow`: every texture over host pages a shadow, its texels copied in before each command buffer that uses it and merged back after each write (the host-pages bullet under **Costs of matching Metal**) | Exact where the driver keeps what its check showed: the check covers texels, the bytes between rows and those after the image, of 1, 2, 4, 8 and 16-byte texels and a 3840x2160 surface, three rounds each, for an image that reads and one that renders (its pass a clear at load and a store, then a draw over its last column in a pass that loads and stores it; a resolve into it is not among the rounds), the CPU writing beside the texels sweep after sweep until each step completed, so that a device that writes back bytes it read beside them, wherever in the step, puts back an older value the check finds, and, for one a shader writes, of 4, 8 and 16-byte texels, rows apart (of widths no multiple of 4 and odd heights among them) or tight, and 1920x1080, and apart of 1- and 2-byte texels, rows apart at a 256-byte pitch (of rows that end inside a 4-byte word and odd heights) or tight, and 1024x64, each texel stored by a kernel through an unsigned-integer view (a program's atomics, and its stores through a float view, are not among the rounds); a driver whose operations changed a byte outside every round's window would undo a CPU write made meanwhile. A kernel's writes of a texture over a buffer whose padding is free may change that padding, as an x86 Mac's GPU's do (above). Not announced where the check passed. A CPU write reaches the image's reads as it reaches the buffer's (Host Write Ordering Guarantees) | See **Costs of matching Metal** (host pages): the shadow copies a sampled 3840x2160 surface in whole each command buffer, and a render target's shadow copies it in, keeps it and merges it back at each render pass instance |
+ | A render or compute state's creation hands the driver's making of its predicted pipeline (`pipeline/predicted.rs`, `pipeline/dispatch_making.rs`) to the runtime's pool, kept by the state as a draw's or dispatch's making is, and waits for it `pipeline_creation_wait` at most; a committed command buffer's recordings wait until its commit plus `pipeline_commit_wait` at most, one deadline its commands share, for its draws' and dispatches' (a compute encoder's, a render pass's tile dispatches) pipelines still being made (the scheduler wakes at the bound, `StepWaits::until`), an execution's replayed draws (`render/pending.rs`) among them, whose pipelines the commit's settle hands to the pool (a device replay's, one recording for every command, waits until made under either value), then record each such command as nothing: a draw's barriers and visibility query, a dispatch's barrier (a tile dispatch's copies into its scratch and back), no draw or dispatch, the command buffer running on without error. The making goes on, and the command buffers after it draw and dispatch with the pipeline once made. Metal compiles inside `newRenderPipelineState`, so no draw of a made state waits or is dropped; a host that creates a state inside a command buffer's encoding (the consumer creates a guest's state at an execution's first lookup of it) held that execution through the driver's whole compile: 11.59 s inside one execution on an M2 Pro (MoltenVK 1.4.2, a cold Metal compiler service; a sample of such a stall finds the compile's thread waiting in `MVKMetalCompiler::compile` for Metal's compiler), past the guest's 10 s FIFO check, which ended the guest's task. Each bound is 4.5 s: a creation and a commit may fall in one step of the guest's FIFO (a task's jobs run one after another, and a draw's own variant waits under its command buffer's bound), and no runtime call waits for both, so one step waits 9 s at most for makings, under that 10 s check. A creation waits on no command buffer's deadline and a `commit` on no creation's; a `commit` waits until its own deadline at most (it records there what it can, an execution of render commands the CPU writes among them), every other recording on the scheduler's thread, a host step's on one of the steps' threads. Made until made under either value, in the call that makes them: a draw that records nothing, one in a pass of custom sample positions and one recorded again into another instance of its pass (each in the draw's call or an execution's replay), a device replay's draws (in its `commit`), and a failed making made again (`PipelineWaitPolicy`'s docs). The runtime's: no pipeline differs. | `pipeline_waits = PipelineWaitPolicy::Bounded`, `pipeline_creation_wait = 4.5 s`, `pipeline_commit_wait = 4.5 s` | `pipeline_waits = PipelineWaitPolicy::Exact`: the creation makes its predicted pipeline before it returns (a render state's first key on its own thread, the rest on the pool, joined; a compute state's on its own thread), an execution's settle makes its replayed draws' pipelines at the commit, and a command buffer waits for each draw's and dispatch's pipeline until it is made | A draw whose pipeline was still being made `pipeline_commit_wait` after its command buffer's commit renders nothing in that command buffer (only there: later ones draw it), where Metal's renders: content drawn once (a layer, a glyph cache) stays without it until redrawn. A creation returns after `pipeline_creation_wait` at most with its making in flight (`WorkCounts::creations_left_making`). `DrawDroppedStillMaking` (`draw-dropped-still-making`), at each such draw where `DeviceOptions::announce_each` asks, else once per device; `CommandBuffer::dropped_draw` names the first with `VK_TIMEOUT`; `WorkCounts::draws_dropped_still_making`; `deferred_calls::a_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing` and `under_the_exact_wait_a_held_making_holds_its_command_buffer_until_it_lands`. A dispatch whose pipeline was still being made then writes nothing in that command buffer, where Metal's runs: `DispatchDroppedStillMaking` (`dispatch-dropped-still-making`), `WorkCounts::dispatches_dropped_still_making`, the first named by `dropped_draw`; `deferred_calls::a_dispatch_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing`, `a_compute_state_s_creation_waits_its_bound_for_its_predicted_making` and `a_replayed_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing` | No GPU cost. The exact form holds the creating thread, and the command buffer, for the whole compile: up to 11.59 s on the M2 Pro's cold boot (that boot's 2,483 render state creations, translation included: 300 over 16 ms, 151 over 100 ms, 14 over 250 ms, 3 over 1 s, the longest 11.59 s, 5.82 s and 1.17 s), where the default holds a creation for 4.5 s at most and a command buffer for 4.5 s from its commit, which drops the draws of the compiles that outlast those (2 of that boot's 2,483 were over 4.5 s) for the command buffers committed before they land; bounds of 1 s dropped 39 draws in a cold boot on the M2 Pro, and the guest's menu bar, drawn once, stayed half drawn |
+ | A line Apple's `setLineWidth:` widens (`w' = floor(16 w) / 16`, other than 1), and a triangle's edge in fill mode `Lines`, is drawn by the device's own lines at `w'` wherever it draws that width (`wideLines`, `w'` in `lineWidthRange` and above 0), where Metal draws the parallelogram Vulkan's non-strict wide lines may be (`render/line_width.rs`). No device's are taken as it, announced on every device: a strict device's rectangle with square ends (lavapipe, NVIDIA), lines Vulkan does not state as parallelograms (ANV, and every width below 1), a width rounded to the granularity, and a driver's parallelograms (`strictLines` unset, `nonStrictWideLinesUseParallelogram` set), whose ends the driver places (RADV on the Radeon RX 7900 XTX draws 21 of `runtime_lane::line_widths`'s 48 scattered lines at width 2.5 a row or a column off Metal's at an end). A mesh draw's lines and edges and a tessellated patch draw's edges take the device's lines under either value, the band not drawing them (at the nearest width they draw where they do not draw `w'`, announced `lines-at-nearest-width`: a known gap below). The runtime's: no pipeline's code differs. | `wide_lines = WideLinePolicy::Device` | `wide_lines = WideLinePolicy::Exact`: a draw of lines or edges the device's lines draw is the pipeline's band variant (`VariantKey::line_band`, `pipeline::link::band`) on a device with `tessellationShader` (the device's lines where it has none, or where the translator refuses the state's band or the draw's): two triangles over each line's parallelogram, and each triangle's three edges' parallelograms facing as the triangle, through a tessellation control and evaluation stage; every other width other than 1 is the band under either value | The lines can cover pixels the parallelogram does not, and miss others, at each end and along each edge: up to half the width past each end (square ends), a rounded width, and a row or a column at an end (a driver's parallelograms). `DeviceWideLines` (`device-wide-lines`), at each such draw where `DeviceOptions::announce_each` asks, else once per device; `WorkCounts::device_wide_line_draws`, `line_band_draws`, `nearest_width_line_draws`; `runtime_lane::line_widths` (the band matches Metal's maps of lines and of triangles' edges, their facing, culling, flat inputs, primitive IDs and depth on MoltenVK under both values, which has no `wideLines`; a band of edges under a depth bias is announced `wide-edge-depth-bias`) | Not measured. Expected from the band's form: a second pipeline variant made for each render state that draws such lines or edges (its two synthesized stages), each line tessellated as a patch of two control points into four corners and each triangle as a patch of three into 21 triangles (12 degenerate), and a strip, loop or fan drawn as the list of its primitives |
+ | A blit or fill through a `BGRA10_XR` or `BGRA10_XR_sRGB` texture Metal keeps losslessly compressed (`allowGPUOptimizedContents`, 16 texels or more a side, neither `ShaderWrite` nor `PixelFormatView` usage, one sample, not over a buffer) is the device's copy, which keeps the bytes it moves, on every device: Metal's GPU blit into, out of or between such textures moves the texels through its compression, which writes each 16-bit field's low six bits cleared and the alpha code clamped to `[384, 894]`, and its fill clears the low six bits alone (an Apple M3 Max under macOS 27.0.1, every direction, storage mode, usage and size that decides the compression; CPU copies keep the bytes on Metal too). A pass's draws through such an attachment are the device-gap row below. The runtime's choice: no pipeline differs (`compressed_blit.rs`). | `extended_range_blits = ExtendedRangeBlitPolicy::Kept` | `extended_range_blits = ExtendedRangeBlitPolicy::Canonical`: after a blit writes such a texture's region, or a blit out of one writes a buffer's words, a texture over a buffer's or another texture's, a compute dispatch (`bind::extended_canonical_module`, `extended_canonical.rs`) rewrites the texels it wrote in Metal's encoding: in place in a buffer's bytes, an image's through a scratch buffer, a copy out and back around the dispatch; a fill's texel is encoded before it is written. A buffer whose words the device cannot bind (an offset or pitch off 4 bytes, a region past `maxStorageBufferRange`) and a texture over a buffer whose rows share bytes keep the bytes under either value, announced | Bytes no Metal write left (uploaded, CPU-copied or kernel-written texels: a field's low six bits, an alpha code outside `[384, 894]`) keep what Metal's blit would rewrite; a texel reads the same value either way, its low six bits unread and its alpha read clamped. `ExtendedRangeBitsKept` (`extended-range-bits-kept`), once per device; under `Canonical` not for the blits it makes exact; `runtime_lane::compressed_blits` (both values on MoltenVK), the conformance cases `compressed-blits-bgra10xr` and `compressed-blits-bgra10xr-srgb` | Measured, `Canonical` against `Kept`, on `Private` `BGRA10_XR` textures Metal keeps compressed (the sRGB twin and fills not measured), 256x256 and 2048x2048, one whole-texture blit a command buffer: p50 of 300 blits a run, the two values interleaved in one process, three runs a host. RTX 5080 Laptop (NVIDIA 615.71.09, the command buffer's GPU time): a buffer into the texture 23.5 against 11.5 us and 761 against 244 us from a `Private` buffer, 42 against 30 us and 1,945 against 1,176 us from a `Shared` one; the texture into a `Private` buffer 14.1 against 11.2 us and 287 against 246 us, into a `Shared` one, whose words the dispatch rewrites in system memory, 66 against 27 us and 3,386 against 1,182 us; texture into texture 22.5 against 9.7 us and 630 against 80 us. Apple M3 Max (MoltenVK 1.4.2, whose GPU times are the host's, so per blit of 16 in one command buffer), the same blits: into the texture +38 to +57 us and +536 to +548 us, out of it into a buffer +15 us and +84 to +94 us, texture into texture +46 to +48 us and +535 to +541 us. Every figure is above its `Kept` one in every run, by more than the runs' spread (under 1 us on the 5080): measurable at both sizes on both hosts. Into an image a blit adds a copy out into a scratch buffer of the region's size, the dispatch, a copy back and the barriers between them; into a buffer the dispatch and a barrier. The scratch is made without zeros, since the copy out writes every byte the dispatch and the copy back read; the figures above were taken while it was zeroed first, by a command buffer of its own (a fill on the 5080, a copy on MoltenVK). CPU from the command buffer's making through its commit, a blit alone: +1 to +3 us on the M3 Max, +1 to +127 us on the 5080, whose host other builds loaded; 16 blits into 2048x2048 images in one command buffer hold 16 scratch buffers of 32 MiB, and encoding each costs 141 to 165 us (5080) and 286 to 356 us (M3 Max), new memory blocks among it, against 2 to 6 us under `Kept`. Nothing for a texture Metal keeps uncompressed or of another format |
+-| A colour attachment of a texture's own image (not over a buffer's bytes, not memoryless, resolving nothing) that a pass stores `DontCare` is stored as the driver stores it: `DONT_CARE` on a driver measured to keep one of Metal's two answers or to store as Metal's own (`DriverFact::DontCareStoreIsOneOfMetals`, `DontCareStoreIsMetals`), else `STORE`, the rendered texels (`render_target.rs`). Metal's documentation leaves the contents open (`MTLStoreAction.dontCare`: "You need to assume that GPU discarded the texture's contents"); Apple's GPU leaves the texels the attachment held before the pass, the pass's clear and draws both gone (the conformance case `pass-sequence-color-actions`, an M3 Max under macOS 27.0.1, eight runs alike), or the rendered ones where its tiler overflows. A pass MoltenVK runs as one instance is handed to Metal's own `DontCare` under either value. | `dont_care_colors = DontCareColorPolicy::Driver` | `dont_care_colors = DontCareColorPolicy::Kept`: the pass renders through a backing its command queue keeps, one image of the attachment's shape, into which a `Load` copies the texels first, and nothing is copied back, so the texture keeps its earlier texels exactly (`kept_bytes.rs`, `WorkCounts::kept_texels_passes`); where a format makes no such image, the pass stores as under `Driver`, announced | Under `Driver`, the attachment holds the rendered texels (`STORE`: NVIDIA, lavapipe) or what the driver's `DONT_CARE` leaves (RADV, ANV: measured to be one of Metal's two answers), where Metal's holds the earlier texels unless its tiler overflows. `DontCareStore` (`dont-care-store`), once per device; under `Kept` not for the passes it keeps; `runtime_lane::dont_care_stores` (both values), the conformance case `pass-sequence-color-actions` | Measured, `Kept` against the same pass stored `Store`, one pass of one draw over an `RGBA8Unorm` texture a command buffer, commit to completion, the median of 300 interleaved (a scratch measurement, `rows3_cost`): RTX 5080 Laptop (NVIDIA 615.71.09), a `Load` pass 19 µs more at 1920x1080 and 10 µs at 256x256 (16 µs and 7 µs of GPU time), a `Clear` pass 3 µs; lavapipe (llvmpipe, LLVM 23.1.4), a `Load` pass 0.5 to 0.8 ms more at 1920x1080 and 30 µs at 256x256, a `Clear` pass within the runs' spread. Memory: one backing image of the attachment's shape per command queue |
++| A colour attachment of a texture's own image (not over a buffer's bytes, not memoryless, resolving nothing) that a pass stores `DontCare` is stored as the driver stores it: `DONT_CARE` on a driver measured to keep one of Metal's two answers or to store as Metal's own (`DriverFact::DontCareStoreIsOneOfMetals`, `DontCareStoreIsMetals`), else `STORE`, the rendered texels (`render_target.rs`). Metal's documentation leaves the contents open (`MTLStoreAction.dontCare`: "You need to assume that GPU discarded the texture's contents"); Apple's GPU leaves the texels the attachment held before the pass, the pass's clear and draws both gone (the conformance case `pass-sequence-color-actions`, an M3 Max under macOS 27.0.1, eight runs alike), or the rendered ones where its tiler overflows. A pass MoltenVK runs as one instance is handed to Metal's own `DontCare` under either value. | `dont_care_colors = DontCareColorPolicy::Driver` | `dont_care_colors = DontCareColorPolicy::Kept`: the pass renders through a backing its command queue keeps, one image of the attachment's shape, into which a `Load` copies the texels first, and nothing is copied back, so the texture keeps its earlier texels exactly (`kept_bytes.rs`, `WorkCounts::kept_texels_passes`); where a format makes no such image, the pass stores as under `Driver`, announced | Under `Driver`, the attachment holds the rendered texels (`STORE`: NVIDIA, lavapipe) or what the driver's `DONT_CARE` leaves (RADV, ANV: measured to be one of Metal's two answers; Turnip on the Adreno 740: read in Mesa's source to be one, a pass in tile memory skipping the attachment's tile store and one in system memory leaving the stored texels), where Metal's holds the earlier texels unless its tiler overflows. `DontCareStore` (`dont-care-store`), once per device; under `Kept` not for the passes it keeps; `runtime_lane::dont_care_stores` (both values), the conformance case `pass-sequence-color-actions` | Measured, `Kept` against the same pass stored `Store`, one pass of one draw over an `RGBA8Unorm` texture a command buffer, commit to completion, the median of 300 interleaved (a scratch measurement, `rows3_cost`): RTX 5080 Laptop (NVIDIA 615.71.09), a `Load` pass 19 µs more at 1920x1080 and 10 µs at 256x256 (16 µs and 7 µs of GPU time), a `Clear` pass 3 µs; lavapipe (llvmpipe, LLVM 23.1.4), a `Load` pass 0.5 to 0.8 ms more at 1920x1080 and 30 µs at 256x256, a `Clear` pass within the runs' spread. Memory: one backing image of the attachment's shape per command queue |
+ | A linear sample of a two-plane YCbCr texture whose planes a function reads in place (`YCBCR8_420_2P`, `YCBCR10_420_2P` through a uniform texel buffer over their codes, on an integrated GPU or a CPU device; `lower::sampler::in_place`), through a sampler that addresses no border on either plane axis, with no texel offset placed by a parent's size, is Vulkan's Y′CbCr model of the codes, as the device's own conversion with a linear chroma filter computes it: the four luma codes around the point and the four chroma pairs around the same point of the chroma plane (Metal's midpoint siting) blended bilinearly, then the surface's range and matrix (Metal's coefficients) in `float`, each channel clamped into `[0, 1]`: eight fetches. A runtime sampler's word decides as the function runs. A nearest sample, a border mode, a parent-placed offset and a gather are Metal's under either value. | `ycbcr_in_place_reads = YCbCrInPlacePolicy::Model` | `ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact`: every tap Metal's texel (its chroma weighted 9/3/3/1 and rounded to a code, the fixed-point conversion), and the sample Metal's sum of the four taps' steps on the grid `2048`: twenty fetches and four conversions | The model reconstructs each channel at the point where Metal converts four taps and sums them: within the `float` arithmetic's rounding of the model (checked against an `f64` model on the CPU interpreter, `engine_ycbcr_in_place`), it differs from Metal's by the chroma the taps reconstruct, by Metal's roundings to a code and to `1/2048`, and where a tap's channel leaves `[0, 1]`, which Metal clamps before it sums. `HalfSampleFilter` / `FloatSampleFilter` under the bound converted 4:2:0 format, announced `ycbcr-filter-not-exact` | Radeon 780M (RADV): a 3840 x 2160 `YCBCR10_420_2P` frame sampled linearly into a 3840 x 2160 `BGRA8Unorm` target, GPU time per frame (median of 60): 6.4-6.9 ms under the exact form (`runtime_lane::video_frames`) |
+ 
+ All at once: `DevicePolicy::exact_answers()` sets every switch above; each row states its own cost.
+@@ -117,6 +118,11 @@ known. The rest of the differences are docs/API.md section 9's precision notes.
  
  ## Costs of matching Metal
  
@@ -3339,7 +3963,7 @@ index 1f13b41f8..eab7cf99a 100644
  Where matching what Metal observably does costs time, the runtime matches it and the cost is
  recorded here.
  
-@@ -286,6 +291,12 @@ recorded here.
+@@ -286,6 +292,12 @@ recorded here.
    times covering 1.5% or 12.5%, where both builds take the snapshot and the query is the difference
    (on the Radeon 780M 0.55 to 0.71 and 1.04, on the RX 7900 XTX 0.90 to 0.91 and 1.04 to 1.05).
    Other devices are not measured.
@@ -3352,3 +3976,16 @@ index 1f13b41f8..eab7cf99a 100644
  - **A texture over a no-copy buffer's host pages, or over a host-visible buffer longer than 32
    MiB, that a shader writes of texels of a width the check stores none of (none of 1, 2, 4, 8 and
    16 bytes; or whose class's check has not passed for an access of its, or whose format, usage or
+diff --git a/scripts/regen-spirv-grammar/items.txt b/scripts/regen-spirv-grammar/items.txt
+index f4222232b..9216f38c4 100644
+--- a/scripts/regen-spirv-grammar/items.txt
++++ b/scripts/regen-spirv-grammar/items.txt
+@@ -102,7 +102,7 @@ enum ImageFormat
+ values *
+ 
+ enum Decoration
+-values SpecId Block ColMajor ArrayStride MatrixStride BuiltIn NoPerspective Flat Patch Centroid
++values RelaxedPrecision SpecId Block ColMajor ArrayStride MatrixStride BuiltIn NoPerspective Flat Patch Centroid
+ values Sample Invariant Aliased Volatile Coherent NonWritable Location Component Index Binding
+ values DescriptorSet Offset NoContraction InputAttachmentIndex PerPrimitiveEXT NonUniform
+ values AliasedPointer
