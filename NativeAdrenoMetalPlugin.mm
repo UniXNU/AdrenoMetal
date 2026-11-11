@@ -338,11 +338,11 @@ static id deviceForPort(unsigned port) {
                     setenv("TU_DEBUG", value, 1);
                 }
         }
-        // Every pass renders in system memory with the 8-bit BGRA framebuffer (fb-bgra=1): measured against tile memory with the swap of
-        // GMEM loads and stores fixed (patches/mesa/turnip-gmem-mutable-swap.patch, lock screen 99.5 % equal to the RGhA picture), the GPU time per
-        // command buffer was no better (17.8 ms mean and 56.1 ms at p95 in tile memory, 17.1 and 52.1 in system memory), and one home screen frame
-        // still came out with red and blue exchanged. tu-debug= overrides this for experiments.
-        setenv("TU_DEBUG", bootArgSet("fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+        // Every pass renders in tile memory (GMEM) wherever Turnip can tile it: attachments are loaded and stored once per tile instead of
+        // every draw going to system memory, and memoryless attachments take no memory at all. The colour order of GMEM loads and stores is
+        // the image's own swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch: 0.0 % of lock screen tiles exchanged).
+        // A pass Turnip cannot tile still renders in system memory; the RM row of the memory log counts both. tu-debug= overrides this.
+        setenv("TU_DEBUG", "gmem,nocb", 0);
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
