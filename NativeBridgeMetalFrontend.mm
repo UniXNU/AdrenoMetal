@@ -172,6 +172,7 @@ static std::atomic<uint64_t> gPasses,gDraws,gPassPixels,gDispatches,gBlits,gBigg
 // What the screen-size passes (2 Mpx and up) could draw on, for the SA row: how many ended, of them those whose draws' scissors reach
 // 90 % of the target and those that drew nothing, and the pixels of the targets and of the scissors' bounding boxes. A bound from above:
 // a draw may cover less than its scissor, and a pass that never sets one counts whole.
+static std::atomic<uint64_t> gTileDispatches,gTilePipelines;   // tile dispatches encoded and tile pipeline states made (the SA row)
 static std::atomic<uint64_t> gBigPassesEnded,gBigPassesWhole,gBigPassesEmpty,gBigPassTargetPixels,gBigPassScissorPixels;
 // Where the time goes on the CPU side of the bridge: pipeline, library and function creation (count, total and slowest, in microseconds), and the
 // last commits with what each held and how long the GPU took (commit to completion).
@@ -907,10 +908,10 @@ static void journal(const std::string &line) {
  if(gJournalPath.empty())return;
  std::lock_guard<std::mutex> lock(gJournalLock);
  if(FILE *f=fopen(gJournalPath.c_str(),"a")){fwrite(line.data(),1,line.size(),f);fputc('\n',f);fclose(f);}
-}
  // A test boot ends in a reset: every 32 lines the file is synced to disk.
  static uint32_t lines=0;
  if(++lines%32==0){const int fd=open(gJournalPath.c_str(),O_RDONLY);if(fd>=0){fsync(fd);close(fd);}}
+}
 
 // A selector this file lacks (iPadOS 27's QuartzCore sends setResponsibleTaskIDs:count: to every command buffer, which 17 never did): answered
 // once as a no-op returning nil/0, and noted once, instead of the NSInvalidArgumentException that ended the render server. respondsToSelector:
@@ -2580,6 +2581,7 @@ static uint64_t encodeCommandOf(id object) {
  // The pass's target size, its current scissor (x0, y0, x1, y1; the whole target until set) and the bounding box of the scissors its
  // draws ran under (empty until a draw), for the SA row.
  uint32_t _targetW,_targetH,_scissor[4],_drawn[4];
+ uint32_t _tileW,_tileH;   // the pass's tile size (tileWidth, tileHeight)
 }
 @property(nonatomic) uint64_t passKey;   // colour 0 format | load << 16 | surface << 18 | big << 19
 @end
@@ -2708,14 +2710,39 @@ static uint64_t encodeCommandOf(id object) {
 - (void)setFragmentTexture:(id<MTLTexture>)t atTextureIndex:(NSUInteger)ti samplerState:(id<MTLSamplerState>)s atSamplerIndex:(NSUInteger)si {
  [self texture:t index:ti stage:2];[self sampler:s index:si stage:2];
 }
-// Tile shaders and imageblock tile memory (Apple GPU families 4 and up) are not offered: supportsTileShaders answers no, and a call that
-// reaches one anyway fails its command buffer.
-- (NSUInteger)tileWidth {return 0;}
-- (NSUInteger)tileHeight {return 0;}
-- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {(void)t;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {(void)p;(void)n;(void)i;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)dispatchThreadsPerTile:(MTLSize)size {(void)size;[self.commandBuffer refuse:@"tile shaders are not supported"];}
-- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {(void)size;(void)region;[self.commandBuffer refuse:@"tile shaders are not supported"];}
+// Tile shaders (a render pipeline state made from a tile descriptor, dispatched per tile of the pass) go to the runtime, which runs the
+// tile function as a compute dispatch between two instances of the pass. The tile stage is stage 3 of the binders.
+// The tile size is the pass descriptor's, or Metal's default for the pass's samples (32, and 16 at 4 samples); it is answered here
+// because the runtime's encoder is made later, on the encoding thread.
+- (NSUInteger)tileWidth {return _tileW;}
+- (NSUInteger)tileHeight {return _tileH;}
+- (void)setTileBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:3];}
+- (void)setTileBufferOffset:(NSUInteger)o atIndex:(NSUInteger)i {[self offset:o index:i stage:3];}
+- (void)setTileBuffers:(const id<MTLBuffer> __unsafe_unretained [])b offsets:(const NSUInteger [])o withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self buffer:b[k] offset:o[k] index:r.location+k stage:3];
+}
+- (void)setTileBytes:(const void *)p length:(NSUInteger)n atIndex:(NSUInteger)i {[self bytes:p length:n index:i stage:3];}
+- (void)setTileTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {[self texture:t index:i stage:3];}
+- (void)setTileTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self texture:t[k] index:r.location+k stage:3];
+}
+- (void)setTileSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {[self sampler:s index:i stage:3];}
+- (void)setTileSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)a lodMaxClamp:(float)b atIndex:(NSUInteger)i {[self sampler:s lodMin:a max:b index:i stage:3];}
+- (void)setTileSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r {
+ for(NSUInteger k=0;k<r.length;k++)[self sampler:s[k] index:r.location+k stage:3];
+}
+- (void)setThreadgroupMemoryLength:(NSUInteger)length offset:(NSUInteger)offset atIndex:(NSUInteger)index {
+ ENCODE([self check:nmb_render_set_threadgroup_memory_length(self.handle,length,offset,(uint32_t)index) what:"setThreadgroupMemoryLength"]);
+}
+- (void)dispatchThreadsPerTile:(MTLSize)size {
+ const uint64_t threads[3]={size.width,size.height,size.depth};gTileDispatches++;
+ ENCODE([self check:nmb_render_dispatch_threads_per_tile(self.handle,threads) what:"dispatchThreadsPerTile"]);
+}
+- (void)dispatchThreadsPerTile:(MTLSize)size inRegion:(MTLRegion)region {
+ const uint64_t threads[3]={size.width,size.height,size.depth};
+ const uint64_t words[6]={region.origin.x,region.origin.y,region.origin.z,region.size.width,region.size.height,region.size.depth};gTileDispatches++;
+ ENCODE([self check:nmb_render_dispatch_threads_per_tile_in_region(self.handle,threads,words) what:"dispatchThreadsPerTile"]);
+}
 - (void)setStencilReferenceValue:(uint32_t)v {if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,v,v) what:"setStencilReferenceValue"]);}
 - (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b {
  if(gDrawStats)[self noteState:kDSOther key:UINT32_MAX object:nullptr value:0];ENCODE([self check:nmb_render_set_stencil_reference(self.handle,f,b) what:"setStencilReferenceValues"]);
@@ -3299,6 +3326,7 @@ static char kUserDictionaryKey;
  pass.depth.clear[0]=d.depthAttachment.clearDepth;pass.stencil.clear[0]=d.stencilAttachment.clearStencil;
  pass.depth.resolve_filter=d.depthAttachment.depthResolveFilter;pass.stencil.resolve_filter=d.stencilAttachment.stencilResolveFilter;
  pass.width=d.renderTargetWidth;pass.height=d.renderTargetHeight;pass.array_length=d.renderTargetArrayLength;pass.samples=singleSample() && d.defaultRasterSampleCount?1:d.defaultRasterSampleCount;
+ pass.tile_width=d.tileWidth;pass.tile_height=d.tileHeight;pass.imageblock_sample_length=d.imageblockSampleLength;pass.threadgroup_memory_length=d.threadgroupMemoryLength;
  if(d.visibilityResultBuffer) {
   if(![(id)d.visibilityResultBuffer isKindOfClass:[NBBuffer class]]){[self refuse:@"foreign visibility result buffer"];return nil;}
   [self own:d.visibilityResultBuffer];
@@ -3309,6 +3337,13 @@ static char kUserDictionaryKey;
  if(made) {
   ((NBRenderEncoder *)made).resolveCopies=std::move(resolveCopies);
   id<MTLTexture> t0=d.colorAttachments[0].texture;
+  {
+   // tileWidth and tileHeight: the descriptor's, or Metal's default for the pass's samples (32, and 16 at 4 samples).
+   const NSUInteger samples=t0?t0.sampleCount:(NSUInteger)pass.samples;
+   const uint32_t fallback=samples>=4?16:32;
+   ((NBRenderEncoder *)made)->_tileW=d.tileWidth?(uint32_t)d.tileWidth:fallback;
+   ((NBRenderEncoder *)made)->_tileH=d.tileHeight?(uint32_t)d.tileHeight:fallback;
+  }
   const uint64_t big=t0 && (uint64_t)t0.width*t0.height>=2000000;
   if(big) {
    NBRenderEncoder *encoder=(NBRenderEncoder *)made;
@@ -4682,6 +4717,23 @@ static void reportUnreadableLibrary(NSString *path) {
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
  uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
+ // With diagnostics on: which Metal functions the program Turnip just built for this pipeline belongs to (tu_darwin_last_program gives
+ // the vertex and fragment shader hashes of the last program this thread built; the pass records of the frame trace name a pass's
+ // heaviest fragment shader by the same hash). One line per fragment hash, at most 512.
+ if(handle && diagOn()) {
+  static void (*lastProgram)(uint32_t *,uint32_t *)=nullptr;static std::atomic<bool> looked{false};
+  if(!looked.load() && !gLoaderPath.empty()) {
+   if(void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD)){lastProgram=(void (*)(uint32_t *,uint32_t *))dlsym(turnip,"tu_darwin_last_program");looked.store(true);}
+  }
+  uint32_t vs=0,fs=0;
+  if(lastProgram)lastProgram(&vs,&fs);
+  if(fs) {
+   static std::mutex seenLock;static std::set<uint32_t> seen;
+   bool fresh=false;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<512 && seen.insert(fs).second;}
+   if(fresh)os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal shader fs %{public}08x vs %{public}08x | frag %{public}@ vert %{public}@ | %llu us",fs,vs,
+                   d.fragmentFunction.name,d.vertexFunction.name,(unsigned long long)(nowUs()-pipelineBegan));
+  }
+ }
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
  std::string cost=gJournalPath.empty()?std::string():NBCost::now().since(costBegan);
@@ -4708,6 +4760,50 @@ static void reportUnreadableLibrary(NSString *path) {
 }
 // The asynchronous forms make the pipeline on the caller's thread and call the handler before returning, as the library's
 // newFunctionWithName:constantValues:completionHandler: does (RenderBox's pipeline loader, Core Image's bilateral solver).
+// A tile pipeline (MTLTileRenderPipelineDescriptor): the runtime compiles the tile function as a compute kernel under the descriptor's
+// colour formats; a render encoder dispatches it per tile of its pass.
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                                                          reflection:(MTLRenderPipelineReflection **)reflection error:(NSError **)error {
+ if(reflection)*reflection=nil;
+ NBFunction *tile=[(id)d.tileFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.tileFunction:nil;
+ if(!tile){if(error)*error=nbError(@"tile pipeline: foreign or missing tile function");return nil;}
+ NmbTilePipelineDescriptor p={};
+ p.tile=tile.handle;
+ for(unsigned i=0;i<8;i++)p.formats[i]=d.colorAttachments[i].pixelFormat;
+ p.samples=singleSample()?1:d.rasterSampleCount;
+ p.threadgroup_matches_tile=d.threadgroupSizeMatchesTileSize;
+ p.max_threads=d.maxTotalThreadsPerThreadgroup;
+ p.max_call_stack_depth=d.maxCallStackDepth;
+ p.adding_binary_functions=d.supportAddingBinaryFunctions;
+ for(unsigned i=0;i<31;i++)p.mutability[i]=d.tileBuffers[i].mutability;
+ std::vector<NmbFunction *> linkedStore,privateStore;
+ MTLLinkedFunctions *linked=d.linkedFunctions;
+ if(!linkedHandles(linked.functions,linkedStore) || !linkedHandles(linked.privateFunctions,privateStore)) {
+  if(error)*error=nbError(@"tile pipeline: foreign linked function");return nil;
+ }
+ p.linked=linkedStore.data();p.linked_count=linkedStore.size();p.private_linked=privateStore.data();p.private_linked_count=privateStore.size();
+ std::vector<NmbBinaryArchive *> archives;
+ if(!pipelineArchives(d.binaryArchives,archives,error))return nil;
+ const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
+ const uint64_t began=nowUs();
+ NmbRenderPipeline *handle=nmb_tile_pipeline_new(gDevice,&p,&creation);gTimePipeline.add(began);
+ if(!handle) {
+  NSString *why=[NSString stringWithFormat:@"%@ | tile %@",lastError(),tile.name];
+  static std::atomic<int> told{0};
+  if(told.fetch_add(1)<64)NBLOG(@"native-metal: tile pipeline refused: %@",why);else noteProblem([@"tile pipeline: " stringByAppendingString:why]);
+  if(error)*error=nbError([@"tile pipeline: " stringByAppendingString:why]);
+  return nil;
+ }
+ NBRenderPipeline *state=[NBRenderPipeline new];state.handle=handle;state.stateFormat=(uint32_t)d.colorAttachments[0].pixelFormat;
+ gPipelines++;gTilePipelines++;if(error)*error=nil;
+ return (id<MTLRenderPipelineState>)state;
+}
+- (void)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)d options:(MTLPipelineOption)options
+                               completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler {
+ NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
+ id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithTileDescriptor:d options:options reflection:&reflection error:&error];
+ handler(state,reflection,error);
+}
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)d completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler {
  NSError *error=nil;id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d error:&error];
  handler(state,error);
@@ -4717,23 +4813,6 @@ static void reportUnreadableLibrary(NSString *path) {
  NSError *error=nil;MTLRenderPipelineReflection *reflection=nil;
  id<MTLRenderPipelineState> state=[(id<MTLDevice>)self newRenderPipelineStateWithDescriptor:d options:options reflection:&reflection error:&error];
  handler(state,reflection,error);
- // With diagnostics on: which Metal functions the program Turnip just built for this pipeline belongs to (tu_darwin_last_program gives
- // the vertex and fragment shader hashes of the last program this thread built; the pass records of the frame trace name a pass's
- // heaviest fragment shader by the same hash). One line per fragment hash, at most 512.
- if(handle && diagOn()) {
-  static void (*lastProgram)(uint32_t *,uint32_t *)=nullptr;static std::atomic<bool> looked{false};
-  if(!looked.load() && !gLoaderPath.empty()) {
-   if(void *turnip=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD)){lastProgram=(void (*)(uint32_t *,uint32_t *))dlsym(turnip,"tu_darwin_last_program");looked.store(true);}
-  }
-  uint32_t vs=0,fs=0;
-  if(lastProgram)lastProgram(&vs,&fs);
-  if(fs) {
-   static std::mutex seenLock;static std::set<uint32_t> seen;
-   bool fresh=false;{std::lock_guard<std::mutex> lock(seenLock);fresh=seen.size()<512 && seen.insert(fs).second;}
-   if(fresh)os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal shader fs %{public}08x vs %{public}08x | frag %{public}@ vert %{public}@ | %llu us",fs,vs,
-                   d.fragmentFunction.name,d.vertexFunction.name,(unsigned long long)(nowUs()-pipelineBegan));
-  }
- }
 }
 - (void)newComputePipelineStateWithFunction:(id<MTLFunction>)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler {
  NSError *error=nil;id<MTLComputePipelineState> state=[(id<MTLDevice>)self newComputePipelineStateWithFunction:function error:&error];
@@ -5460,8 +5539,9 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   (ull)gDispatches.load(),(ull)gBlits.load());
  // The screen-size passes that ended: how many, those whose draws' scissors reach 90 % of the target, those that drew nothing; then the
  // targets' megapixels and the megapixels inside the draws' scissors (a bound from above on what the passes drew on).
- row("SA big %llu whole %llu empty %llu | target %lluM scissors %lluM",(ull)gBigPassesEnded.load(),(ull)gBigPassesWhole.load(),
-  (ull)gBigPassesEmpty.load(),(ull)(gBigPassTargetPixels.load()/1000000),(ull)(gBigPassScissorPixels.load()/1000000));
+ row("SA big %llu whole %llu empty %llu | target %lluM scissors %lluM | tile pipelines %llu dispatches %llu",(ull)gBigPassesEnded.load(),
+  (ull)gBigPassesWhole.load(),(ull)gBigPassesEmpty.load(),(ull)(gBigPassTargetPixels.load()/1000000),(ull)(gBigPassScissorPixels.load()/1000000),
+  (ull)gTilePipelines.load(),(ull)gTileDispatches.load());
  row("G commit-to-complete n=%llu total=%llums max=%llums mean=%lluus",(ull)gTimeEncodeToCommit.count.load(),ms(gTimeEncodeToCommit.total.load()),
   ms(gTimeEncodeToCommit.slowest.load()),(ull)(gTimeEncodeToCommit.count.load()?gTimeEncodeToCommit.total.load()/gTimeEncodeToCommit.count.load():0));
  for(int k=0;k<3;k++) {

@@ -355,6 +355,7 @@ struct NmbRenderPassDescriptor {
     struct NmbPassAttachment colors[8], depth, stencil;
     uint64_t width, height, array_length, samples;
     NmbBuffer *visibility; /* the pass's visibility result buffer, or null */
+    uint64_t tile_width, tile_height, imageblock_sample_length, threadgroup_memory_length; /* 0: Metal's defaults */
 };
 NmbEncoder *nmb_render_encoder_new(NmbCommandBuffer *, const struct NmbRenderPassDescriptor *);
 bool nmb_encoder_end(NmbEncoder *);
@@ -366,6 +367,27 @@ bool nmb_encoder_set_buffer_offset(NmbEncoder *, uint32_t stage, uint64_t offset
 bool nmb_encoder_set_bytes(NmbEncoder *, uint32_t stage, const void *bytes, size_t length, uint32_t index);
 bool nmb_encoder_set_texture(NmbEncoder *, uint32_t stage, NmbTexture *, uint32_t index);
 bool nmb_encoder_set_sampler(NmbEncoder *, uint32_t stage, NmbSampler *, uint32_t index);
+// The tile stage of a render encoder is stage 3 of the nmb_encoder_set_* binders. A tile pipeline is a render pipeline state made
+// from a tile descriptor (newRenderPipelineStateWithTileDescriptor:): formats are MTLPixelFormat values, 0 for no attachment.
+typedef struct {
+ NmbFunction *tile;
+ uint64_t formats[8];
+ uint64_t samples;
+ uint64_t threadgroup_matches_tile;
+ uint64_t max_threads;
+ uint64_t max_call_stack_depth;
+ uint64_t adding_binary_functions;
+ uint64_t mutability[31];
+ NmbFunction *const *linked;
+ uint64_t linked_count;
+ NmbFunction *const *private_linked;
+ uint64_t private_linked_count;
+} NmbTilePipelineDescriptor;
+NmbRenderPipeline *nmb_tile_pipeline_new(NmbDevice *, const NmbTilePipelineDescriptor *, const struct NmbPipelineOptions *options);
+bool nmb_render_tile_size(NmbEncoder *, uint64_t *size);   // width, height
+bool nmb_render_dispatch_threads_per_tile(NmbEncoder *, const uint64_t *threads);   // width, height, depth
+bool nmb_render_dispatch_threads_per_tile_in_region(NmbEncoder *, const uint64_t *threads, const uint64_t *region);
+bool nmb_render_set_threadgroup_memory_length(NmbEncoder *, uint64_t length, uint64_t offset, uint32_t index);
 
 bool nmb_compute_set_pipeline(NmbEncoder *, NmbComputePipeline *);
 bool nmb_compute_set_threadgroup_memory(NmbEncoder *, uint32_t length, uint32_t index);
