@@ -65,6 +65,8 @@ With `gpu-trace=1`, the render server writes command phases, encoding batches, a
 
 Slow encoding operations retain source lines and enqueue times. Completion handlers and resource destructors carry individual timing and identities. Kernel sampling of the render, encode and completion threads and blocked-thread waits provide the cross-thread wait record.
 
+With `diag=1`, encoding batch end records (type 14, phase 3) store encoding-thread CPU microseconds in field `d`. Compare this with the paired start/end wall time to distinguish work from waits. The `TUC` telemetry row reports Turnip BO cache lookups, hits, inserts, evictions and full flushes.
+
 `python3 scripts/check-wallpaper-freeze-host.py` in the resolved tree checks real pixels, callbacks, concurrent parked submissions and process selection.
 
 The macOS plugin entry (the IOGPUMetalDevice subclass), the layout of block-compressed textures and WindowServer's frame pacing options follow [macOS-DroidVM](https://github.com/Droid-VM/macOS-DroidVM), the DroidVM port booted with UniXNU.

@@ -263,9 +263,10 @@ static void frontStage(uint64_t command,uint64_t commit,uint32_t phase,uint64_t 
  TraceRec rec={};rec.type=15;rec.t0=nowUs();rec.t1=command;rec.t2=commit;rec.t3=tEncodeBatchId;
  rec.a=phase;rec.b=(uint32_t)tid;rec.c=surfaces;rec.d=(uint32_t)(bytes>>10);tracePush(rec);
 }
-static void batchStage(uint64_t batch,uint32_t phase,uint64_t queuedUs,uint32_t tasks,uint32_t depth) {
+// d: at a batch's end (phase 3), the CPU time the encoding thread spent in it, in us (the rest of its run was waiting).
+static void batchStage(uint64_t batch,uint32_t phase,uint64_t queuedUs,uint32_t tasks,uint32_t depth,uint32_t cpuUs=0) {
  if(!diagOn())return;
- TraceRec rec={};rec.type=14;rec.t0=nowUs();rec.t1=batch;rec.t2=queuedUs;rec.a=phase;rec.b=tasks;rec.c=depth;rec.tid=threadIdLow();tracePush(rec);
+ TraceRec rec={};rec.type=14;rec.t0=nowUs();rec.t1=batch;rec.t2=queuedUs;rec.a=phase;rec.b=tasks;rec.c=depth;rec.d=cpuUs;rec.tid=threadIdLow();tracePush(rec);
 }
 static thread_local uint64_t tDetailCommand;
 static std::atomic<uint64_t> gDetailSequence{0};
@@ -2248,8 +2249,9 @@ static EncodeThread &encodeThread() {
     lock.unlock();tEncodeBatchId=batch->serial;
     encodeAdoptReference();
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
+    const uint64_t cpuBefore=diagOn()?threadCpuUs():0;
     @autoreleasepool {batch->run();}
-    batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth);tEncodeBatchId=0;
+    batchStage(batch->serial,3,batch->enqueuedUs,tasks,depth,diagOn()?(uint32_t)(threadCpuUs()-cpuBefore):0);tEncodeBatchId=0;
     lock.lock();t.spare.push_back(batch);t.done++;t.idle.notify_all();
    }
    return nullptr;
@@ -5341,6 +5343,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     (ull)(mc[0]>>20),(ull)(mc[1]>>20),(ull)(mc[2]>>20),(ull)(mc[3]>>20),(ull)(mc[4]>>20),(ull)(mc[5]>>20),(ull)mc[6],(ull)mc[7],
     (ull)mc[8],(ull)mc[9],(ull)(bc[5]>>20),(ull)(bc[6]>>20),(ull)bc[2],(ull)bc[3]);
   }
+  // Turnip's BO cache: lookups, hits (an allocation served without a kernel call), inserts, evictions, whole flushes (memory pressure).
+  if(cacheStats)row("TUC look %llu hit %llu put %llu evict %llu flush %llu",(ull)bc[0],(ull)bc[1],(ull)bc[2],(ull)bc[3],(ull)bc[4]);
   // The same blocks by size (nmb_device_memory_kinds): how many of at most 16, 32, 40, 48, 56 and 64 MiB and of more, for the
   // pooled blocks in use and those kept empty (MK), the spare image blocks and the dedicated blocks of an image, with their MiB
   // (MKb), and the dedicated blocks of a buffer with theirs and buffers' own imported pages (MKc). A full-screen 3048x2032
