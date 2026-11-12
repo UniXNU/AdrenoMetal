@@ -371,6 +371,8 @@ static id deviceForPort(unsigned port) {
         // Turnip compiles inside vkCreate*Pipelines on the calling thread: the runtime makes the call there instead of on a thread it
         // starts for it (its relay exists for a driver whose compiler service takes the asking thread's class).
         setenv("METAL2VULKAN_COMPILE_ON_ASKING_THREAD", "1", 1);
+        // metal-tile=1: the device also answers the family that has tile shaders (bridge: tile_shaders_offered).
+        if (bootArgSet("metal-tile=1")) setenv("NATIVE_METAL_TILE", "1", 1); else unsetenv("NATIVE_METAL_TILE");
         {
             // metal-flow=<bits>: 1 the lowering thread, 2 commit submission, 4 the warm pass; all three without the argument.
             char args[1100] = {}, flow[16] = "";

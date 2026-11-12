@@ -15,7 +15,7 @@ use metal2vulkan::metal::{
 };
 use metal2vulkan::pipeline::{
     ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunction, LinkedFunctions, RenderPipelineDescriptor, StageSource,
-    TessellationDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
+    TessellationDescriptor, TileRenderPipelineDescriptor, VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
@@ -906,6 +906,16 @@ pub unsafe extern "C" fn nmb_device_answer_selector(index: usize, kind: *mut u32
 /// this device has none of (iconservicesagent crashed in `CI::GLContext::init`, int-155); QuartzCore splits a frame into command buffers of
 /// 128 draws where Apple3 is false (`MetalContext::flush`). Each waived row stays the runtime's own refusal where it is used, and
 /// `nmb_device_family_waivers` names them for the journal.
+/// True where `NATIVE_METAL_TILE=1` (the boot argument `metal-tile=1`): the private flag `supportsTileShaders` answers yes and
+/// `supportsFamily:` also answers Apple4, the family whose rows are imageblocks and tile shaders, so a client that has a tile
+/// path takes it. Off by default: the runtime runs a tile dispatch as a compute dispatch between two instances of the pass, with
+/// the attachments copied to a scratch image and back, where the GPU's own tile memory cannot be reached; a client's path without
+/// tile shaders draws the same at reduced sizes. What the path costs here is not measured.
+fn tile_shaders_offered() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NATIVE_METAL_TILE").is_some_and(|value| value == "1"))
+}
+
 const TARGET_FAMILIES: [GpuFamily; 5] =
     [GpuFamily::Apple1, GpuFamily::Apple2, GpuFamily::Apple3, GpuFamily::Common1, GpuFamily::Common2];
 
@@ -948,6 +958,11 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         return device.private().count(c).value().ok_or_else(none);
     }
     if let Some(f) = PrivateFlag::ALL.into_iter().find(|f| f.selector() == selector) {
+        // QuartzCore's render context reads `supportsTileShaders` once (its tile downsample and blur paths); the runtime answers no
+        // because it refuses part of Metal's tile shading. `metal-tile=1` answers yes, to measure what the path costs here.
+        if f == PrivateFlag::SupportsTileShaders && tile_shaders_offered() {
+            return Ok(1);
+        }
         return device.private().flag(f).value().map(u64::from).ok_or_else(none);
     }
     let gap = |r: Result<bool, metal2vulkan_runtime::RuntimeGap>| r.map(u64::from).map_err(|g| format!("{selector}: {g:?}"));
@@ -988,7 +1003,11 @@ fn device_answer(device: &NmbDevice, selector: &str, arg: u64) -> Result<u64, St
         "supportsTextureSampleCount:" => gap(p.supports_texture_sample_count(arg))?,
         "supportsVertexAmplificationCount:" => gap(p.supports_vertex_amplification_count(arg))?,
         "supportsRasterizationRateMapWithLayerCount:" => gap(p.supports_rasterization_rate_map_with_layer_count(arg))?,
-        "supportsFamily:" => (d.supports_family(arg as i64) || TARGET_FAMILIES.iter().any(|f| f.raw() == arg as i64)) as u64,
+        "supportsFamily:" => {
+            (d.supports_family(arg as i64)
+                || TARGET_FAMILIES.iter().any(|f| f.raw() == arg as i64)
+                || (tile_shaders_offered() && GpuFamily::Apple4.raw() == arg as i64)) as u64
+        }
         "supportsPrimitiveType:" => p.supports_primitive_type(arg) as u64,
         "supportsTextureWriteRoundingMode:" => p.supports_texture_write_rounding_mode(arg) as u64,
         _ => return Err(format!("{selector} is not a device query of the bridge")),
@@ -2169,6 +2188,107 @@ fn render_descriptor(descriptor: *const NmbRenderPipelineDescriptor) -> Result<R
         Ok(out)
 }
 
+/// `MTLTileRenderPipelineDescriptor`: the tile function, the colour attachment formats (0 for none), the sample count, whether
+/// the threadgroup is the tile, the threadgroup limit (0 for the pipeline's own) and the buffers' mutability.
+#[repr(C)]
+pub struct NmbTilePipelineDescriptor {
+    pub tile: *mut NmbFunction,
+    pub formats: [u64; 8],
+    pub samples: u64,
+    pub threadgroup_matches_tile: u64,
+    pub max_threads: u64,
+    pub max_call_stack_depth: u64,
+    pub adding_binary_functions: u64,
+    pub mutability: [u64; 31],
+    pub linked: *const *mut NmbFunction,
+    pub linked_count: u64,
+    pub private_linked: *const *mut NmbFunction,
+    pub private_linked_count: u64,
+}
+
+fn tile_descriptor(descriptor: *const NmbTilePipelineDescriptor) -> Result<TileRenderPipelineDescriptor, String> {
+    let d = get(descriptor)?;
+    let mut linked = LinkedFunctions::new();
+    linked.functions = linked_list(d.linked, d.linked_count)?;
+    linked.private_functions = linked_list(d.private_linked, d.private_linked_count)?;
+    let tile = get(d.tile)?.0.function_descriptor().with_linked(linked);
+    let mut out = TileRenderPipelineDescriptor::new(StageSource::Function(tile));
+    for (index, &format) in d.formats.iter().enumerate() {
+        out.color_attachment_formats[index] = optional_format(format)?;
+    }
+    out.raster_sample_count = u32::try_from(d.samples.max(1)).map_err(e("tile sample count"))?;
+    out.threadgroup_size_matches_tile_size = d.threadgroup_matches_tile != 0;
+    out.max_total_threads_per_threadgroup = if d.max_threads == 0 { None } else { Some(u32::try_from(d.max_threads).map_err(e("tile max threads"))?) };
+    out.max_call_stack_depth = u32::try_from(d.max_call_stack_depth.max(1)).map_err(e("tile stack depth"))?;
+    out.support_adding_binary_functions = d.adding_binary_functions != 0;
+    for (index, &mutability) in d.mutability.iter().enumerate() {
+        if mutability != 0 {
+            out.buffers.insert(index as u32, raw::<metal2vulkan::metal::Mutability>(mutability, "buffer mutability")?);
+        }
+    }
+    Ok(out)
+}
+
+/// `newRenderPipelineStateWithTileDescriptor:options:reflection:error:` without reflection: a render pipeline state whose
+/// tile function a render encoder dispatches per tile.
+///
+/// # Safety
+/// `options` is null or a valid record with a counted array of live archive handles.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_tile_pipeline_new(device: *mut NmbDevice, descriptor: *const NmbTilePipelineDescriptor,
+                                              options: *const NmbPipelineOptions) -> *mut NmbRenderPipeline {
+    guard(std::ptr::null_mut(), || {
+        let resolved = unsafe { pipeline_options(options)? };
+        let state = get(device)?.0.new_tile_render_pipeline_state(&tile_descriptor(descriptor)?, &resolved).map_err(e("tile pipeline"))?;
+        Ok(boxed(NmbRenderPipeline(state)))
+    })
+}
+
+/// `tileWidth` and `tileHeight` of the encoder's pass, into the caller's two words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_tile_size(encoder: *mut NmbEncoder, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null tile size".into());
+        }
+        let r = render(encoder)?;
+        let size = [r.tile_width().map_err(e("tile width"))?, r.tile_height().map_err(e("tile height"))?];
+        // SAFETY: the header's two words.
+        unsafe { std::slice::from_raw_parts_mut(out, 2) }.copy_from_slice(&size);
+        Ok(true)
+    })
+}
+
+/// `dispatchThreadsPerTile:`: `threads` is width, height, depth.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_dispatch_threads_per_tile(encoder: *mut NmbEncoder, threads: *const u64) -> bool {
+    guard(false, || {
+        render(encoder)?.dispatch_threads_per_tile(size(threads)?).map_err(e("dispatch threads per tile"))?;
+        Ok(true)
+    })
+}
+
+/// `dispatchThreadsPerTile:inRegion:`: `region` is the header's six words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_dispatch_threads_per_tile_in_region(encoder: *mut NmbEncoder, threads: *const u64, region_words: *const u64)
+                                                                 -> bool {
+    guard(false, || {
+        render(encoder)?
+            .dispatch_threads_per_tile_in_region(size(threads)?, region(region_words)?, None)
+            .map_err(e("dispatch threads per tile in region"))?;
+        Ok(true)
+    })
+}
+
+/// `setThreadgroupMemoryLength:offset:atIndex:` of a render encoder (the tile stage's threadgroup memory).
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_render_set_threadgroup_memory_length(encoder: *mut NmbEncoder, length: u64, offset: u64, index: u32) -> bool {
+    guard(false, || {
+        render(encoder)?.set_threadgroup_memory_length(length, offset, index).map_err(e("threadgroup memory length"))?;
+        Ok(true)
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_render_pipeline_release(pipeline: *mut NmbRenderPipeline) {
     release(pipeline)
@@ -2845,6 +2965,11 @@ pub struct NmbRenderPassDescriptor {
     pub array_length: u64,
     pub samples: u64,
     pub visibility: *const NmbBuffer,
+    /// `tileWidth`, `tileHeight`, `imageblockSampleLength` and `threadgroupMemoryLength` of the pass (0 for Metal's defaults).
+    pub tile_width: u64,
+    pub tile_height: u64,
+    pub imageblock_sample_length: u64,
+    pub threadgroup_memory_length: u64,
 }
 
 fn texture_of(a: &NmbPassAttachment) -> Result<Option<Texture>, String> {
@@ -2900,6 +3025,10 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         pass.render_target_height = d.height;
         pass.render_target_array_length = d.array_length;
         pass.default_raster_sample_count = d.samples;
+        pass.tile_width = d.tile_width;
+        pass.tile_height = d.tile_height;
+        pass.imageblock_sample_length = d.imageblock_sample_length;
+        pass.threadgroup_memory_length = d.threadgroup_memory_length;
         if !d.visibility.is_null() {
             pass.visibility_result_buffer = Some(get(d.visibility)?.0.live()?.clone());
         }
@@ -2959,6 +3088,8 @@ fn optional<'a, T>(handle: *const T) -> Result<Option<&'a T>, String> {
 const COMPUTE: u32 = 0;
 const VERTEX: u32 = 1;
 const FRAGMENT: u32 = 2;
+/// The tile stage of a render encoder (`setTileBuffer:` and its kin).
+const TILE: u32 = 3;
 
 fn bad_stage(stage: u32) -> String {
     format!("stage {stage} does not fit this encoder")
@@ -2973,6 +3104,7 @@ pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, b
             (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer(buffer, offset, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_buffer(buffer, offset, index),
             (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_buffer(buffer, offset, index),
+            (NmbEncoder::Render(r), TILE) => r.set_tile_buffer(buffer, offset, index),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set buffer"))?;
@@ -2987,6 +3119,7 @@ pub extern "C" fn nmb_encoder_set_buffer_offset(encoder: *mut NmbEncoder, stage:
             (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer_offset(offset, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_buffer_offset(offset, index),
             (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_buffer_offset(offset, index),
+            (NmbEncoder::Render(r), TILE) => r.set_tile_buffer_offset(offset, index),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set buffer offset"))?;
@@ -3009,6 +3142,7 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: 
             (NmbEncoder::Compute(c), COMPUTE) => c.set_bytes(bytes, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_bytes(bytes, index),
             (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_bytes(bytes, index),
+            (NmbEncoder::Render(r), TILE) => r.set_tile_bytes(bytes, index),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set bytes"))?;
@@ -3025,6 +3159,7 @@ pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, 
             (NmbEncoder::Compute(c), COMPUTE) => c.set_texture(texture, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_texture(texture, index),
             (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_texture(texture, index),
+            (NmbEncoder::Render(r), TILE) => r.set_tile_texture(texture, index),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set texture"))?;
@@ -3040,6 +3175,7 @@ pub extern "C" fn nmb_encoder_set_sampler(encoder: *mut NmbEncoder, stage: u32, 
             (NmbEncoder::Compute(c), COMPUTE) => c.set_sampler_state(sampler, index),
             (NmbEncoder::Render(r), VERTEX) => r.set_vertex_sampler_state(sampler, index),
             (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_sampler_state(sampler, index),
+            (NmbEncoder::Render(r), TILE) => r.set_tile_sampler_state(sampler, index),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set sampler"))?;
