@@ -18,6 +18,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #include <set>
 #include <string>
@@ -87,6 +88,14 @@ static void writeCurrent(const std::string &path, const std::string &line) {
 }
 static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;}
 
+static std::string bootSession() {
+    char uuid[64] = {};
+    size_t size = sizeof uuid;
+    if (sysctlbyname("kern.bootsessionuuid", uuid, &size, nullptr, 0) != 0) return "unknown";
+    uuid[sizeof uuid - 1] = 0;
+    return uuid;
+}
+
 // The libraries: first the paths of the list file beside the bundle (NativeAdrenoMetal.primelist, every .metallib of the OS image, one
 // absolute path per line), because the render server's sandbox refuses to list most directories (a scan alone found 8 of 166). Only
 // without a list does the scan run: it walks every directory it can reach and held a core for 8 s with frames stalling (i557u, 120 s
@@ -95,23 +104,25 @@ static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 100000
 static std::vector<std::string> libraries(const std::string &listPath, std::string &note) {
     std::vector<std::string> found;
     std::set<std::pair<dev_t, ino_t>> seen;
-    unsigned lines = 0, failed = 0;
+    unsigned lines = 0, failed = 0, invalid = 0;
     int lastErrno = 0;
     std::set<std::string> list = listPath.empty() ? std::set<std::string>() : readLines(listPath);
     const char *source = listPath.empty() ? "(none)" : listPath.c_str();
     if (list.empty()) {list = embeddedLines(); source = "embedded";}
+    const bool inventory = !list.empty();
     for (const std::string &path : list) {
         ++lines;
         struct stat st = {};
-        if (path.empty() || path[0] != '/') continue;
+        if (path.empty() || path[0] != '/') {++invalid; continue;}
         if (stat(path.c_str(), &st) != 0) {++failed; lastErrno = errno; continue;}
-        if (S_ISREG(st.st_mode) && seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
+        if (!S_ISREG(st.st_mode)) {++invalid; continue;}
+        if (seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
     }
     char line[200];
-    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d", source, lines,
-             found.size(), failed, lastErrno);
+    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d invalid=%u inventory=%u", source, lines,
+             found.size(), failed, lastErrno, invalid, inventory ? 1u : 0u);
     note = line;
-    native_prime_inventory_failed = failed;
+    native_prime_inventory_failed = failed + invalid + (inventory ? 0u : 1u);
     for (const char *root : kRoots) {
         if (!found.empty()) break;
         char *paths[] = {const_cast<char *>(root), nullptr};
@@ -376,8 +387,10 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     const std::string donePath = root + "/prime-done", badPath = root + "/prime-bad", current = root + "/prime-current",
                       logPath = root + "/prime.log";
-    // A function was being compiled when the process ended: it is not tried again.
-    for (const std::string &line : readLines(current)) appendLine(badPath, line);
+    const std::string resume = root + "/prime-resume";
+    const bool planned = access(resume.c_str(), F_OK) == 0;
+    if (planned) unlink(resume.c_str());
+    else for (const std::string &line : readLines(current)) appendLine(badPath, line);
     unlink(current.c_str());
     sleep(delaySeconds);
     const std::set<std::string> bad = readLines(badPath);
@@ -390,7 +403,13 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
     const std::string build = buildId() + "-prime2";
-    appendLine(logPath, note + " build=" + build);
+    const std::string boot = bootSession();
+#if TARGET_OS_OSX
+    const unsigned scope = wholeSystem ? 2 : 1;
+#else
+    const unsigned scope = 2;
+#endif
+    appendLine(logPath, note + " boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
     auto selected = [&](const std::string &path) {
 #if TARGET_OS_OSX
         return wholeSystem ? !libraryOfDriverBundle(path) : libraryOfLoadedBundle(path);
@@ -403,11 +422,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     unsigned eligible = 0;
     for (const std::string &path : paths) if (selected(path)) ++eligible;
     native_prime_libraries_total = eligible;
-#if TARGET_OS_OSX
-    native_prime_scope = wholeSystem ? 2 : 1;
-#else
-    native_prime_scope = 2;   // iPadOS primes every library of the list, whatever its bundle
-#endif
+    native_prime_scope = scope;
     for (const std::string &path : paths) {
         ++libs;
         native_prime_libraries_done = finished;
@@ -435,9 +450,9 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;
     native_prime_pass_complete = eligible && finished == eligible && !native_prime_libraries_failed && !native_prime_inventory_failed ? 1 : 2;
-    char line[220];
-    snprintf(line, sizeof line, "pass libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
-             libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
+    char line[512];
+    snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
+             boot.c_str(), scope, build.c_str(), libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
              native_prime_inventory_failed, foreign, native_prime_pass_complete, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
 }

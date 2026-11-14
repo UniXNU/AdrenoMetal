@@ -5498,15 +5498,16 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
     row("V vkpipe n=%llu total=%llums max=%llums waited=%llums failed=%llu",(ull)work[0],ms(work[1]),ms(work[2]),ms(work[3]),(ull)work[4]);
    row("V cache hit%llu miss%llu wr%llu | msg i%llu w%llu",(ull)work[7],(ull)work[8],(ull)work[9],(ull)work[5],(ull)work[6]);
   }
-  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, compute and render pipelines found/compiled, entries
+  // The shader cache's full counts (nmb_device_shader_cache_detail): functions found/translated, driver data found/unchanged, render pipelines found/compiled, entries
   // rejected, unreadable, handed to the directory (queued, written on the asking thread), bytes written, failed writes, evictions, the driver's own
   // pipeline cache: loads, saves, hits, misses.
   uint64_t sc[24]={};
   if(nmb_device_shader_cache_detail(gDevice,sc)) {
-   row("SC fn %llu/%llu cp %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
+   row("SC fn %llu/%llu data %llu/%llu rp %llu/%llu rej %llu rd-fail %llu",(ull)sc[2],(ull)sc[3],(ull)sc[4],(ull)sc[5],(ull)sc[6],(ull)sc[7],
     (ull)sc[8],(ull)sc[9]);
    row("SCb wr %llu q %llu thr %llu %lluK wfail %llu evict %llu qhit %llu | drv load %llu save %llu hit %llu miss %llu",(ull)sc[10],(ull)sc[11],
     (ull)sc[12],(ull)(sc[13]>>10),(ull)sc[15],(ull)sc[16],(ull)sc[14],(ull)sc[17],(ull)sc[20],(ull)sc[18],(ull)sc[19]);
+   row("SCc drv truncated %llu mismatched %llu",(ull)sc[21],(ull)sc[22]);
   }
  }
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);

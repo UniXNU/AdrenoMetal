@@ -41,9 +41,9 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
-/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, compute pipeline hits and misses, render pipeline hits and misses,
+/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, driver data found and unchanged, render pipeline hits and misses,
  * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
- * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
+ * driver pipeline hits, driver pipeline misses, driver saves, truncated driver data, mismatched driver data, then one spare zero. */
 bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
 /* The read-only system cache layer of the device opened after this call: the directory at root, read only where it, every directory
  * on the way to an entry and the entry are owned by one of the count user ids and not writable by group or others, never through a
