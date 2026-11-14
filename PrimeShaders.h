@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: MIT
-// Shader priming in the render server: once the desktop has settled, every Metal library of the OS volume goes through the runtime on a
-// background thread, so its functions are translated and compiled into the persistent cache directory before anything asks for them.
-// Each kernel function becomes a compute pipeline; each vertex function becomes a render pipeline with the library's fragment function of
-// the same stem (`_vert_` -> `_frag_`, or a fragment-less pipeline) and one BGRA8 attachment. Pipelines a caller makes with other constants
-// or attachments still compile then, but their functions' modules are decoded and the translator has seen every function once.
-// State in the cache directory: prime-done lists finished libraries (path, size, mtime), prime-bad the functions that ended the process
-// (prime-current names the function being compiled; a start that finds it moves it to prime-bad), prime.log one line per library, and
-// prime-fn the functions finished inside the libraries not finished yet (path, name and the build that made them).
-// A library listed as finished is never read again, and a function listed in prime-fn is not compiled again, so a restart resumes where
-// the previous run stopped even inside a library with thousands of functions (the one that held priming at 162 of 280 libraries for
-// every boot: each boot ended before it did and began it again).
+// The render server primes the OS inventory on a background thread while the desktop is idle. Kernel entry points
+// use default function constants; vertex entry points use a matching fragment function with BGRA8 and RGBA16Float targets.
+// prime-done records fully compiled libraries. prime-fn2 and prime-refused2 record successful and refused entry points
+// for the current runtime build; prime-current identifies an interrupted compile and prime-bad records that entry point.
+// The next process resumes successful work and retains refusal counts. PRc and prime.log report the pass's completion.
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -42,7 +36,9 @@ extern "C" {volatile uint32_t native_prime_compiling, native_prime_libraries_don
                native_prime_functions_resumed;
 // For the PRb row: the libraries this process's passes compiled, those a pass leaves out, and the pass's scope (1 the bundles loaded
 // in this process, 2 the whole system).
-volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;}
+volatile uint32_t native_prime_libraries_primed, native_prime_libraries_skipped, native_prime_scope;
+volatile uint32_t native_prime_pass_complete, native_prime_libraries_failed, native_prime_functions_refused,
+                  native_prime_functions_skipped, native_prime_inventory_failed;}
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
@@ -115,6 +111,7 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d", source, lines,
              found.size(), failed, lastErrno);
     note = line;
+    native_prime_inventory_failed = failed;
     for (const char *root : kRoots) {
         if (!found.empty()) break;
         char *paths[] = {const_cast<char *>(root), nullptr};
@@ -267,7 +264,10 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
 
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
-                           const std::string &functionsPath, const std::set<std::string> &functionsDone, const std::string &build) {
+                           const std::string &functionsPath, const std::set<std::string> &functionsDone,
+                           const std::string &refusedPath, const std::set<std::string> &refusedDone,
+                           const std::string &build, bool &complete) {
+    complete = false;
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
@@ -286,14 +286,15 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 const std::string key = path + "\t" + name.UTF8String;
                 const std::string doneKey = key + "\t" + build;
                 native_prime_compiling = 3;
-                if (bad.count(key)) {++skipped; continue;}
-                if (functionsDone.count(doneKey)) {native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
+                if (bad.count(doneKey)) {++skipped; continue;}
+                if (refusedDone.count(doneKey)) {++refused; continue;}
+                if (functionsDone.count(doneKey)) {++made; native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
                 id<MTLFunction> function = [lib newFunctionWithName:name];
-                if (!function) {++refused; continue;}
+                if (!function) {++refused; appendLine(refusedPath, doneKey); continue;}
                 const MTLFunctionType type = function.functionType;
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
                 waited += waitForQuiet();
-                writeCurrent(current, key);
+                writeCurrent(current, doneKey);
                 native_prime_compiling = 1;
                 bool ok = false;
                 @try {
@@ -340,7 +341,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 native_prime_compiling = 0;
-                appendLine(functionsPath, doneKey);
+                appendLine(ok ? functionsPath : refusedPath, doneKey);
                 ok ? ++made : ++refused;
                 if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {
@@ -356,6 +357,9 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         }
     }
     unlink(current.c_str());
+    native_prime_functions_refused = native_prime_functions_refused + refused;
+    native_prime_functions_skipped = native_prime_functions_skipped + skipped;
+    complete = refused == 0 && skipped == 0;
     char line[200];
     snprintf(line, sizeof line, " kernels=%u renders=%u made=%u half=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
              made, halfMade, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
@@ -378,15 +382,27 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     sleep(delaySeconds);
     const std::set<std::string> bad = readLines(badPath);
     std::set<std::string> done = readLines(donePath);
-    const std::string functionsPath = root + "/prime-fn";
+    const std::string functionsPath = root + "/prime-fn2", refusedPath = root + "/prime-refused2";
     const std::set<std::string> functionsDone = readLines(functionsPath);
+    const std::set<std::string> refusedDone = readLines(refusedPath);
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0, foreign = 0;
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
-    const std::string build = buildId();
+    const std::string build = buildId() + "-prime2";
     appendLine(logPath, note + " build=" + build);
-    native_prime_libraries_total = (uint32_t)paths.size();
+    auto selected = [&](const std::string &path) {
+#if TARGET_OS_OSX
+        return wholeSystem ? !libraryOfDriverBundle(path) : libraryOfLoadedBundle(path);
+#else
+        (void)path;
+        (void)wholeSystem;
+        return true;
+#endif
+    };
+    unsigned eligible = 0;
+    for (const std::string &path : paths) if (selected(path)) ++eligible;
+    native_prime_libraries_total = eligible;
 #if TARGET_OS_OSX
     native_prime_scope = wholeSystem ? 2 : 1;
 #else
@@ -396,29 +412,33 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         ++libs;
         native_prime_libraries_done = finished;
         struct stat st = {};
-        if (stat(path.c_str(), &st) != 0) continue;
-        // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
-        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
-        if (done.count(id)) {++finished; continue;}
-#if TARGET_OS_OSX
-        // Counted as done for the telemetry's progress, and not listed as finished (libraryOfDriverBundle, libraryOfLoadedBundle).
-        if (wholeSystem ? libraryOfDriverBundle(path) : !libraryOfLoadedBundle(path)) {
-            ++foreign; ++finished;
+        if (stat(path.c_str(), &st) != 0) {native_prime_libraries_failed = native_prime_libraries_failed + 1; continue;}
+        if (!selected(path)) {
+            ++foreign;
             native_prime_libraries_skipped = foreign;
             continue;
         }
-#endif
-        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, build));
+        // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
+        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
+        if (done.count(id)) {++finished; continue;}
+        bool complete = false;
+        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, refusedPath, refusedDone, build, complete));
         native_prime_libraries_primed = native_prime_libraries_primed + 1;
-        appendLine(donePath, id);
-        done.insert(id);
-        ++finished;
+        if (complete) {
+            appendLine(donePath, id);
+            done.insert(id);
+            ++finished;
+        } else {
+            native_prime_libraries_failed = native_prime_libraries_failed + 1;
+        }
     }
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;
-    char line[120];
-    snprintf(line, sizeof line, "pass libraries=%u finished=%u %s=%u ms=%llu", libs, finished, wholeSystem ? "driver-bundles" : "not-loaded",
-             foreign, (unsigned long long)(nowMs() - began));
+    native_prime_pass_complete = eligible && finished == eligible && !native_prime_libraries_failed && !native_prime_inventory_failed ? 1 : 2;
+    char line[220];
+    snprintf(line, sizeof line, "pass libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
+             libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
+             native_prime_inventory_failed, foreign, native_prime_pass_complete, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
 }
 }  // namespace prime

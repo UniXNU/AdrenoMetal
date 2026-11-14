@@ -5,7 +5,6 @@
 // Every result comes from the runtime and the GPU: a refused call returns nil/NO with the runtime's reason, an encoder call the runtime
 // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
 // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
-// Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <IOSurface/IOSurfaceRef.h>
@@ -635,6 +634,11 @@ __attribute__((weak)) volatile uint32_t native_prime_rate;
 __attribute__((weak)) volatile uint32_t native_prime_functions_resumed;
 __attribute__((weak)) volatile uint32_t native_prime_libraries_primed;   // libraries this process's passes compiled
 __attribute__((weak)) volatile uint32_t native_prime_libraries_skipped;  // other GPUs' driver bundles (whole system) or not loaded here
+__attribute__((weak)) volatile uint32_t native_prime_pass_complete;
+__attribute__((weak)) volatile uint32_t native_prime_libraries_failed;
+__attribute__((weak)) volatile uint32_t native_prime_functions_refused;
+__attribute__((weak)) volatile uint32_t native_prime_functions_skipped;
+__attribute__((weak)) volatile uint32_t native_prime_inventory_failed;
 __attribute__((weak)) volatile uint32_t native_prime_scope;              // 0 no pass yet, 1 loaded bundles only, 2 the whole system
 }
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
@@ -5488,6 +5492,8 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   }
  }
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
+ row("PRc state=%u failed=%u refused=%u bad=%u missing=%u",native_prime_pass_complete,native_prime_libraries_failed,
+  native_prime_functions_refused,native_prime_functions_skipped,native_prime_inventory_failed);
  // Priming's reach and the system shader cache. PRb: the pass's scope (1 the bundles loaded here, 2 the whole system), the libraries
  // it compiled itself, those it leaves out (other GPUs' driver bundles, or not loaded here), the system cache's state here (0 not
  // named, 1 read, 2 filled by this process, 3 refused) and what this process published: the entries and KiB its cache directory
@@ -5503,6 +5509,13 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("SY read %llu/%lluK rej %llu refused %llu replies %llu",(ull)sy[0],(ull)(sy[3]>>10),(ull)sy[1],(ull)sy[2],(ull)gCompileSystem.load());
  }
  if(gDevice) {
+  uint64_t fast[15]={};
+  if(nmb_device_fast_path_counts(gDevice,fast)) {
+   row("FP group %llu/%llu pools %llu/%llu linear %llu/%llu evict %llu",(ull)fast[0],(ull)fast[1],(ull)fast[2],(ull)fast[3],
+    (ull)fast[4],(ull)fast[5],(ull)fast[6]);
+   row("CM calls %llu us %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)fast[7],(ull)fast[8],(ull)fast[9],(ull)fast[10],(ull)fast[11],
+    (ull)fast[12],(ull)fast[13],(ull)fast[14]);
+  }
   // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
   // log waits, encoder ends on the lowering thread.
   uint64_t flow[8]={};

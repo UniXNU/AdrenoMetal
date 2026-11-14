@@ -43,6 +43,11 @@ int nmb_pac_atexit(void *function)
 {
     return atexit((void (*)(void))NMB_SIGN(function));
 }
+extern int __cxa_atexit(void (*function)(void *), void *argument, void *shared_object);
+int nmb_pac_cxa_atexit(void *function, void *argument, void *shared_object)
+{
+    return __cxa_atexit((void (*)(void *))NMB_SIGN(function), argument, shared_object);
+}
 void nmb_pac_dyld_register_func_for_add_image(void *function)
 {
     _dyld_register_func_for_add_image((void (*)(const struct mach_header *, intptr_t))NMB_SIGN(function));

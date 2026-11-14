@@ -263,10 +263,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
-        // A texture over host pages or a buffer whose rows lie apart is an image over the bytes, rendered or written too: the window
-        // server's surfaces and padded framebuffers (3048x2032 BGRA8 at 12288-byte rows, int-251) were otherwise copied in and out of a
-        // shadow image every pass.
-        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        // Use the device's measured in-place image route for imported surfaces and padded buffers.
+        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlace;
         // Metal makes a pipeline state's pipeline at its creation and never drops a draw for a pipeline being made; the runtime's
         // default (PipelineWaitPolicy::Bounded) drops the draws and dispatches of a pipeline not made 4.5 s after the commit, which the
         // render server showed as missing pieces of the screen while it compiled (int 590aaee2).
@@ -487,6 +485,25 @@ pub extern "C" fn nmb_device_flow_counts(device: *const NmbDevice, out: *mut u64
     })
 }
 
+/// Submission grouping, command-pool reuse, in-place passes and commit costs, into the header's fifteen words.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_fast_path_counts(device: *const NmbDevice, out: *mut u64) -> bool {
+    guard(false, || {
+        if out.is_null() {
+            return Err("null counts".into());
+        }
+        // SAFETY: the header's fifteen writable words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 15) };
+        let w = get(device)?.0.work_counts();
+        out.copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made, w.spare_command_pools_taken,
+                              w.linear_passes_in_place, w.linear_passes_through_copies, w.region_pipelines_evicted, w.commit_calls,
+                              w.commit_nanos / 1000, w.commit_lowering_nanos / 1000, w.commit_recording_nanos / 1000,
+                              w.commit_pipeline_wait_nanos / 1000, w.commit_lock_wait_nanos / 1000,
+                              w.commit_pass_nanos / 1000, w.commit_submit_nanos / 1000]);
+        Ok(true)
+    })
+}
+
 /// Where render passes cost the GPU more than Metal's single pass in tile memory, into the caller's ten words: passes begun as
 /// instances, passes split inline, then instance splits for a barrier, tile memory, a memoryless write and a pending pipeline, stand-ins
 /// made and their bytes, and stand-in copies made and those made at draws.
@@ -525,7 +542,7 @@ pub extern "C" fn nmb_device_memory_counts(device: *const NmbDevice, out: *mut u
     })
 }
 
-/// The runtime's live blocks of its own device memory by what holds them and by size (bridge patch 0031), into the caller's 48 words:
+/// The runtime's live blocks of its own device memory by what holds them and by size, into the caller's 48 words:
 /// seven size classes each (at most 16, 32, 40, 48, 56 and 64 MiB, and larger) of the pooled blocks with a placement, the pooled
 /// blocks kept empty, the spare image blocks, the dedicated blocks of an image and those of a buffer; then the bytes of the spare
 /// blocks and of the dedicated blocks of images and of buffers; then, of the blocks of a lazily allocated memory type, those with a

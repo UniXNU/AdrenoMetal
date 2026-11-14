@@ -1,5 +1,115 @@
+diff --git a/crates/metal2vulkan-air/src/canon/mod.rs b/crates/metal2vulkan-air/src/canon/mod.rs
+index 7af78ea23..01509c531 100644
+--- a/crates/metal2vulkan-air/src/canon/mod.rs
++++ b/crates/metal2vulkan-air/src/canon/mod.rs
+@@ -574,6 +574,7 @@ pub fn specialize_dynamic(
+     let emap = erase::erase_consts(&mut parts.consts, m)?;
+     erase::erase_globals(parts.globals.values_mut(), &emap);
+     erase_functions(&mut parts, &emap, m)?;
++    prune_entry(&mut parts, func, &fcs, &name, m)?;
+     let inlined = inline::inline(
+         &parts.funcs,
+         (&parts.types, &parts.symbols),
+@@ -645,21 +646,22 @@ pub fn specialize_dynamic(
+     } = solved;
+     // A pointer loaded from a field of a constant global is the field's constant: a `constexpr
+     // sampler` that SCCP's folded select picked is its sampler state. SCCP runs again over a body
+-    // that changed, to fold what those constants decide.
+-    let (body, folded) = const_loads::fold(body, &mut parts, m)?;
+-    // A pointer loaded from a constant table at an index only the run knows is the `select` chain
+-    // over the table's elements: a `constexpr` sampler table read at a dynamic index.
+-    let (body, tabled) = const_tables::fold(body, &mut parts, func, m)?;
+-    let mut body = if folded || tabled {
+-        let solved = solve(&body, &mut parts, &fcs, &name, m)?;
+-        body.release(m);
++    // that changed, to fold what those constants decide. Constant table folding may expose
++    // another constant field load, so both run to their fixed point.
++    let mut body = body;
++    loop {
++        let (next, folded) = const_loads::fold(body, &mut parts, m)?;
++        let (next, tabled) = const_tables::fold(next, &mut parts, func, m)?;
++        if !folded && !tabled {
++            body = next;
++            break;
++        }
++        let solved = solve(&next, &mut parts, &fcs, &name, m)?;
++        next.release(m);
+         undefined_reads.extend(solved.reads);
+-        solved.body
+-    } else {
+-        body
+-    };
+-    // MSL 4.1's generic pointers, each a pointer of the one space its pointers come from; SCCP
+-    // runs again over a body whose space queries that answered.
++        body = solved.body;
++    }
++    // Resolve MSL 4.1 generic pointers before the subsequent loop simplification.
+     let (resolved, queried) = generic::resolve(body, &mut parts, func, &name, m)?;
+     body = if queried {
+         let solved = solve(&resolved, &mut parts, &fcs, &name, m)?;
+@@ -937,6 +939,60 @@ fn erased_entry(
+ }
+ 
+ /// Erase every defined function's body in place, one at a time, each body replaced freed.
++/// The entry's own blocks that its function constants leave unreachable, and its loads from
++/// fields of constant globals, folded before the entry is inlined, so the inliner copies no callee
++/// only a dead block calls. An uber-shader's entry is most of the module and branches on the
++/// constants into every effect it has: QuartzCore's `fixed_frag` entries inlined 15,700
++/// instructions of which SCCP kept 300, and building, solving and rebuilding the rest was most of a
++/// specialization.
++///
++/// Its calls are opaque here, so what it proves unreachable is unreachable whatever they return,
++/// and the SCCP after inlining reaches the fixed point it reached over the whole body. It runs
++/// only when every declared constant is supplied, so no undefined read goes unrecorded. Any
++/// refusal here (a branch on `undef` that a call's constant result would have made dead) leaves
++/// the entry as it was, for the SCCP after inlining to judge; a budget, cancellation or limit is
++/// final.
++fn prune_entry(
++    parts: &mut ModuleParts,
++    func: FuncId,
++    fcs: &HashMap<GlobalId, sccp::FcState>,
++    name: &DiagName,
++    m: &mut Meter,
++) -> Result<(), Error> {
++    if fcs.is_empty() || fcs.values().any(|s| !s.supplied) {
++        return Ok(());
++    }
++    let Some(entry) = parts.funcs.get_mut(func).and_then(|f| f.body.take()) else {
++        return Ok(());
++    };
++    let pruned = solve(&entry, parts, fcs, name, m).and_then(|solved| {
++        let mut body = solved.body;
++        loop {
++            let (next, folded) = const_loads::fold(body, parts, m)?;
++            if !folded {
++                return Ok(next);
++            }
++            let solved = solve(&next, parts, fcs, name, m);
++            next.release(m);
++            body = solved?.body;
++        }
++    });
++    let kept = match pruned {
++        Ok(body) => {
++            entry.release(m);
++            body
++        }
++        Err(e @ (Error::Budget(_) | Error::Cancelled | Error::LimitExceeded(_))) => return Err(e),
++        Err(_) => entry,
++    };
++    parts
++        .funcs
++        .get_mut(func)
++        .ok_or_else(|| invariant("entry out of range"))?
++        .body = Some(kept);
++    Ok(())
++}
++
+ fn erase_functions(
+     parts: &mut ModuleParts,
+     emap: &[crate::ir::ConstId],
 diff --git a/crates/metal2vulkan-conformance/src/device.rs b/crates/metal2vulkan-conformance/src/device.rs
-index aae72dcd5..93b87d1a2 100644
+index 6cc76c877..ab6fe88d1 100644
 --- a/crates/metal2vulkan-conformance/src/device.rs
 +++ b/crates/metal2vulkan-conformance/src/device.rs
 @@ -260,8 +260,9 @@ fn loader() -> Option<PathBuf> {
@@ -47,10 +157,10 @@ index 1fef73096..97da33d27 100644
  }
  
 diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
-index eb53071c2..b9d67e9e7 100644
+index 3c3a958bb..8916f64b5 100644
 --- a/crates/metal2vulkan-runtime/src/buffer.rs
 +++ b/crates/metal2vulkan-runtime/src/buffer.rs
-@@ -2942,6 +2942,15 @@ impl Device {
+@@ -3101,6 +3101,15 @@ impl Device {
          taken
      }
  
@@ -67,10 +177,10 @@ index eb53071c2..b9d67e9e7 100644
      fn let_go_parked_buffers(&self, gone: recycle::Gone<vk::Buffer>) {
          if gone.is_empty() {
 diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
-index eea20fa68..9c2e855bd 100644
+index 2bddbb680..f23f738b1 100644
 --- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
 +++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
-@@ -1099,10 +1099,19 @@ impl Buffer {
+@@ -1113,9 +1113,19 @@ impl Buffer {
              let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
                  .with_options(options)
                  .over_surface(surface);
@@ -78,26 +188,24 @@ index eea20fa68..9c2e855bd 100644
 +            // (`texture/ycbcr_image.rs`).
 +            let alone = ycbcr_surface.is_some_and(|facts| facts.planes_alone);
              return self
--                .device()
+                 .device()
 -                .new_converted_texture(call, texels, descriptor, &layout, id_use, (&planes, span))
--                .map(Over::Made);
-+                .device().new_converted_texture(
-+                call,
-+                texels,
-+                descriptor,
-+                &layout,
-+                (id_use, alone),
-+                (&planes, span),
-+            )
-+            .map(Over::Made);
++                .new_converted_texture(
++                    call,
++                    texels,
++                    descriptor,
++                    &layout,
++                    (id_use, alone),
++                    (&planes, span),
++                )
+                 .map(Over::Made);
          }
          if layout.texture_type == TextureType::TextureBuffer {
-             // Over a surface's plane, of the descriptor's options (`Buffer::new_texture_with_iosurface_plane`):
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
-index 95be96b54..a06b2696c 100644
+index ff995edf7..9409a21fd 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/completion.rs
-@@ -724,6 +724,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
+@@ -730,6 +730,11 @@ fn finish(watch: &Watch, lists: &mut FenceLists, mut finished: Vec<(usize, Submi
          } = batch;
          lists.gathered.extend(fence.map(|fence| (queue, fence)));
          if last {
@@ -109,7 +217,7 @@ index 95be96b54..a06b2696c 100644
              let mut state = lock(&buffer.state);
              state.times.completed = seen;
              state.keep_holds(holds);
-@@ -1113,6 +1118,8 @@ struct Front {
+@@ -1119,6 +1124,8 @@ struct Front {
      value: u64,
      /// The fence its submission signals, where it has one.
      fence: Option<vk::Fence>,
@@ -118,7 +226,7 @@ index 95be96b54..a06b2696c 100644
  }
  
  /// `VkQueue` `queue`'s waiter (the module docs): it waits for its queue's first pending batch
-@@ -1148,6 +1155,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+@@ -1154,6 +1161,7 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
                          let front = Front {
                              value: batch.value,
                              fence: batch.fence,
@@ -126,7 +234,7 @@ index 95be96b54..a06b2696c 100644
                          };
                          Some((front, batch.buffer.device().clone()))
                      }
-@@ -1169,11 +1177,18 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
+@@ -1175,11 +1183,22 @@ fn wait_for_queue(watch: &Watch, queue: usize) {
              continue;
          };
          device.shared().counts.completion_armed(slept);
@@ -141,11 +249,15 @@ index 95be96b54..a06b2696c 100644
              Some(busy) => {
 +                let id = front.id;
                  let polled = poll(&device, queue, front);
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::PollDone, queue.min(255) as u32);
++                crate::stage_trace::mark(
++                    id,
++                    crate::stage_trace::Stage::PollDone,
++                    queue.min(255) as u32,
++                );
                  drop(busy);
                  Some(polled)
              }
-@@ -1360,6 +1375,7 @@ pub(crate) fn seen<E>(
+@@ -1366,6 +1385,7 @@ pub(crate) fn seen<E>(
  }
  
  /// The command-buffer error of a failed wait, recording a lost device.
@@ -154,20 +266,22 @@ index 95be96b54..a06b2696c 100644
      match error {
          vk::Result::ERROR_DEVICE_LOST => {
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-index 87a5686c3..6d6433032 100644
+index deb2aedfc..bac675475 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -2111,6 +2111,9 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
+@@ -2258,6 +2258,11 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
  }
  
  impl CommandBuffer {
 +    /// Stable trace identity for this command buffer until its completion.
-+    pub fn diagnostic_id(&self) -> u64 { Arc::as_ptr(&self.0) as u64 }
++    pub fn diagnostic_id(&self) -> u64 {
++        Arc::as_ptr(&self.0) as u64
++    }
 +
      /// A new command buffer of `root`, on its place `queue`, holding `slot` of it.
      pub(super) fn new(queue: &QueueGen, root: &CommandQueue, slot: Slot) -> CommandBuffer {
          let footprints = Footprints::default();
-@@ -3073,9 +3076,12 @@ impl CommandBuffer {
+@@ -3271,9 +3276,12 @@ impl CommandBuffer {
          failure: Option<CommitFailure>,
          hand: Hand,
      ) -> Result<(), Error> {
@@ -180,7 +294,7 @@ index 87a5686c3..6d6433032 100644
              return Ok(());
          }
          // The last render encoder's end, where its call left it to the device's lowering thread.
-@@ -3178,6 +3184,12 @@ impl CommandBuffer {
+@@ -3376,6 +3384,16 @@ impl CommandBuffer {
          run: CommitRun,
          hand: Hand,
      ) -> Result<(), Error> {
@@ -189,11 +303,15 @@ index 87a5686c3..6d6433032 100644
 +            CommitRun::Queued => 1,
 +            CommitRun::Refused => 2,
 +        };
-+        crate::stage_trace::mark(Arc::as_ptr(&self.0) as usize, crate::stage_trace::Stage::CommitRun, run_kind);
++        crate::stage_trace::mark(
++            Arc::as_ptr(&self.0) as usize,
++            crate::stage_trace::Stage::CommitRun,
++            run_kind,
++        );
          let _for = self.notices_for();
          // The waiting fetched render targets take their storage form at this commit where it
          // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
-@@ -3432,6 +3444,11 @@ impl CommandBuffer {
+@@ -3644,6 +3662,11 @@ impl CommandBuffer {
                  return Err(error);
              }
          };
@@ -205,7 +323,7 @@ index 87a5686c3..6d6433032 100644
          // The first segment a host step records, which the device announces (a loop's check
          // and a staged scatter's CPU copy record nothing).
          let announced = segments
-@@ -5231,6 +5248,7 @@ impl CommandBufferShared {
+@@ -5590,6 +5613,7 @@ impl CommandBufferShared {
          result: Result<(), CommandBufferError>,
      ) {
          let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
@@ -213,7 +331,7 @@ index 87a5686c3..6d6433032 100644
          let (signallers, own): (Vec<Arc<Follow>>, _) = {
              let state = lock(&buffer.state);
              let signallers = (state.waited.iter())
-@@ -5279,12 +5297,16 @@ impl CommandBufferShared {
+@@ -5638,12 +5662,16 @@ impl CommandBufferShared {
                  let ran = contexts.run_here(queue, item, may_run);
                  drop(unheld);
                  match ran {
@@ -231,7 +349,7 @@ index 87a5686c3..6d6433032 100644
          contexts.post(queue, item.whole());
          posted();
      }
-@@ -5305,6 +5327,8 @@ impl CommandBufferShared {
+@@ -5664,6 +5692,8 @@ impl CommandBufferShared {
      /// The first part of [`complete`](Self::complete), to its completion-seen handlers: its
      /// status final, they ran. What the rest needs is answered.
      fn complete_seen(self: &Arc<Self>, result: Result<(), CommandBufferError>) -> Rest {
@@ -240,7 +358,7 @@ index 87a5686c3..6d6433032 100644
          // A thread sleeps on `changed`, as the state's lock below reads.
          let parked;
          // Its command pool, where it settled, whose primary the device's spares begin ahead once
-@@ -5497,6 +5521,7 @@ impl CommandBufferShared {
+@@ -5867,6 +5897,7 @@ impl CommandBufferShared {
          }
          // The holds taken above go here, with no lock of the command buffer's held, before any
          // handler of its runs: a detach from one of them detaches (`detach.rs`).
@@ -248,7 +366,7 @@ index 87a5686c3..6d6433032 100644
          drop(submitted_holds);
          self.wake_parked(parked);
          let buffer = CommandBuffer(Arc::clone(self));
-@@ -5527,6 +5552,7 @@ impl CommandBufferShared {
+@@ -5897,6 +5928,7 @@ impl CommandBufferShared {
      /// handlers ran ([`complete_seen`](Self::complete_seen)): its completed handlers, its queue's
      /// slot, its releases and its gate.
      fn complete_rest(self: &Arc<Self>, rest: Rest) {
@@ -256,7 +374,7 @@ index 87a5686c3..6d6433032 100644
          let Rest {
              settled_pool,
              released_versions,
-@@ -5553,6 +5579,7 @@ impl CommandBufferShared {
+@@ -5923,6 +5955,7 @@ impl CommandBufferShared {
                  exit_guard::program(|| handler(&buffer));
              }
          }
@@ -264,7 +382,7 @@ index 87a5686c3..6d6433032 100644
          let handled = Instant::now();
          drop(buffer);
          // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
-@@ -5633,6 +5660,7 @@ impl CommandBufferShared {
+@@ -6003,6 +6036,7 @@ impl CommandBufferShared {
          }
          // The gate notifies its waiters only where it opened here, which this transition's own
          // hold holds it from: the notify for them is that hold's, as it goes (`gate.rs`).
@@ -272,7 +390,7 @@ index 87a5686c3..6d6433032 100644
          let notified = self.gate.finish();
          self.device.shared().counts.command_buffer_wake(notified);
          // Its pool's primary begun ahead, where no command buffer took the pool since
-@@ -5643,6 +5671,7 @@ impl CommandBufferShared {
+@@ -6013,6 +6047,7 @@ impl CommandBufferShared {
              let shared = self.device.shared();
              shared.spares.begin_ahead(shared, pool);
          }
@@ -281,10 +399,10 @@ index 87a5686c3..6d6433032 100644
  }
  
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-index 024ee685e..600cfae8f 100644
+index 109fe8b69..0e79af5b2 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-@@ -424,6 +424,30 @@ impl CommandBufferShared {
+@@ -426,6 +426,30 @@ impl CommandBufferShared {
          scheduler: &mut scheduler::State,
      ) -> Result<Submitting, CommandBufferError> {
          let _for = self.notices_for();
@@ -315,15 +433,19 @@ index 024ee685e..600cfae8f 100644
          let device = &self.device;
          if device.is_lost() {
              return Err(CommandBufferError::DeviceLost);
-@@ -547,6 +571,7 @@ impl CommandBufferShared {
+@@ -557,6 +581,11 @@ impl CommandBufferShared {
          };
          // The scrubs of emulated textures' writes, as mapped now, then every segment in its place.
          self.record_scrubs(&mut state, range.clone())?;
-+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 1);
++        crate::stage_trace::mark(
++            Arc::as_ptr(self) as usize,
++            crate::stage_trace::Stage::SubmitStep,
++            1,
++        );
          state
              .place(range.clone())
              .map_err(|error| recording_error(device, error))?;
-@@ -753,11 +778,8 @@ impl CommandBufferShared {
+@@ -799,11 +828,8 @@ impl CommandBufferShared {
              barriers.first().is_some_and(Option::is_some) || !held_moves.transitions(0).is_empty();
          if entry.is_some() {
              started = true;
@@ -337,7 +459,7 @@ index 024ee685e..600cfae8f 100644
              let stamps = Stamps {
                  start: start_stamp.filter(|_| !encoder_behind),
                  after: entry_barrier.is_some(),
-@@ -766,7 +788,7 @@ impl CommandBufferShared {
+@@ -812,7 +838,7 @@ impl CommandBufferShared {
              if stamps.start.is_some() {
                  start_stamp = None;
              }
@@ -346,7 +468,7 @@ index 024ee685e..600cfae8f 100644
          }
          for (offset, barrier) in barriers.iter().enumerate() {
              let moves = held_moves.transitions(offset);
-@@ -781,11 +803,8 @@ impl CommandBufferShared {
+@@ -827,11 +853,8 @@ impl CommandBufferShared {
                  work.extend(&part.raws);
                  continue;
              }
@@ -360,7 +482,7 @@ index 024ee685e..600cfae8f 100644
              if !globals.is_empty() || start_stamp.is_some() || !moves.is_empty() {
                  started |= offset == 0;
                  let stamps = Stamps {
-@@ -794,7 +813,7 @@ impl CommandBufferShared {
+@@ -840,7 +863,7 @@ impl CommandBufferShared {
                      end: None,
                  };
                  let kept = &mut scheduler.kept;
@@ -369,41 +491,57 @@ index 024ee685e..600cfae8f 100644
              }
              work.extend(&state.recorded[start + offset].raws);
          }
-@@ -1024,6 +1043,9 @@ impl CommandBufferShared {
+@@ -1153,6 +1176,13 @@ impl CommandBufferShared {
                  false => work.insert(0, lead),
              }
          }
 +        for command in work.iter().chain(finale.iter()) {
-+            crate::stage_trace::diagnostic_link(Arc::as_ptr(self) as u64, ash::vk::Handle::as_raw(*command), index as u64);
++            crate::stage_trace::diagnostic_link(
++                Arc::as_ptr(self) as u64,
++                ash::vk::Handle::as_raw(*command),
++                index as u64,
++            );
 +        }
          let mut work_timeline = vk::TimelineSemaphoreSubmitInfo::default()
              .wait_semaphore_values(wait_values)
              .signal_semaphore_values(work_signal_values);
-@@ -1067,6 +1089,7 @@ impl CommandBufferShared {
+@@ -1196,6 +1226,11 @@ impl CommandBufferShared {
          let buffers = (submits.iter())
              .map(|info| info.command_buffer_count as usize)
              .sum();
-+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 2);
++        crate::stage_trace::mark(
++            Arc::as_ptr(self) as usize,
++            crate::stage_trace::Stage::SubmitStep,
++            2,
++        );
          // From here its heap set versions may be pending: nothing writes them any more, and its
          // first batch takes the ticket a texture that goes from now on waits for
          // (`heap_sets.rs`). One committed and not yet submitted holds no gone texture.
-@@ -1128,6 +1151,7 @@ impl CommandBufferShared {
+@@ -1258,6 +1293,11 @@ impl CommandBufferShared {
                  scheduler
                      .group
                      .submit(device, &mut scheduler.waited[queue], Some(after));
-+            crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 3);
++            crate::stage_trace::mark(
++                Arc::as_ptr(self) as usize,
++                crate::stage_trace::Stage::SubmitStep,
++                3,
++            );
              // A test's stand-in for a scheduler thread preempted once the call returned.
              #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
              super::completion::trace::submit_returned();
-@@ -1277,6 +1301,7 @@ impl CommandBufferShared {
+@@ -1429,6 +1469,11 @@ impl CommandBufferShared {
              finishes_after(&batches.all()[index].waits, (queue, self), waited)
          };
          drop(state);
-+        crate::stage_trace::mark(Arc::as_ptr(self) as usize, crate::stage_trace::Stage::SubmitStep, 4);
++        crate::stage_trace::mark(
++            Arc::as_ptr(self) as usize,
++            crate::stage_trace::Stage::SubmitStep,
++            4,
++        );
          if rebound {
              device.degrade_encoded_use_rebound(rebound_use);
          }
-@@ -1806,3 +1831,15 @@ fn finishes_after(
+@@ -2043,3 +2088,15 @@ fn finishes_after(
      }
      after
  }
@@ -420,7 +558,7 @@ index 024ee685e..600cfae8f 100644
 +    (pair, count)
 +}
 diff --git a/crates/metal2vulkan-runtime/src/creation.rs b/crates/metal2vulkan-runtime/src/creation.rs
-index 12076dbdc..15a835a16 100644
+index 12076dbdc..040614839 100644
 --- a/crates/metal2vulkan-runtime/src/creation.rs
 +++ b/crates/metal2vulkan-runtime/src/creation.rs
 @@ -116,6 +116,7 @@ pub(crate) unsafe fn allocate_memory(
@@ -431,7 +569,7 @@ index 12076dbdc..15a835a16 100644
      let busy = allocations::Busy::of(admitted.as_deref());
      // SAFETY: the caller's.
      let memory = unsafe { device.allocate_memory(info, None) };
-@@ -124,6 +125,62 @@ pub(crate) unsafe fn allocate_memory(
+@@ -124,6 +125,66 @@ pub(crate) unsafe fn allocate_memory(
      memory
  }
  
@@ -463,7 +601,8 @@ index 12076dbdc..15a835a16 100644
 +    let mut raw = [std::ptr::null_mut::<libc::c_void>(); SITE_FRAMES + 2];
 +    // SAFETY: `raw` holds the count passed.
 +    #[cfg(target_vendor = "apple")]
-+    let depth = unsafe { libc::backtrace(raw.as_mut_ptr(), raw.len() as libc::c_int) }.max(0) as usize;
++    let depth =
++        unsafe { libc::backtrace(raw.as_mut_ptr(), raw.len() as libc::c_int) }.max(0) as usize;
 +    #[cfg(not(target_vendor = "apple"))]
 +    let depth = 0usize;
 +    let mut frames = [0usize; SITE_FRAMES];
@@ -475,7 +614,10 @@ index 12076dbdc..15a835a16 100644
 +    let at = match sites.iter().position(|site| site.frames == frames) {
 +        Some(at) => at,
 +        None if sites.len() < SITE_COUNT => {
-+            sites.push(AllocationSite { frames, ..Default::default() });
++            sites.push(AllocationSite {
++                frames,
++                ..Default::default()
++            });
 +            sites.len() - 1
 +        }
 +        None => sites.len() - 1,
@@ -494,8 +636,49 @@ index 12076dbdc..15a835a16 100644
  /// `image` bound to `memory` at `offset`.
  ///
  /// # Safety
+diff --git a/crates/metal2vulkan-runtime/src/device/compiles.rs b/crates/metal2vulkan-runtime/src/device/compiles.rs
+index efd709070..cf70123f0 100644
+--- a/crates/metal2vulkan-runtime/src/device/compiles.rs
++++ b/crates/metal2vulkan-runtime/src/device/compiles.rs
+@@ -299,12 +299,35 @@ pub(crate) fn holding<R>(call: impl FnOnce() -> R) -> (R, Vec<(MessageSink, Debu
+     (made, messages)
+ }
+ 
++/// Whether a call that may compile is made on this thread whatever its class: the host says its
++/// driver compiles inside the call, on the calling thread (`METAL2VULKAN_COMPILE_ON_ASKING_THREAD=1`),
++/// so there is no compiler service whose class would follow the asking thread's, and a thread
++/// started for the call only makes the asking thread wait for one of a lower priority than its
++/// own (a render server's main thread, which has no class, waited 40 to 170 ms for it on a busy
++/// system). A thread with less than 2 MiB of stack still hands the call over: the driver's
++/// compiler runs deep, and the runtime's thread has the room.
++#[cfg(any(target_os = "macos", target_os = "ios"))]
++fn compiles_here() -> bool {
++    static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let host = *HOST.get_or_init(|| {
++        std::env::var_os("METAL2VULKAN_COMPILE_ON_ASKING_THREAD").is_some_and(|value| value == "1")
++    });
++    // SAFETY: the calling thread's own handle.
++    host && unsafe { libc::pthread_get_stacksize_np(libc::pthread_self()) } >= 2 << 20
++}
++
++/// Never: no class here, so every call is made on the asking thread already.
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
++fn compiles_here() -> bool {
++    false
++}
++
+ /// Run `call`, one Vulkan call that may compile, at the user-initiated quality of service or
+ /// above (the module docs). It runs here where this thread is at that class, and otherwise on a
+ /// thread of the runtime's own at it while this thread waits. It runs here too where no thread
+ /// starts or the process is exiting.
+ pub(super) fn at_user_initiated<R: Send>(call: impl FnOnce() -> R + Send) -> R {
+-    if exit_guard::at_least_user_initiated() {
++    if exit_guard::at_least_user_initiated() || compiles_here() {
+         return call();
+     }
+     // The driver diagnostics this thread's call is measured to report: the driver reports them
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index cb4fe4588..6ff2064bc 100644
+index 38bb54a46..9cd6f125b 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 @@ -31,6 +31,10 @@ pub(super) mod prime;
@@ -509,7 +692,7 @@ index cb4fe4588..6ff2064bc 100644
  mod staging;
  pub(super) mod submit;
  pub(crate) mod submit_stalls;
-@@ -667,6 +671,9 @@ pub(super) struct DeviceShared {
+@@ -694,6 +698,9 @@ pub(super) struct DeviceShared {
      /// The thread that lets go of what a released state's pool pieces gave back as they ended
      /// (`pipeline/reaper.rs`).
      pub(super) reaper: Arc<crate::pipeline::reaper::Reaper>,
@@ -519,7 +702,7 @@ index cb4fe4588..6ff2064bc 100644
      /// The trails its threads open between a signal and their last let-go of what they held for
      /// the work, which a command buffer's waiters wait for (`trails.rs`).
      pub(crate) trails: Arc<crate::trails::Trails>,
-@@ -1030,6 +1037,9 @@ impl Drop for DeviceShared {
+@@ -1066,6 +1073,9 @@ impl Drop for DeviceShared {
          // What the reaper is handed holds the device: none is left, and it only stops, unless
          // this teardown runs on its thread.
          self.reaper.stop();
@@ -529,7 +712,7 @@ index cb4fe4588..6ff2064bc 100644
          // What the residency thread releases holds the device: none is left.
          #[cfg(unix)]
          self.residency.stop();
-@@ -1485,11 +1495,59 @@ impl Device {
+@@ -1542,11 +1552,52 @@ impl Device {
      /// state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes a memory
      /// block, whose `vkAllocateMemory` waited 2.37 s for other processes' GPU work on NVIDIA's
      /// driver. Nothing in a host step, a serial point of the command buffers' stream that makes
@@ -559,13 +742,6 @@ index cb4fe4588..6ff2064bc 100644
 +        lock(&shared.memory).release_all_kept(shared.vk())
 +    }
 +
-+    /// Let the parked images and buffers go whose time is up (`recycle.rs`), from the room
-+    /// thread: a device that makes and releases nothing more still lets them go.
-+    pub(crate) fn age_parked(&self) {
-+        self.age_parked_images(false);
-+        self.age_parked_buffers(false);
-+    }
-+
 +    /// How long a spare block of the device's memory stays before it is freed
 +    /// (`memory::SPARE_FOR`): the age a consumer that gives memory back by age of its own
 +    /// (resources its caller declared discardable) takes, so both go on one clock. No Metal
@@ -588,9 +764,9 @@ index cb4fe4588..6ff2064bc 100644
 +    /// made ahead while they grow (`memory::keep_room`, `memory/ready.rs`).
 +    pub(crate) fn keep_room_now(&self) {
          let shared = self.shared();
-         let copies = || self.copies_color_on_the_host();
-         let memory = &shared.memory;
-@@ -1534,6 +1592,13 @@ impl Device {
+         // The idle sweep's thread, from the device's first such call on (`idle_sweep.rs`).
+         shared.idle_sweep.start(|| crate::idle_sweep::SweepTargets {
+@@ -1599,6 +1650,13 @@ impl Device {
          Arc::ptr_eq(self.line(), other.line())
      }
  
@@ -604,7 +780,7 @@ index cb4fe4588..6ff2064bc 100644
      /// Whether the device was lost: not to a public call that took its arguments on it before
      /// its loss, which the loss follows (`Device::at_serving_taking`, `line.rs`).
      pub(super) fn is_lost(&self) -> bool {
-@@ -1542,8 +1607,12 @@ impl Device {
+@@ -1607,8 +1665,12 @@ impl Device {
      }
  
      /// Record that the device was lost: its line recovers at the next call that needs the device,
@@ -618,13 +794,12 @@ index cb4fe4588..6ff2064bc 100644
          let shared = self.shared();
          shared.lost.store(true, Ordering::Release);
          shared.line.lose(shared);
-@@ -2167,6 +2236,31 @@ impl Device {
-         // SAFETY: the device is live, of `physical`, and enables timeline semaphores, and
-         // `bufferDeviceAddress` where `device_address` says so; `queues` holds at least one of
-         // its queues, which nothing uses yet.
+@@ -2302,6 +2364,28 @@ impl Device {
+         // object where the device is the first after one. A device that registers nothing (one
+         // of an identity registered since the last load) is not primed: an earlier device's
+         // priming made those calls first, on what stays loaded.
 +        let priming_has = drawn.has(prime::Has {
 +            timestamps: timestamp_bits > 0,
-+            // A device the runtime created enables it (`enables.rs`).
 +            host_query_reset: owned,
 +            device_addresses: device_address,
 +            generated_commands: generated_commands.is_some(),
@@ -638,8 +813,6 @@ index cb4fe4588..6ff2064bc 100644
 +            sized_index_bind: false,
 +            ycbcr_conversion: ycbcr_formats.primer().is_some(),
 +        });
-+        // Raw disk/cache I/O only: starting the ordinary guarded cache or its
-+        // worker before priming would change the destructor ordering it protects.
 +        let priming_cache = cache.priming(
 +            &unsafe { instance.raw.get_physical_device_properties(physical) },
 +            compile.profile_fingerprint(),
@@ -647,40 +820,18 @@ index cb4fe4588..6ff2064bc 100644
 +            prime::cache_key(priming_has, queue_family),
 +            instance.sink().cloned(),
 +        );
-         if let Err(error) = unsafe {
-             prime::prime(
-                 &instance.raw,
-@@ -2183,27 +2277,13 @@ impl Device {
-                 queue_family,
-                 &queues,
-                 Sharing::with_buffers(&queue_families, &buffer_families),
--                drawn.has(prime::Has {
--                    timestamps: timestamp_bits > 0,
--                    // A device the runtime created enables it (`enables.rs`).
--                    host_query_reset: owned,
--                    device_addresses: device_address,
--                    generated_commands: generated_commands.is_some(),
--                    sparse_binding: sparse.binds(),
--                    push_descriptor: push_descriptor.is_some(),
--                    calibration: calibrated.is_some(),
--                    object_names: object_name.is_some(),
--                    extended_dynamic_state: false,
--                    primitive_restart: false,
--                    color_write_masks: false,
--                    sized_index_bind: false,
--                    ycbcr_conversion: ycbcr_formats.primer().is_some(),
--                }),
-+                priming_has,
-                 generated_commands.as_ref(),
-                 push_descriptor,
-                 calibrated,
-                 drawn,
-                 ycbcr_formats.primer(),
-+                priming_cache,
-             )
+         let primes = exit_guard::before_priming(&guard_identity);
+         if let Err(error) = match primes {
+             false => Ok(()),
+@@ -2345,6 +2429,7 @@ impl Device {
+                     calibrated,
+                     drawn,
+                     ycbcr_formats.primer(),
++                    priming_cache,
+                 )
+             },
          } {
-             scheduler.stop();
-@@ -2771,6 +2851,7 @@ impl Device {
+@@ -2903,6 +2988,7 @@ impl Device {
              uncommitted: Arc::default(),
              pipeline_pool: Default::default(),
              reaper: Default::default(),
@@ -689,10 +840,10 @@ index cb4fe4588..6ff2064bc 100644
              recoveries: Arc::default(),
              libraries: graphics_pipeline_library.then(Default::default),
 diff --git a/crates/metal2vulkan-runtime/src/device/prime.rs b/crates/metal2vulkan-runtime/src/device/prime.rs
-index eada5530e..fd69af97c 100644
+index 5650334ba..519dcb3b3 100644
 --- a/crates/metal2vulkan-runtime/src/device/prime.rs
 +++ b/crates/metal2vulkan-runtime/src/device/prime.rs
-@@ -83,9 +83,11 @@ use crate::gpu_time::Calibration;
+@@ -92,9 +92,11 @@ use crate::gpu_time::Calibration;
  use crate::loader_word::DeviceWord;
  use crate::memory;
  use crate::release::{self, Generated, Released};
@@ -704,7 +855,7 @@ index eada5530e..fd69af97c 100644
  use std::time::{Duration, Instant};
  
  use super::functions::Vk;
-@@ -362,7 +364,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
+@@ -371,7 +373,7 @@ fn specialization() -> vk::SpecializationInfo<'static> {
  /// What the device primed has: a queue family that writes timestamps, `hostQueryReset`, device
  /// addresses, `VK_EXT_device_generated_commands`, sparse binding on its queues, the push command,
  /// calibrated timestamps, and the render encoder's commands of [`PrimedDraws`].
@@ -713,7 +864,7 @@ index eada5530e..fd69af97c 100644
  pub(crate) struct Has {
      pub(crate) timestamps: bool,
      pub(crate) host_query_reset: bool,
-@@ -404,6 +406,16 @@ impl PrimedDraws {
+@@ -413,6 +415,16 @@ impl PrimedDraws {
      }
  }
  
@@ -730,7 +881,7 @@ index eada5530e..fd69af97c 100644
  /// Prime `device` of `physical`, made from `instance`, whose queues are `queues`, the first of
  /// its primary family `queue_family`, its buffers and images shared as `sharing` says, on this
  /// thread; `has` says what the device has, `generated` holds the commands of
-@@ -431,6 +443,7 @@ pub(super) unsafe fn prime(
+@@ -440,6 +452,7 @@ pub(super) unsafe fn prime(
      calibration: Option<Calibration>,
      drawn: PrimedDraws,
      ycbcr: Option<vk::SamplerYcbcrConversionCreateInfo<'static>>,
@@ -738,7 +889,7 @@ index eada5530e..fd69af97c 100644
  ) -> Result<(), Error> {
      let mut primer = Primer {
          device,
-@@ -443,6 +456,8 @@ pub(super) unsafe fn prime(
+@@ -452,6 +465,8 @@ pub(super) unsafe fn prime(
          memory: unsafe { instance.get_physical_device_memory_properties(physical) },
          calls: Calls::NONE,
          held: Vec::new(),
@@ -747,7 +898,7 @@ index eada5530e..fd69af97c 100644
      };
      // SAFETY: the caller's.
      let primed = unsafe {
-@@ -461,6 +476,10 @@ pub(super) unsafe fn prime(
+@@ -470,6 +485,10 @@ pub(super) unsafe fn prime(
      unsafe {
          let _ = device.device_wait_idle();
          primer.made(Call::DeviceWaitIdle);
@@ -758,7 +909,7 @@ index eada5530e..fd69af97c 100644
          while let Some(release) = primer.held.pop() {
              let call = release(device);
              primer.made(call);
-@@ -548,6 +567,8 @@ struct Primer<'a> {
+@@ -560,6 +579,8 @@ struct Primer<'a> {
      calls: Calls,
      /// What was made, released last first.
      held: Vec<Release>,
@@ -767,7 +918,7 @@ index eada5530e..fd69af97c 100644
  }
  
  impl Primer<'_> {
-@@ -872,7 +893,7 @@ impl Primer<'_> {
+@@ -884,7 +905,7 @@ impl Primer<'_> {
                  .layout(layout)
                  .push_next(&mut flags);
              let pipeline = device
@@ -776,7 +927,7 @@ index eada5530e..fd69af97c 100644
                  .map_err(|(_, error)| vulkan(error))?[0];
              self.hold(pipeline);
              let pipelines = ExecutionSetPipelineInfo::new(pipeline, 1);
-@@ -1208,9 +1229,8 @@ impl Primer<'_> {
+@@ -1220,9 +1241,8 @@ impl Primer<'_> {
              let module = device.create_shader_module(&info, None).map_err(vulkan)?;
              self.made(Call::CreateShaderModule);
              self.hold(module);
@@ -790,10 +941,10 @@ index eada5530e..fd69af97c 100644
              let specialization = specialization();
 diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
 new file mode 100644
-index 000000000..531abcf9e
+index 000000000..96955b8b8
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/device/room.rs
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,121 @@
 +//! The device's room keeper: one thread of the device's that keeps room in the pools its encodings
 +//! and commits place their own resources in (`memory::keep_room`), so the creation call that asks
 +//! for room returns at once.
@@ -887,56 +1038,39 @@ index 000000000..531abcf9e
 +    let Some(_busy) = exit_guard::enter() else {
 +        return;
 +    };
-+    device.age_parked();
-+    let shared = device.shared();
-+    crate::memory::age_spares(&shared.memory, shared.vk());
 +    device.keep_room_now();
 +}
 +
 +/// The thread's loop: a pass for each time room was asked since the last, until stopped.
 +fn run(shared: &Shared, weak: &WeakDevice) {
 +    loop {
-+        let requested = {
++        {
 +            let mut state = lock(&shared.state);
 +            while !state.asked && !state.stopping {
-+                let (next, timeout) = shared
++                state = shared
 +                    .work
-+                    .wait_timeout(state, std::time::Duration::from_millis(250))
++                    .wait(state)
 +                    .unwrap_or_else(PoisonError::into_inner);
-+                state = next;
-+                if timeout.timed_out() {
-+                    break;
-+                }
 +            }
 +            if state.stopping {
 +                return;
 +            }
-+            let requested = state.asked;
 +            state.asked = false;
-+            requested
-+        };
++        }
 +        let Some(device) = weak.upgrade() else {
 +            return;
 +        };
-+        if requested {
-+            keep(&device);
-+        } else if let Some(_busy) = exit_guard::enter() {
-+            // In a section of the exit guard, as every Vulkan call of a thread of the runtime's is:
-+            // a parked image or buffer, a kept empty block and a spare whose time is up go here.
-+            device.age_parked();
-+            let parts = device.shared();
-+            crate::memory::age_spares(&parts.memory, parts.vk());
-+        }
++        keep(&device);
 +        // Outside the state's lock: it may be the device's last handle, whose teardown stops
 +        // this thread.
 +        drop(device);
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/device/submit.rs b/crates/metal2vulkan-runtime/src/device/submit.rs
-index 0550b9f5c..a1aba6ab6 100644
+index 41d1ea49a..8a01c88bb 100644
 --- a/crates/metal2vulkan-runtime/src/device/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/device/submit.rs
-@@ -503,6 +503,7 @@ impl Device {
+@@ -532,6 +532,7 @@ impl Device {
      }
  
      /// The error of a failed submission or wait, recording a lost device.
@@ -944,39 +1078,112 @@ index 0550b9f5c..a1aba6ab6 100644
      pub(crate) fn failed(&self, error: vk::Result) -> Error {
          if error == vk::Result::ERROR_DEVICE_LOST {
              self.mark_lost();
-diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
-index 2e597846b..e807f98de 100644
---- a/crates/metal2vulkan-runtime/src/in_place.rs
-+++ b/crates/metal2vulkan-runtime/src/in_place.rs
-@@ -802,6 +802,10 @@ pub(crate) fn in_place(
-     if policy == HostPageTexturePolicy::Shadow {
-         return Err(ShadowCause::Exact);
+diff --git a/crates/metal2vulkan-runtime/src/exit_guard.rs b/crates/metal2vulkan-runtime/src/exit_guard.rs
+index 9c0da06da..2ca70d230 100644
+--- a/crates/metal2vulkan-runtime/src/exit_guard.rs
++++ b/crates/metal2vulkan-runtime/src/exit_guard.rs
+@@ -1318,7 +1318,7 @@ thread_local! {
+ /// `device/compiles.rs`). MoltenVK runs each
+ /// compile on a dispatch queue that takes the class of the thread asking, so the class here is the
+ /// compile's class in Metal's compiler service.
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(crate) fn raise_to_user_initiated() {
+     if !at_least_user_initiated() {
+         // SAFETY: sets the calling thread's own class; no pointer.
+@@ -1328,28 +1328,28 @@ pub(crate) fn raise_to_user_initiated() {
      }
-+    // Trusting the driver for every usage (`HostPageTexturePolicy::InPlaceWrites`): no check.
-+    if policy == HostPageTexturePolicy::InPlaceWrites {
-+        return Ok(());
-+    }
-     let written = Access::written(texel, padding);
-     if Access::Writes.takes(usage) && written.is_none() {
-         return Err(ShadowCause::StoreWidth(texel));
+ }
+ 
+-/// Nothing: no quality of service class here ([`raise_to_user_initiated`] on macOS).
+-#[cfg(not(target_os = "macos"))]
++/// Nothing: no quality of service class here ([`raise_to_user_initiated`] on macOS and iOS).
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+ pub(crate) fn raise_to_user_initiated() {}
+ 
+ /// Lower this thread to the utility quality of service: a warm pass's thread (`warm/pass.rs`),
+ /// whose translations nothing waits for. Its pipeline makings still compile at the
+ /// user-initiated class, on a thread of their own (`device/compiles.rs`), and a thread it starts
+ /// starts at the default class ([`spawn`]).
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(crate) fn lower_to_utility() {
+     // SAFETY: sets the calling thread's own class; no pointer.
+     unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+ }
+ 
+ /// Nothing elsewhere: a Linux thread's nice value passes to the threads it starts, and the warm
+-/// pass starts the pipeline pool's, which serve the program ([`lower_to_utility`] on macOS).
+-#[cfg(not(target_os = "macos"))]
++/// pass starts the pipeline pool's, which serve the program ([`lower_to_utility`] on macOS and iOS).
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+ pub(crate) fn lower_to_utility() {}
+ 
+ /// Run this thread at the user-interactive quality of service, whatever its class: a thread of
+ /// the runtime's own that takes command buffers to their handlers ([`spawn_user_interactive`]).
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ fn run_at_user_interactive() {
+     // Metal runs every command buffer's scheduled and completed handlers at the user-interactive
+     // class, whatever the class of the thread that committed it: measured on an M3 Max, macOS
+@@ -1469,12 +1469,12 @@ impl SchedAttr {
+ }
+ 
+ /// Nothing: no such hint here ([`run_at_user_interactive`] on macOS and Linux).
+-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
++#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+ fn run_at_user_interactive() {}
+ 
+ /// Whether this thread runs at the user-initiated quality of service or above: its class is
+ /// user-initiated or user-interactive. Always where there is no such class.
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(crate) fn at_least_user_initiated() -> bool {
+     use libc::qos_class_t as Q;
+     let mut class = Q::QOS_CLASS_UNSPECIFIED;
+@@ -1489,8 +1489,8 @@ pub(crate) fn at_least_user_initiated() -> bool {
+         )
+ }
+ 
+-/// Always: no quality of service class here ([`at_least_user_initiated`] on macOS).
+-#[cfg(not(target_os = "macos"))]
++/// Always: no quality of service class here ([`at_least_user_initiated`] on macOS and iOS).
++#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+ pub(crate) fn at_least_user_initiated() -> bool {
+     true
+ }
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index 9e216b6af..1e892a791 100644
+index be5774fee..9749d07cc 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
-@@ -29,6 +29,7 @@
- #![recursion_limit = "256"]
- 
- mod address;
+@@ -102,6 +102,7 @@ mod exactness;
+ mod execution;
+ mod extended_canonical;
+ mod families;
 +pub mod stage_trace;
- mod address_map;
- mod address_pool;
- mod allocations;
-@@ -370,12 +371,18 @@ pub use render_values::{
+ #[doc(hidden)]
+ pub use execution::{ExecutedPipeline, Execution};
+ mod exit_guard;
+@@ -287,6 +288,7 @@ pub use command_buffer::checks::{Submission, SubmissionCheck};
+ pub use command_buffer::{CommandBuffer, CommitFailure, FailedEncoders, Handler};
+ pub use compute::ComputeCommandEncoder;
+ pub use copy_plan::{BlitOption, CopyProblem};
++pub use creation::{allocation_sites, AllocationSite};
+ pub use degradation::{Degradation, DegradationCategory, DegradeNotice};
+ pub use degradation::{MisplacedNotice, NoticePlace};
+ pub use depth_stencil::DepthStencilState;
+@@ -346,6 +348,7 @@ pub use indirect_command_buffer::{
+ pub use interop::{SemaphoreProblem, VkEventSignal, VkEventWait, VkHostMemory};
+ pub use library::{Function, FunctionDescriptor, Library};
+ pub use linear_plan::BufferTextureProblem;
++pub use memory::{MemoryKinds, MEMORY_KIND_CLASSES};
+ pub use metal2vulkan::device::DriverFact;
+ pub use metal_release::MACOS_RELEASE;
+ pub use mipmap_plan::MipmapProblem;
+@@ -381,12 +384,16 @@ pub use render_values::{
  pub use resource::{ObjectId, ResourceRef};
  pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
  pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
-+pub use creation::{allocation_sites, AllocationSite};
-+pub use memory::{MemoryKinds, MEMORY_KIND_CLASSES};
 +pub use shader_cache::system::{
 +    set_cache_readable_by_all, set_system_layer, system_layer, SystemLayer, SystemLayerCounts,
 +};
@@ -1010,42 +1217,11 @@ index 8f4a05025..a3e0f21a6 100644
      /// The function as a stage links it, with its constant values, under its specialized name
      /// where it was made with one, specialized where it was made with constant values or by
      /// [`Library::new_function_with_descriptor`], and precompiled where it was made compiled to a
-diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
-index bf7b0911b..8875b45df 100644
---- a/crates/metal2vulkan-runtime/src/linear_plan.rs
-+++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
-@@ -1356,6 +1356,26 @@ pub(super) fn holding(
-     ))
- }
- 
-+/// Whether a render pass that keeps a texture `width` texels wide over `layout`'s texels in tile
-+/// memory stores it back within the bytes an image over them may hold, in a buffer of
-+/// `buffer_length` bytes: a tile store reaching the texture's right or bottom edge writes whole
-+/// 16x4-texel blocks, so up to 15 texels past a row's last and 3 rows past its last row. Every
-+/// row's block must end within its pitch, and the last block within the buffer; one slice only.
-+pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
-+    const TILE: (u64, u64) = (16, 4);
-+    if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
-+        return false;
-+    }
-+    let block_row = width.next_multiple_of(TILE.0) * (layout.row_bytes / width);
-+    let last_row = layout.rows.next_multiple_of(TILE.1) - 1;
-+    layout.row_pitch >= block_row
-+        && layout
-+            .offset
-+            .saturating_add(layout.row_pitch.saturating_mul(last_row))
-+            .saturating_add(block_row)
-+            <= buffer_length
-+}
-+
- /// Whether a linear image over `layout`'s texels, whose subresources take `size` bytes each from
- /// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels:
- /// the texels lie with no byte between them ([`holding`]), and its last subresource ends at their
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index 1d1143c66..3c5cdc9ff 100644
+index 029afd32a..34849b6b2 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
-@@ -233,6 +233,57 @@ const DEDICATED_SLACK: u64 = 4;
+@@ -269,6 +269,57 @@ const DEDICATED_SLACK: u64 = 4;
  /// makes and frees blocks.
  const LOGGED_PLACEMENT_BYTES: u64 = 4 << 20;
  
@@ -1103,7 +1279,7 @@ index 1d1143c66..3c5cdc9ff 100644
  /// What memory a resource needs.
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
  pub(super) enum MemoryClass {
-@@ -568,7 +619,10 @@ pub(super) const ZERO_INITIALIZE: vk::MemoryAllocateFlags = vk::MemoryAllocateFl
+@@ -604,7 +655,10 @@ pub(super) const ZERO_INITIALIZE: vk::MemoryAllocateFlags = vk::MemoryAllocateFl
  /// timed, the submission's fence read after both. On ANV (Mesa 26.2.4, the UHD 770 of RPL-S) the
  /// bind took 0.2 to 1.8 us and the view 1.8 to 5.1 us; on RADV (Mesa 26.0.8) 0.0 to 0.6 us and
  /// 0.6 to 2.0 us on the Radeon 780M and the RX 7900 XTX; the submission still pending after both
@@ -1115,7 +1291,7 @@ index 1d1143c66..3c5cdc9ff 100644
  /// block ([`allocate_image_while_queued`]), and every submission names one buffer object fewer
  /// to the kernel for each.
  #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-@@ -1065,6 +1119,14 @@ impl<T> Pool<T> {
+@@ -1262,6 +1316,14 @@ impl<T> Pool<T> {
          }
      }
  
@@ -1130,7 +1306,7 @@ index 1d1143c66..3c5cdc9ff 100644
      /// Whether a pooled block has room for `size` bytes at the largest alignment asked of the
      /// pool so far: whether [`Pool::room`] is that long.
      ///
-@@ -1307,13 +1369,18 @@ impl<T> Pool<T> {
+@@ -1519,13 +1581,18 @@ impl<T> Pool<T> {
      /// imports, whatever else they are.
      fn count_into(&self, census: &mut Census, imported: impl Fn(&T) -> bool) {
          for block in self.blocks.iter().flatten() {
@@ -1154,7 +1330,7 @@ index 1d1143c66..3c5cdc9ff 100644
          }
      }
  }
-@@ -1353,6 +1420,53 @@ impl FreeCause {
+@@ -1565,6 +1632,53 @@ impl FreeCause {
      pub(super) const COUNT: usize = 7;
  }
  
@@ -1208,7 +1384,7 @@ index 1d1143c66..3c5cdc9ff 100644
  /// A device's live `VkDeviceMemory` blocks, by kind ([`Memory::census`]): each one buffer
  /// object the driver lists in every submission where it lists every allocation (ANV on i915).
  #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-@@ -1366,6 +1480,13 @@ pub(super) struct Census {
+@@ -1578,6 +1692,13 @@ pub(super) struct Census {
      pub(super) dedicated: u64,
      /// The caller's host memory imported ([`import_host`]), a block each.
      pub(super) imported: u64,
@@ -1222,7 +1398,7 @@ index 1d1143c66..3c5cdc9ff 100644
  }
  
  /// A host pointer the runtime may send between threads: the mapping of a block it owns.
-@@ -1526,6 +1647,11 @@ struct BlockAddresses {
+@@ -1738,6 +1859,11 @@ struct BlockAddresses {
  }
  
  impl Block {
@@ -1234,7 +1410,7 @@ index 1d1143c66..3c5cdc9ff 100644
      /// Whether another placement may take its memory once its own went: memory the runtime
      /// allocated for itself, neither an import nor a buffer's dedicated allocation
      /// (`VkMemoryDedicatedAllocateInfo`, which binds that buffer alone).
-@@ -2548,6 +2674,60 @@ impl Memory {
+@@ -2957,6 +3083,64 @@ impl Memory {
          census
      }
  
@@ -1285,7 +1461,11 @@ index 1d1143c66..3c5cdc9ff 100644
 +                    (false, _) if kept => kinds.empty[class] += 1,
 +                    (false, _) => kinds.pooled[class] += 1,
 +                }
-+                let into = if kept { &mut kinds.lazy_kept } else { &mut kinds.lazy };
++                let into = if kept {
++                    &mut kinds.lazy_kept
++                } else {
++                    &mut kinds.lazy
++                };
 +                commitment(into, &block.payload, bytes);
 +            }
 +        }
@@ -1295,25 +1475,21 @@ index 1d1143c66..3c5cdc9ff 100644
      /// Whether one of the memory types `allowed` names is of `class`.
      pub(super) fn has_type(&self, allowed: u32, class: MemoryClass) -> bool {
          self.class_types(allowed, class) != 0
-@@ -2950,13 +3130,11 @@ impl Memory {
+@@ -3375,6 +3559,13 @@ impl Memory {
          pool.add_as(size, dedicated, block, used, zeroed)
      }
  
--    /// The bytes of a pooled block made for `pool`: [`Memory::block_bytes`], and a block of
--    /// images' [`Memory::image_block_bytes`].
 +    /// The bytes of the next pooled block made for `pool`: as many as its pooled blocks have (the
 +    /// pool doubles), at least [`FIRST_BLOCK_BYTES`], at most [`Memory::block_bytes`], and a block
 +    /// of images' [`Memory::image_block_bytes`] ([`Memory::next_block_bytes`]).
-     fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
--        match pool.0 {
--            Holds::Images => self.image_block_bytes,
--            _ => self.block_bytes,
--        }
++    fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
 +        self.next_block_bytes(pool, 1)
-     }
- 
++    }
++
      /// The bytes of each live pooled block that holds `holds`, of every memory type, for the
-@@ -3018,6 +3196,21 @@ impl Memory {
+     /// crate's device tests.
+     #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+@@ -3434,6 +3625,18 @@ impl Memory {
              .collect()
      }
  
@@ -1323,10 +1499,7 @@ index 1d1143c66..3c5cdc9ff 100644
 +    /// allocation).
 +    fn next_block_bytes(&self, pool: (Holds, u32), size: u64) -> u64 {
 +        let have = self.pool_ref(pool.0, pool.1).pooled_bytes();
-+        let most = match pool.0 {
-+            Holds::Images => self.image_block_bytes,
-+            _ => self.block_bytes,
-+        };
++        let most = self.block_bytes(pool.1);
 +        (have.max(FIRST_BLOCK_BYTES).max(size.next_power_of_two()))
 +            .min(most)
 +            .max(size)
@@ -1335,26 +1508,18 @@ index 1d1143c66..3c5cdc9ff 100644
      /// What making a block takes, copied out so that the block is made with the memory's lock
      /// released ([`place`], [`keep_room`]).
      fn maker(&self) -> BlockMaker {
-@@ -3026,7 +3219,6 @@ impl Memory {
-             .fold(0, |bits, (index, _)| bits | 1 << index);
-         BlockMaker {
-             block_bytes: self.block_bytes,
--            image_block_bytes: self.image_block_bytes,
-             host_visible,
-             fd_types: self.fd_buffer_types.unwrap_or(0),
-             page_types: self.page_buffer_types.unwrap_or(0),
-@@ -3222,7 +3414,9 @@ impl Memory {
+@@ -3639,7 +3842,9 @@ impl Memory {
          let spare = self
              .kept_budget(heap)
              .saturating_sub(self.kept_in_heap(heap));
--        let half = self.block_bytes / 2;
+-        let half = self.block_bytes(type_index) / 2;
 +        // A dedicated block is larger than half its pool's block as it was made, and a pool's
 +        // blocks grow from [`FIRST_BLOCK_BYTES`]: every dedicated one past half of that is kept.
 +        let half = FIRST_BLOCK_BYTES / 2;
          let reusable = |block: &Block| block.reusable() && block.size > half;
+         let keeps_room = self.keeps_room(self.pool_at(holds, type_index));
          let pool = self.pool(holds, type_index);
-         let freed = pool.release(block, (offset, size), now, spare, reusable);
-@@ -3310,6 +3504,21 @@ impl Memory {
+@@ -3796,6 +4001,21 @@ impl Memory {
          count
      }
  
@@ -1376,7 +1541,7 @@ index 1d1143c66..3c5cdc9ff 100644
      /// Over every pool: the block slots the room queries have walked and the free ranges they
      /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
      /// where it derived per call ([`Pool::room_per_call`]).
-@@ -3383,10 +3592,18 @@ impl Memory {
+@@ -3869,10 +4089,18 @@ impl Memory {
          };
          let (heap, size) = (self.heap_of(block.type_index), block.size);
          let Some(parking) = &self.parking else {
@@ -1395,41 +1560,21 @@ index 1d1143c66..3c5cdc9ff 100644
                  return after;
              };
              let Block {
-@@ -3403,6 +3620,9 @@ impl Memory {
+@@ -3889,6 +4117,13 @@ impl Memory {
                  size,
              };
              // SAFETY: the caller's.
 +            if id != 0 {
-+                crate::stage_trace::mark(id, crate::stage_trace::Stage::MemoryDeferred, (size >> 10) as u32);
++                crate::stage_trace::mark(
++                    id,
++                    crate::stage_trace::Stage::MemoryDeferred,
++                    (size >> 10) as u32,
++                );
 +            }
              return unsafe { frees.post_or_free(posted, device) };
          };
          self.say_block(
-@@ -3647,8 +3867,6 @@ impl Memory {
- struct BlockMaker {
-     /// A pooled block's size ([`BLOCK_BYTES`], or the device's largest allocation).
-     block_bytes: u64,
--    /// As [`Memory`]'s.
--    image_block_bytes: u64,
-     /// The host-visible memory types, as bits: a block of one is mapped whole.
-     host_visible: u32,
-     /// The memory types whose [`Holds::FdBuffers`] blocks are allocated exportable, as bits.
-@@ -3668,14 +3886,6 @@ struct BlockMaker {
- }
- 
- impl BlockMaker {
--    /// The bytes of a pooled block made for `pool` ([`Memory::pooled_bytes`]).
--    fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
--        match pool.0 {
--            Holds::Images => self.image_block_bytes,
--            _ => self.block_bytes,
--        }
--    }
--
-     /// A new block of `size` bytes of memory type `type_index` that holds `holds`, with a buffer
-     /// of addresses where `addressed` gives the counts of such buffers made (its memory then as
-     /// long as that buffer requires, if longer), allocated zero-initialized where it holds images
-@@ -4460,7 +4670,7 @@ pub(super) fn allocate_image_while_queued(
+@@ -5089,7 +5324,7 @@ pub(super) fn allocate_image_while_queued(
  fn binds_wait(driver: Option<DriverId>) -> bool {
      !matches!(
          driver,
@@ -1438,11 +1583,11 @@ index 1d1143c66..3c5cdc9ff 100644
      )
  }
  
-@@ -4624,13 +4834,19 @@ fn place(
-         let pool = (holds, type_index);
+@@ -5246,13 +5481,19 @@ fn place(
+         let dedicated = fit == Fit::Apart || size > pooled / 2;
          let block_size = match dedicated {
              true => size,
--            false => maker.pooled_bytes(pool),
+-            false => pooled,
 +            false => lock(memory).next_block_bytes(pool, size),
          };
 +        let available = lock(memory).pool(pool.0, pool.1).room();
@@ -1459,7 +1604,7 @@ index 1d1143c66..3c5cdc9ff 100644
                  ready_after_placing(&mut guard, pool, size);
                  return Ok(guard.mark_overflowed(placement, overflowing));
              }
-@@ -4673,6 +4889,10 @@ fn place(
+@@ -5295,6 +5536,10 @@ fn place(
          };
          match made {
              Ok(block) => {
@@ -1470,7 +1615,7 @@ index 1d1143c66..3c5cdc9ff 100644
                  let mut memory = lock(memory);
                  if !dedicated && memory.makes_ahead(pool) {
                      memory.ahead.made_in_place(holds);
-@@ -4691,8 +4911,16 @@ fn place(
+@@ -5313,8 +5558,16 @@ fn place(
                  memory.say_placement("placed", &placement, Some(class));
                  return Ok(memory.mark_overflowed(placement, overflowing));
              }
@@ -1489,38 +1634,32 @@ index 1d1143c66..3c5cdc9ff 100644
          }
      }
      Err(failure)
-@@ -4713,6 +4941,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
-     released > 0 || waited
- }
- 
-+/// Free the kept empty blocks whose time is up, from the room worker: a device that makes and
-+/// releases nothing more still lets them go after [`KEPT_EMPTY_FOR`] ([`Memory::sweep_stale`]).
-+pub(super) fn age_spares(memory: &Mutex<Memory>, device: &ash::Device) {
-+    lock(memory).sweep_stale(device, Instant::now());
-+}
-+
- /// Let `memory` keep no block from now on ([`Memory::keep_none`]): those it keeps empty freed, and
- /// those still being made ahead stopped, each waited for with the lock released (its making
- /// reads its pages), and freed.
-@@ -4789,7 +5023,7 @@ pub(super) fn keep_room(
-         .filter(|&&(holds, _)| holds != own && holds != Holds::FdBuffers && !page(holds));
-     for &pool in first.chain(rest) {
+@@ -5422,7 +5675,7 @@ pub(super) fn keep_room(
+             continue;
+         }
          let addressed = pool.0.buffers().then_some(&**counts);
--        let bytes = maker.pooled_bytes(pool);
+-        let bytes = maker.block_bytes(pool.1);
 +        let bytes = lock(memory).pooled_bytes(pool);
          keep_pool_room(memory, device, (&maker, addressed), (pool, bytes));
          ready_if_growing(&mut lock(memory), pool);
      }
 diff --git a/crates/metal2vulkan-runtime/src/neutral.rs b/crates/metal2vulkan-runtime/src/neutral.rs
-index 526e32ebb..0090a6cb6 100644
+index 526e32ebb..24d78de4b 100644
 --- a/crates/metal2vulkan-runtime/src/neutral.rs
 +++ b/crates/metal2vulkan-runtime/src/neutral.rs
-@@ -37,7 +37,7 @@ use metal2vulkan::bind::NeutralResource;
+@@ -27,6 +27,7 @@
+ 
+ use super::device::lock;
+ use super::error::{vulkan, Error};
++use super::key_hash::KeyMap;
+ use super::memory::{Memory, MemoryClass, Placement};
+ use super::resource::ResourceKey;
+ use super::texture::first_move::{Filled, FirstMove, Fresh};
+@@ -37,7 +38,6 @@ use metal2vulkan::bind::NeutralResource;
  use metal2vulkan::device::FormatUsage;
  use metal2vulkan::vk::Format;
  use std::any::Any;
 -use std::collections::HashMap;
-+use super::key_hash::KeyMap;
  use std::sync::{Arc, Mutex, Weak};
  
  /// One neutral image, its view and its memory.
@@ -1567,11 +1706,92 @@ index 1512ab0ed..1fcd2f2e9 100644
      /// Whether nothing is allocated.
      pub(super) fn is_empty(&self) -> bool {
          self.free.len() == 1 && self.free.get(&self.base) == Some(&(self.end - self.base))
+diff --git a/crates/metal2vulkan-runtime/src/rebind.rs b/crates/metal2vulkan-runtime/src/rebind.rs
+index 5087b615d..c9eed1ff1 100644
+--- a/crates/metal2vulkan-runtime/src/rebind.rs
++++ b/crates/metal2vulkan-runtime/src/rebind.rs
+@@ -99,6 +99,8 @@ pub enum RebindProblem {
+     /// attachments' bytes from its open), or one committed whose commands the runtime records
+     /// only once earlier work completed: commit or drop it first.
+     EncodedUses,
++    /// The device refuses every rebind (`Device::refuse_rebinds`).
++    Refused,
+ }
+ 
+ /// The device's buffers over host pages, by their hazard-tracking key, with the command buffers
+@@ -106,6 +108,9 @@ pub enum RebindProblem {
+ #[derive(Default)]
+ pub(super) struct Rebinds {
+     live: AtomicUsize,
++    /// The device refuses every rebind (`Device::refuse_rebinds`): its encoders log no call and
++    /// hold no buffer over host pages, as though it had none.
++    refused: std::sync::atomic::AtomicBool,
+     buffers: Mutex<KeyMap<ResourceKey, Entry>>,
+     /// The keys `buffers` may hold ([`HostedKeys`]): a use of any other names no buffer over host
+     /// pages, which an encoder's hold tells without taking `buffers`' lock.
+@@ -255,7 +260,7 @@ impl Rebinds {
+ 
+     /// Whether the device has a buffer over host pages: else no use names one.
+     pub(super) fn any(&self) -> bool {
+-        self.live.load(Ordering::Relaxed) > 0
++        self.live.load(Ordering::Relaxed) > 0 && !self.refused.load(Ordering::Relaxed)
+     }
+ 
+     /// Note the buffer of `key` over host pages, `cell` its hold on them.
+@@ -1009,6 +1014,15 @@ impl Buffer {
+         keep_alive: Option<KeepAlive>,
+     ) -> Result<(), Error> {
+         const CALL: &str = "rebind_bytes_no_copy";
++        if self
++            .device()
++            .shared()
++            .rebinds
++            .refused
++            .load(Ordering::Relaxed)
++        {
++            return Err(invalid(CALL, Problem::Rebind(RebindProblem::Refused)));
++        }
+         let Some(cell) = self.host_cell() else {
+             // A two-copy buffer's host copy takes the new pages, copied in whole
+             // (`managed_copy.rs`).
+@@ -1070,6 +1084,15 @@ impl Heap {
+         keep_alive: Option<KeepAlive>,
+     ) -> Result<(), Error> {
+         const CALL: &str = "rebind_bytes_no_copy";
++        if self
++            .device()
++            .shared()
++            .rebinds
++            .refused
++            .load(Ordering::Relaxed)
++        {
++            return Err(invalid(CALL, Problem::Rebind(RebindProblem::Refused)));
++        }
+         let Some((own, cell)) = self
+             .bytes()
+             .and_then(|own| own.host_cell().map(|cell| (own, cell)))
+@@ -1099,3 +1122,16 @@ impl Device {
+         self.shared().rebinds.pending(key)
+     }
+ }
++
++impl Device {
++    /// Refuse every `rebind_bytes_no_copy` of the device's buffers and heaps from now on
++    /// (`Invalid`, [`RebindProblem::Refused`]), for a consumer that never moves the pages of what
++    /// it made with `new_buffer_with_bytes_no_copy` or `new_heap_with_bytes_no_copy`, and never
++    /// detaches them: the encoders then log no call to encode again at a rebind and hold no buffer
++    /// over host pages, which only a rebind or a detach reads, so a draw pays for neither. Call
++    /// before any buffer over host pages is made. No Metal counterpart.
++    #[doc(hidden)]
++    pub fn refuse_rebinds(&self) {
++        self.shared().rebinds.refused.store(true, Ordering::Relaxed);
++    }
++}
 diff --git a/crates/metal2vulkan-runtime/src/recycle.rs b/crates/metal2vulkan-runtime/src/recycle.rs
-index a5db81130..80afa1207 100644
+index b4dd4c4ea..ca9829903 100644
 --- a/crates/metal2vulkan-runtime/src/recycle.rs
 +++ b/crates/metal2vulkan-runtime/src/recycle.rs
-@@ -315,6 +315,26 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
+@@ -332,6 +332,26 @@ impl<R: Copy + Eq + Hash, M: Clone + Eq + Hash> Recycler<R, M> {
          Some(self.unindexed(order, parked))
      }
  
@@ -1595,14 +1815,30 @@ index a5db81130..80afa1207 100644
 +        gone
 +    }
 +
-     /// The objects parked longer than the bounds' time at `now`, out of the recycler.
-     fn stale(&mut self, now: Instant) -> Gone<R> {
-         let stale = Some((now, self.bounds.parked_for));
+     /// The objects parked longer than the bounds' time at `now`, out of the recycler, to destroy,
+     /// for the device's idle sweep (`idle_sweep.rs`); and when the next still parked goes.
+     pub(crate) fn sweep(&mut self, now: Instant) -> (Gone<R>, Option<Instant>) {
+diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
+index 9572b6377..5387b311b 100644
+--- a/crates/metal2vulkan-runtime/src/render.rs
++++ b/crates/metal2vulkan-runtime/src/render.rs
+@@ -12700,6 +12700,11 @@ impl Recording<'_> {
+     /// recorded into it bound (each recorded through it). With a pair, the pass is one
+     /// `render_target` made, of no views (`snapshot::Pair::record`).
+     unsafe fn record(&self, bound: &mut Bound) -> Recorded {
++        // A draw whose pipeline could not be created (the compile was refused) has a null pipeline; binding it crashes the driver
++        // (int-170: tu_CmdBindPipeline in the render server). The draw is dropped instead, and nothing is recorded for it.
++        if self.pipeline == vk::Pipeline::null() {
++            return Recorded::default();
++        }
+         let (raw, cb) = (self.raw, self.command_buffer);
+         bound.follow(cb);
+         let mut recorded = 0;
 diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-index 911fc7a1a..d12297e84 100644
+index ac7c25940..ba471dc16 100644
 --- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-@@ -529,6 +529,9 @@ impl SchedulerShared {
+@@ -535,6 +535,9 @@ impl SchedulerShared {
      /// lock of its sleep; one that sleeps later reads what the waker wrote first), counted as
      /// `woken`; else the notify, a system call, is spared.
      fn woken(&self, woken: Woken, asleep: Asleep) {
@@ -1612,7 +1848,7 @@ index 911fc7a1a..d12297e84 100644
          match asleep {
              // The thread alone waits on it.
              Asleep::OnCondvar => {
-@@ -708,6 +711,8 @@ struct Held {
+@@ -715,6 +718,8 @@ struct Held {
      /// The host nanoseconds at the first look of the scheduler's that found it held
      /// ([`held_for`](Self::held_for)), until it goes ([`hold_ended`](Self::hold_ended)).
      held_since: Option<u64>,
@@ -1621,7 +1857,7 @@ index 911fc7a1a..d12297e84 100644
  }
  
  impl Held {
-@@ -716,6 +721,15 @@ impl Held {
+@@ -723,6 +728,15 @@ impl Held {
      /// read from the host's clock while nothing waits.
      fn held_for(&mut self, reason: HeldFor) {
          (self.buffer.device().shared().counts).head_held_for(reason);
@@ -1637,7 +1873,7 @@ index 911fc7a1a..d12297e84 100644
          if self.held_since.is_none() {
              self.held_since = Some(gpu_time::host_nanos());
          }
-@@ -859,6 +873,11 @@ impl Scheduler {
+@@ -867,6 +881,11 @@ impl Scheduler {
          hand: Hand,
      ) {
          let shared = &*self.shared;
@@ -1649,7 +1885,7 @@ index 911fc7a1a..d12297e84 100644
          let committed = Committed {
              buffer: buffer.hold(),
              queue,
-@@ -1245,6 +1264,7 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1271,6 +1290,7 @@ fn run(shared: &Arc<SchedulerShared>) {
                  && bound.is_none()
                  && stalls.is_none();
              let slice = bound.map_or(slice, |left| left.min(slice));
@@ -1657,11 +1893,15 @@ index 911fc7a1a..d12297e84 100644
              let on_gpu = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu));
              // The lock of the sleep ([`Sleep`]), under the scheduler's: a waker that found no
              // pass under way wrote what it asks for before it took it, so its commit or nudge is
-@@ -1255,12 +1275,15 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1281,12 +1301,19 @@ fn run(shared: &Arc<SchedulerShared>) {
              }
              shared.sleeps.fetch_add(1, Ordering::Relaxed);
              if let Some(nudge) = on_gpu {
-+                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerSleep, slice_ms | 0x8000);
++                crate::stage_trace::mark(
++                    0,
++                    crate::stage_trace::Stage::SchedulerSleep,
++                    slice_ms | 0x8000,
++                );
                  state = wait_for_gpu(shared, (state, sleep), nudge, &mut gpu, (slice, short));
 +                crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, 0);
                  #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
@@ -1673,15 +1913,19 @@ index 911fc7a1a..d12297e84 100644
              // A waker that marks the state under the scheduler's lock takes it once this lets
              // go of it, and then the sleep's, which the wait lets go of.
              drop(state);
-@@ -1277,6 +1300,7 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1303,6 +1330,11 @@ fn run(shared: &Arc<SchedulerShared>) {
                      waited.timed_out()
                  }
              };
-+            crate::stage_trace::mark(0, crate::stage_trace::Stage::SchedulerResumed, u32::from(timed_out));
++            crate::stage_trace::mark(
++                0,
++                crate::stage_trace::Stage::SchedulerResumed,
++                u32::from(timed_out),
++            );
              sleep.asleep = false;
              drop(sleep);
              #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-@@ -1400,8 +1424,12 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
+@@ -1426,8 +1458,16 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
  fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
      (shared.inbox).pass(|state, commits| {
          shared.passes.fetch_add(1, Ordering::Relaxed);
@@ -1690,11 +1934,15 @@ index 911fc7a1a..d12297e84 100644
          let taken = pass(state, commits, (&mut *passed, &mut *left), &shared.awaits);
          shared.took_in(taken);
 +        let spent = passed.spent.len().saturating_sub(before);
-+        crate::stage_trace::mark(0, crate::stage_trace::Stage::PassEnd, spent.min(0xffff) as u32);
++        crate::stage_trace::mark(
++            0,
++            crate::stage_trace::Stage::PassEnd,
++            spent.min(0xffff) as u32,
++        );
          !passed.exiting && left.is_empty() && !passed.more
      });
      passed.more = false;
-@@ -1460,6 +1488,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
+@@ -1486,6 +1526,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
      } in commits.drain(..)
      {
          let count = batches.len();
@@ -1706,7 +1954,7 @@ index 911fc7a1a..d12297e84 100644
          let State { order, binary, .. } = &mut *state;
          let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
              buffer: buffer.hold(),
-@@ -1475,6 +1508,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
+@@ -1501,6 +1546,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
              hastened: false,
              counted_held: false,
              held_since: None,
@@ -1730,7 +1978,7 @@ index 6ac057360..52b9f9a7f 100644
          exit_guard::called(call);
      }
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-index 507a38b00..dba2239b8 100644
+index 507a38b00..d6517070f 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 @@ -71,6 +71,7 @@ pub(crate) use creation::VariantStages;
@@ -1741,7 +1989,7 @@ index 507a38b00..dba2239b8 100644
  pub(super) mod worker;
  
  use super::error::{invalid, Error, Problem, ShaderCacheError};
-@@ -386,6 +387,103 @@ impl CacheSetup {
+@@ -386,6 +387,102 @@ impl CacheSetup {
      }
  }
  
@@ -1770,7 +2018,8 @@ index 507a38b00..dba2239b8 100644
 +            settings,
 +            profile,
 +        };
-+        let name = records.name(&records.key(Making::new("device-entry-point-priming").digest(&key)));
++        let name =
++            records.name(&records.key(Making::new("device-entry-point-priming").digest(&key)));
 +        PrimingCache {
 +            store: Store::new(self.directory.clone(), sink, None),
 +            identity,
@@ -1798,9 +2047,7 @@ index 507a38b00..dba2239b8 100644
 +        if let Some(bytes) = seed {
 +            let info = vk::PipelineCacheCreateInfo::default().initial_data(&bytes);
 +            // SAFETY: the caller owns the live device and the info's bytes outlive the call.
-+            if let Ok(cache) =
-+                unsafe { word.restored(|| raw.create_pipeline_cache(&info, None)) }
-+            {
++            if let Ok(cache) = unsafe { word.restored(|| raw.create_pipeline_cache(&info, None)) } {
 +                self.loaded = Some(bytes);
 +                return Ok(cache);
 +            }
@@ -1846,10 +2093,10 @@ index 507a38b00..dba2239b8 100644
  /// records, the `VkPipelineCache` it keeps for each record, and the cache thread.
  pub(super) struct ShaderCache {
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/store.rs b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
-index b475f3365..3052b5b0b 100644
+index 5bccf66fa..962f9f0d5 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/store.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
-@@ -76,6 +76,9 @@ pub(crate) struct Directory {
+@@ -76,30 +76,57 @@ pub(crate) struct Directory {
      root: PathBuf,
      build: Hash256,
      capacity: u64,
@@ -1859,7 +2106,16 @@ index b475f3365..3052b5b0b 100644
  }
  
  impl Directory {
-@@ -92,17 +95,20 @@ impl Directory {
+     /// Open `root` for `build` with a cap of `capacity` bytes: create it and the build's
+     /// directory (owner-only) and write and remove a probe file there. The error names the
+     /// directory that failed.
++    ///
++    /// With `METAL2VULKAN_SHADER_CACHE_OPTIONAL` in the environment a directory that cannot be
++    /// made or written opens anyway: a process that may write nowhere (a sandboxed one, as
++    /// WebKit's GPU process) still gets its device, and every read and write of the cache is a
++    /// miss, as after any later failure.
+     pub(crate) fn open(root: PathBuf, build: Hash256, capacity: u64) -> Result<Directory, Failed> {
+         let directory = Directory {
              root,
              build,
              capacity,
@@ -1869,21 +2125,44 @@ index b475f3365..3052b5b0b 100644
              let path = path.to_path_buf();
              move |error| Failed { path, error }
          };
-         let made = (|| {
--            create_private_dir_all(&directory.root).map_err(failed(&directory.root))?;
-+            directory.create_dir_all(&directory.root).map_err(failed(&directory.root))?;
+-        create_private_dir_all(&directory.root).map_err(failed(&directory.root))?;
+-        let build_dir = directory.build_dir();
+-        create_private_dir_all(&build_dir).map_err(failed(&build_dir))?;
+-        let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
+-        let written = new_private_file(&probe).and_then(|mut file| file.write_all(b"probe"));
+-        let removed = fs::remove_file(&probe);
+-        written.and(removed).map_err(failed(&directory.root))?;
+-        Ok(directory)
++        let made = (|| {
++            directory
++                .create_dir_all(&directory.root)
++                .map_err(failed(&directory.root))?;
 +            let layout_dir = directory.layout_dir();
-+            directory.create_dir_all(&layout_dir).map_err(failed(&layout_dir))?;
-             let build_dir = directory.build_dir();
--            create_private_dir_all(&build_dir).map_err(failed(&build_dir))?;
-+            directory.create_dir_all(&build_dir).map_err(failed(&build_dir))?;
-             let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
--            let written = new_private_file(&probe).and_then(|mut file| file.write_all(b"probe"));
-+            let written = directory.new_file(&probe).and_then(|mut file| file.write_all(b"probe"));
-             let removed = fs::remove_file(&probe);
-             written.and(removed).map_err(failed(&directory.root))
-         })();
-@@ -133,6 +139,41 @@ impl Directory {
++            directory
++                .create_dir_all(&layout_dir)
++                .map_err(failed(&layout_dir))?;
++            let build_dir = directory.build_dir();
++            directory
++                .create_dir_all(&build_dir)
++                .map_err(failed(&build_dir))?;
++            let probe = build_dir.join(format!(".probe.{}.tmp", unique()));
++            let written = directory
++                .new_file(&probe)
++                .and_then(|mut file| file.write_all(b"probe"));
++            let removed = fs::remove_file(&probe);
++            written.and(removed).map_err(failed(&directory.root))
++        })();
++        match made {
++            Err(_) if std::env::var_os("METAL2VULKAN_SHADER_CACHE_OPTIONAL").is_some() => {
++                Ok(directory)
++            }
++            Err(failed) => Err(failed),
++            Ok(()) => Ok(directory),
++        }
+     }
+ 
+     /// The directory the consumer named or the platform's default.
+@@ -122,6 +149,41 @@ impl Directory {
          self.layout_dir().join(hex(&self.build))
      }
  
@@ -1925,7 +2204,7 @@ index b475f3365..3052b5b0b 100644
      /// The path of the entry named `name`.
      pub(crate) fn entry_path(&self, name: &str) -> PathBuf {
          self.build_dir().join(&name[..2]).join(name)
-@@ -204,6 +245,9 @@ enum Found {
+@@ -193,6 +255,9 @@ enum Found {
      Bytes(Vec<u8>, fs::File),
      /// The entry's bytes, from a write the cache thread has not made yet: no file to refresh.
      Queued(Vec<u8>),
@@ -1935,7 +2214,15 @@ index b475f3365..3052b5b0b 100644
  }
  
  /// The counts behind [`ShaderCacheStatistics`](super::ShaderCacheStatistics).
-@@ -347,6 +391,8 @@ pub(crate) struct Store {
+@@ -328,11 +393,16 @@ pub(crate) struct Store {
+     used: AtomicU64,
+     /// A scan has set `used`; before that the cap is not judged.
+     scanned: AtomicBool,
++    /// The platform refused this process an entry's access time ([`Store::accepted`]): its hits
++    /// ask for none from then on.
++    touch_refused: AtomicBool,
+     /// The warnings said once each ([`Warnings`]).
+     warnings: Warnings,
      /// The device's cache thread, which writes the entries this store is given; `None` in a
      /// store with no thread, which writes them on the calling thread.
      asked: Option<Arc<Asked>>,
@@ -1944,7 +2231,14 @@ index b475f3365..3052b5b0b 100644
  }
  
  /// What a device's store says once each, through its instance's message sink, else on stderr:
-@@ -383,9 +429,17 @@ impl Store {
+@@ -362,15 +432,24 @@ impl Store {
+             counters: Counters::default(),
+             used: AtomicU64::new(0),
+             scanned: AtomicBool::new(false),
++            touch_refused: AtomicBool::new(false),
+             warnings: Warnings {
+                 sink,
+                 evicted: AtomicBool::new(false),
                  write_failed: AtomicBool::new(false),
              },
              asked,
@@ -1962,7 +2256,7 @@ index b475f3365..3052b5b0b 100644
      /// Count an entry not written (`ShaderCacheStatistics::write_failures`); the first is
      /// announced as [`Degradation::ShaderCacheEntryNotWritten`], naming the directory and its
      /// cap. Never an error: the work the entry would have saved is the directory's regardless.
-@@ -475,6 +529,10 @@ impl Store {
+@@ -460,6 +539,10 @@ impl Store {
          count(&self.counters.holds_questions);
          timed(&self.counters.read_nanos, || {
              fs::metadata(path).is_ok_and(|metadata| metadata.len() <= self.entry_limit())
@@ -1973,7 +2267,7 @@ index b475f3365..3052b5b0b 100644
          })
      }
  
-@@ -514,6 +572,10 @@ impl Store {
+@@ -499,6 +582,10 @@ impl Store {
              }
              Found::Bytes(bytes, file) => (bytes, Some(file)),
              Found::Queued(bytes) => (bytes, None),
@@ -1984,7 +2278,7 @@ index b475f3365..3052b5b0b 100644
          };
          match decode(bytes) {
              Some(value) => {
-@@ -527,6 +589,23 @@ impl Store {
+@@ -512,6 +599,23 @@ impl Store {
          }
      }
  
@@ -2008,7 +2302,7 @@ index b475f3365..3052b5b0b 100644
      /// [`Store::load`] of the file at `path`.
      fn load_at<T, E>(&self, path: &Path, decode: impl FnOnce(&[u8]) -> Result<T, E>) -> Lookup<T> {
          let (bytes, file) = match self.read(path) {
-@@ -537,6 +616,9 @@ impl Store {
+@@ -522,6 +626,9 @@ impl Store {
              }
              Found::Bytes(bytes, file) => (bytes, Some(file)),
              Found::Queued(bytes) => (bytes, None),
@@ -2018,7 +2312,28 @@ index b475f3365..3052b5b0b 100644
          };
          match decode(&bytes) {
              Ok(value) => {
-@@ -595,7 +677,19 @@ impl Store {
+@@ -537,9 +644,19 @@ impl Store {
+ 
+     /// The contents a decoder accepted: a hit from `file` makes its entry the most recently used;
+     /// a hit from the queue (no file) is counted as one the directory had not written yet.
++    ///
++    /// A process whose sandbox lets it read and add entries may still be refused their
++    /// attributes: macOS's `iconservicesagent` was, at every hit, and each refusal is a sandbox
++    /// violation the kernel logs (39133 of a boot's 45648). The first such refusal is the last
++    /// asked: the entries this process hits keep the access time their readers leave them.
+     fn accepted(&self, file: Option<&fs::File>) {
+         match file {
+-            Some(file) => timed(&self.counters.read_nanos, || touch(file)),
++            Some(_) if self.touch_refused.load(Ordering::Relaxed) => {}
++            Some(file) => {
++                if timed(&self.counters.read_nanos, || touch(file)) {
++                    self.touch_refused.store(true, Ordering::Relaxed);
++                }
++            }
+             None => count(&self.counters.queued_hits),
+         }
+     }
+@@ -570,7 +687,19 @@ impl Store {
              return Found::Queued(bytes);
          }
          count(&self.counters.entry_reads);
@@ -2039,7 +2354,7 @@ index b475f3365..3052b5b0b 100644
              let file = match fs::File::open(path) {
                  Ok(file) => file,
                  Err(error) if error.kind() == io::ErrorKind::NotFound => return Found::Absent,
-@@ -618,7 +712,7 @@ impl Store {
+@@ -593,7 +722,7 @@ impl Store {
                  }
                  Err(_) => Found::Failed,
              }
@@ -2048,7 +2363,7 @@ index b475f3365..3052b5b0b 100644
      }
  
      /// Give `bytes` to the cache thread to write as the entry named `name` (`worker.rs`): the
-@@ -679,10 +773,10 @@ impl Store {
+@@ -654,10 +783,10 @@ impl Store {
              return Err(io::Error::other("the entry is larger than the cache takes"));
          }
          let parent = path.parent().expect("an entry has a directory");
@@ -2061,12 +2376,25 @@ index b475f3365..3052b5b0b 100644
              file.write_all(bytes)?;
              drop(file);
              fs::rename(&temporary, path)?;
+@@ -849,8 +978,10 @@ fn last_use(metadata: &fs::Metadata) -> SystemTime {
+ }
+ 
+ /// Refresh `file`'s access time: a hit makes its entry the most recently used. Best effort.
+-fn touch(file: &fs::File) {
+-    let _ = file.set_times(fs::FileTimes::new().set_accessed(SystemTime::now()));
++/// Whether the platform refused this process the change (`EPERM`, `EACCES`).
++fn touch(file: &fs::File) -> bool {
++    let set = file.set_times(fs::FileTimes::new().set_accessed(SystemTime::now()));
++    set.is_err_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+ }
+ 
+ /// A name no other writer uses: this process's id, a per-process sequence number, and the time.
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/system.rs b/crates/metal2vulkan-runtime/src/shader_cache/system.rs
 new file mode 100644
-index 000000000..c6e5cd185
+index 000000000..90de15a81
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/system.rs
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,281 @@
 +//! The system layer: a second cache directory, read only, that one trusted writer fills for every
 +//! process of the machine (the consumer's render server primes the OS's Metal libraries into it).
 +//!
@@ -2164,7 +2492,11 @@ index 000000000..c6e5cd185
 +/// Open `name` under `parent` (or by its path where `parent` is `None`), never through a link.
 +fn open_level(parent: Option<&OwnedFd>, name: &[u8], directory: bool) -> Result<OwnedFd, i32> {
 +    let name = c_path(name).ok_or(libc::EINVAL)?;
-+    let kind = if directory { libc::O_DIRECTORY } else { libc::O_NONBLOCK };
++    let kind = if directory {
++        libc::O_DIRECTORY
++    } else {
++        libc::O_NONBLOCK
++    };
 +    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | kind;
 +    // SAFETY: the name is a C string and the parent descriptor is open.
 +    let fd = unsafe {
@@ -2174,7 +2506,9 @@ index 000000000..c6e5cd185
 +        }
 +    };
 +    if fd < 0 {
-+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO));
++        return Err(std::io::Error::last_os_error()
++            .raw_os_error()
++            .unwrap_or(libc::EIO));
 +    }
 +    // SAFETY: a descriptor this call opened and nothing else owns.
 +    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -2256,8 +2590,14 @@ index 000000000..c6e5cd185
 +    /// Whether a level of `st` is what the layer reads: a directory or a regular file, an
 +    /// owner's, that neither its group nor others may write.
 +    fn trusted(&self, st: &libc::stat, directory: bool) -> bool {
-+        let kind = if directory { libc::S_IFDIR } else { libc::S_IFREG };
-+        st.st_mode & libc::S_IFMT == kind && self.owners.contains(&st.st_uid) && st.st_mode & 0o022 == 0
++        let kind = if directory {
++            libc::S_IFDIR
++        } else {
++            libc::S_IFREG
++        };
++        st.st_mode & libc::S_IFMT == kind
++            && self.owners.contains(&st.st_uid)
++            && st.st_mode & 0o022 == 0
 +    }
 +
 +    /// The open file of `relative` under the layer and its length, every level on the way judged.
@@ -2296,7 +2636,8 @@ index 000000000..c6e5cd185
 +
 +    /// Whether the layer holds `relative`, of at most `limit` bytes.
 +    pub fn holds(&self, relative: &Path, limit: u64) -> bool {
-+        self.entry(relative).is_some_and(|(_, length)| length <= limit)
++        self.entry(relative)
++            .is_some_and(|(_, length)| length <= limit)
 +    }
 +
 +    /// The bytes of `relative` under the layer, at most `limit`; `None` where it is absent,
@@ -2336,10 +2677,10 @@ index 000000000..c6e5cd185
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/shadow.rs b/crates/metal2vulkan-runtime/src/shadow.rs
-index a7046af05..4e478c8d9 100644
+index 1146f7816..a6117bf73 100644
 --- a/crates/metal2vulkan-runtime/src/shadow.rs
 +++ b/crates/metal2vulkan-runtime/src/shadow.rs
-@@ -394,6 +394,8 @@ pub(super) enum ShadowSource {
+@@ -661,6 +661,8 @@ pub(super) enum ShadowSource {
          conversion: Box<YCbCrConversion>,
          /// The texture's format, which a refusal names.
          pixel_format: PixelFormat,
@@ -2350,10 +2691,10 @@ index a7046af05..4e478c8d9 100644
      /// 4:4:4 two-plane YCbCr texture are stored (`ycbcr.rs`): the shadow is an image of the
 diff --git a/crates/metal2vulkan-runtime/src/stage_trace.rs b/crates/metal2vulkan-runtime/src/stage_trace.rs
 new file mode 100644
-index 000000000..3325dd04c
+index 000000000..964ef7561
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/stage_trace.rs
-@@ -0,0 +1,246 @@
+@@ -0,0 +1,252 @@
 +//! A process-wide ring of the stages each command buffer passes from its commit to its completion,
 +//! for a host that asks where the time between them goes ([`read`]): when it was committed, left
 +//! to the lowering thread, run, recorded, handed to the scheduler and taken in, what held its
@@ -2521,8 +2862,14 @@ index 000000000..3325dd04c
 +pub(crate) fn mark(id: usize, stage: Stage, arg: u32) {
 +    // Per-command handoff and completion stages retain scheduler latency.
 +    // Idle scheduler turns have no command identity and add no causal link.
-+    if matches!(stage, Stage::SchedulerSleep | Stage::SchedulerWake
-+        | Stage::SchedulerResumed | Stage::PassBegin | Stage::PassEnd) {
++    if matches!(
++        stage,
++        Stage::SchedulerSleep
++            | Stage::SchedulerWake
++            | Stage::SchedulerResumed
++            | Stage::PassBegin
++            | Stage::PassEnd
++    ) {
 +        return;
 +    }
 +    if !diagnostics() {
@@ -2601,22 +2948,10 @@ index 000000000..3325dd04c
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index d30837cdf..257b65b20 100644
+index acc81e462..bc7618767 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
-@@ -85,7 +85,10 @@ use super::image_plan::{
- };
- use super::in_place::{self, PagesClass, Refusal, ShadowCause, Verdict};
- use super::key_hash::KeyMap;
--use super::linear_plan::{aliases, check_linear_limits, linear_lack, LinearImage, LinearLack};
-+use metal2vulkan::device::HostPageTexturePolicy;
-+use super::linear_plan::{
-+    aliases, check_linear_limits, linear_lack, tile_store_fits, LinearImage, LinearLack,
-+};
- use super::memory::{BoundMemory, MemoryClass, Placement, FD_BLOCKS_HANDLE};
- use super::nan_clear;
- use super::neutral::Neutrals;
-@@ -187,7 +190,8 @@ pub(super) mod wrapped;
+@@ -194,7 +194,8 @@ pub(super) mod wrapped;
  mod ycbcr_image;
  mod ycbcr_planes;
  pub(crate) use decoded_twin::TwinRead;
@@ -2625,41 +2960,8 @@ index d30837cdf..257b65b20 100644
 +pub(crate) use ycbcr_image::{ImageAlive, KeptImage, PlanesInPlace};
  pub(crate) use ycbcr_planes::KeptTexels;
  
- pub(crate) use attached_reads::feedback_candidate;
-@@ -2504,6 +2508,32 @@ impl Device {
-                 self.host_shadowed(shadowed, (usage, &plan), descriptor, pending)?
-             }
-             Route::Device { holds } => {
-+                // Rows that lie apart alias the buffer's bytes, written too, under
-+                // `HostPageTexturePolicy::InPlaceWrites`: the bytes between them are no texel's,
-+                // and a program that pads its framebuffers (a window server's) keeps nothing
-+                // there. A written texture's tile stores must stay within its rows
-+                // (`linear_plan::tile_store_fits`). Rows that share bytes stay refused.
-+                let policy = self.compile_device().policy().host_page_textures;
-+                let writes = usage.intersects(
-+                    TextureUsage::RENDER_TARGET
-+                        | TextureUsage::SHADER_WRITE
-+                        | TextureUsage::SHADER_ATOMIC,
-+                );
-+                let holds = match holds {
-+                    Err(_)
-+                        if policy == HostPageTexturePolicy::InPlaceWrites
-+                            && texels.layout.shared_bytes() == 0
-+                            && (!writes
-+                                || tile_store_fits(
-+                                    &texels.layout,
-+                                    u64::from(layout.extent[0]),
-+                                    texels.buffer.length(),
-+                                )) =>
-+                    {
-+                        Ok(())
-+                    }
-+                    holds => holds,
-+                };
-                 let over = (&*texels, &holds, usage);
-                 match self.alias_over_device(&plan, (descriptor, layout), over, &facts)? {
-                     Ok((image, count)) => {
-@@ -3886,6 +3916,15 @@ impl Device {
+ pub(crate) use attached_reads::{feedback_candidate, AttachedSpan};
+@@ -4002,6 +4003,15 @@ impl Device {
          Ok((raw, placement))
      }
  
@@ -2675,14 +2977,7 @@ index d30837cdf..257b65b20 100644
      /// Destroy the parked images the recycler let go of, `gone`.
      fn let_go_parked(&self, gone: recycle::Gone<vk::Image>) {
          if gone.is_empty() {
-@@ -5205,10 +5244,13 @@ impl Texture {
-         }
-     }
- 
--    /// The buffer's bytes a texture buffer is, or `None` for a texture with an image.
-+    /// The buffer's bytes a texture buffer is, or `None` for a texture with an image, and for a
-+    /// two-plane YCbCr texture over its planes alone (`texture/ycbcr_image.rs`), whose texels
-+    /// are the planes' bytes and which binds as a texture, not as a texture buffer.
+@@ -5337,6 +5347,7 @@ impl Texture {
      pub(super) fn texels(&self) -> Option<&Texels> {
          match self.storage() {
              Storage::Image(_) | Storage::Alias { .. } | Storage::Shadow { .. } => None,
@@ -2690,7 +2985,7 @@ index d30837cdf..257b65b20 100644
              Storage::Texels(texels) => Some(texels),
          }
      }
-@@ -6089,6 +6131,30 @@ impl Texture {
+@@ -6220,6 +6231,30 @@ impl Texture {
          self.heap_place().map(|place| place.size)
      }
  
@@ -2721,7 +3016,7 @@ index d30837cdf..257b65b20 100644
      /// `makeAliasable`: a heap texture's bytes may be another resource's from now on. An
      /// automatic heap gives its range to the next resource it places; a placement heap's texture
      /// is aliasable from the start, so nothing changes. Using the texture after is the program's
-@@ -6372,6 +6438,11 @@ impl Texture {
+@@ -6501,6 +6536,11 @@ impl Texture {
          placement: IdPlacement,
      ) -> Result<Texture, Error> {
          self.check_viewable(call)?;
@@ -2733,11 +3028,62 @@ index d30837cdf..257b65b20 100644
          self.device().check_texture_placement(
              call,
              placement,
+diff --git a/crates/metal2vulkan-runtime/src/texture/heap.rs b/crates/metal2vulkan-runtime/src/texture/heap.rs
+index b4571e397..67edafd0c 100644
+--- a/crates/metal2vulkan-runtime/src/texture/heap.rs
++++ b/crates/metal2vulkan-runtime/src/texture/heap.rs
+@@ -2411,6 +2411,18 @@ impl Device {
+                 metal_layout = tiles;
+             }
+         }
++        // An answer of the device's own (no Metal answer modelled, or one the texture is past)
++        // is the image's size in the driver's units, which need not be a multiple of the image's
++        // alignment (Turnip's 4 KiB). Metal's sizes are multiples of their alignment, so a heap
++        // sized as the sum of its textures' answers holds them in any order; with the device's
++        // size each texture placed after another pads past what the heap was sized for, and the
++        // last one finds no room (iPadOS 27's iconservicesagent: `heap texture: OutOfMemory(Heap)`).
++        // A shadow in Metal's tiles takes Metal's answer.
++        if (metal_answer.is_none() || past_metal.is_some()) && image.route != AliasRoute::Tiled {
++            size_and_align.size = size_and_align
++                .size
++                .next_multiple_of(size_and_align.align.max(1));
++        }
+         // Only a texture an image of binds into the heap's own memory is held to the heap's base,
+         // and the routes decide that (`holds_heap_base`).
+         check_heap_base(image.route, size_and_align.align)?;
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+index 852a2359a..932cc9123 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
+@@ -58,6 +58,7 @@ use crate::degradation::Degradation;
+ use crate::error::{Error, RuntimeGap};
+ use crate::image_plan::plan_image;
+ use crate::linear_plan::{BufferLayout, LINEAR_ALIGNMENT};
++use crate::resource::Identity;
+ use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource, ShadowTarget};
+ use crate::shadow_merge::ScratchSpares;
+ use crate::texture_descriptor::{texture_usage, TextureDescriptor, TextureLayout};
+@@ -208,7 +209,14 @@ impl Device {
+             return Err(Error::NotImplemented(RuntimeGap::Textures));
+         }
+         let hazard = texels.options().hazard_tracking_mode()?;
+-        let image = self.new_image(plan, layout, descriptor, hazard)?;
++        // Its copy in writes every texel of its one aspect before any command reads it, or a pass
++        // that clears it whole does (`shadow.rs`, `render/shadows.rs`), so it starts as its memory
++        // lies, as the other shadows of a buffer's bytes do (`storage_over_buffer`): zeros there
++        // would never be read, and the host's zeros copied into a full-screen surface's image
++        // were most of its making on a phone's render server.
++        let identity = Identity::new(hazard, false);
++        let image =
++            self.new_image_as_it_lies(plan, layout, descriptor, identity, Device::runtime_owner)?;
+         let (raw, start) = texels.buffer.at(color.offset);
+         let staging = HeapPlaneCopies::staging(self, &planes, start, hazard)?;
+         let moves = Box::new(HeapPlaneCopies::new(self, &staging, &planes, hazard)?);
 diff --git a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
-index b5b92e531..9e6cc697c 100644
+index 90567cc9a..ab19c92bd 100644
 --- a/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
 +++ b/crates/metal2vulkan-runtime/src/texture/usage_shadow.rs
-@@ -37,6 +37,11 @@
+@@ -44,6 +44,11 @@
  //!   shadow here instead (`texture/ycbcr_image.rs`, `shadow.rs`): every storage binding of it
  //!   writes the shadow's view and names the shadow in its uses, and every other binding names its
  //!   own image. It is exact and announces nothing.
@@ -2749,7 +3095,7 @@ index b5b92e531..9e6cc697c 100644
  
  use super::{Image, Owner, Storage, Texture};
  use crate::binding_view::binding_view;
-@@ -170,6 +175,10 @@ impl Texture {
+@@ -195,6 +200,10 @@ impl Texture {
          storage: bool,
          attached: bool,
      ) -> Result<Option<Arc<UsageShadow>>, Error> {
@@ -2760,7 +3106,7 @@ index b5b92e531..9e6cc697c 100644
          if self.needs_usage_shadow(storage) {
              let shadow = self.usage_shadow(call, Need::Usage)?;
              if !shadow.announced.swap(true, Ordering::Relaxed) {
-@@ -251,6 +260,16 @@ impl Texture {
+@@ -307,6 +316,16 @@ impl Texture {
          }
          // A converted texture's image has both shader usages: the slot holds its write shadow.
          let shadow = match ycbcr_writes_stored(self.0.record.pixel_format) {
@@ -2778,10 +3124,10 @@ index b5b92e531..9e6cc697c 100644
                  let (image, copies) = self.ycbcr_write_shadow(call)?;
                  UsageShadow {
 diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
-index 57cfc751a..32fdd2432 100644
+index 27e2071c6..7216a034c 100644
 --- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
 +++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
-@@ -21,9 +21,29 @@
+@@ -21,6 +21,25 @@
  //! are also an image of it over their bytes (`ycbcr_planes.rs`), which a slot whose every sample
  //! the device's sampler takes samples through the device's conversion instead of the texel
  //! buffer.
@@ -2807,10 +3153,14 @@ index 57cfc751a..32fdd2432 100644
  
  use super::ycbcr_planes::PlanesImage;
  use super::{image_error, IdUse, Image, Storage, Texture};
+@@ -31,6 +50,7 @@ use crate::device::lock;
+ use crate::error::{internal, Error};
+ use crate::image_plan::plan_image;
+ use crate::resource::ResourceKey;
 +use crate::resource_ids::IdPlacement;
- use crate::address_map::AddressModeMap;
- use crate::binding_view::VkView;
- use crate::buffer_texture::{view_usage, Texels};
+ use crate::shadow::{ShadowBuffer, ShadowCopies, ShadowSource};
+ use crate::shadow_merge::ScratchSpares;
+ use crate::texture_descriptor::{TextureDescriptor, TextureLayout};
 @@ -56,9 +76,70 @@ use metal2vulkan::vk::{
      ImageUsageFlags, ImageViewType,
  };
@@ -3034,7 +3384,7 @@ index 57cfc751a..32fdd2432 100644
              },
              shadow_key: image.identity.key,
              shadow_range: UseRange::Image {
-@@ -404,6 +535,47 @@ impl Device {
+@@ -405,6 +536,47 @@ impl Device {
  }
  
  impl Texture {
@@ -3082,11 +3432,86 @@ index 57cfc751a..32fdd2432 100644
      /// The uniform texel buffer view of the texture's planes read in place (the module docs), made
      /// at its first bind and kept with the texels. Internal for a texture whose planes are not.
      pub(crate) fn planes_view(&self) -> Result<vk::BufferView, Error> {
+diff --git a/crates/metal2vulkan-runtime/src/used_resources.rs b/crates/metal2vulkan-runtime/src/used_resources.rs
+index cc823d91e..99caa0a9e 100644
+--- a/crates/metal2vulkan-runtime/src/used_resources.rs
++++ b/crates/metal2vulkan-runtime/src/used_resources.rs
+@@ -59,6 +59,70 @@ pub struct UsedResources {
+     pub heaps: Vec<Heap>,
+ }
+ 
++// Compare host address ranges without touching their bytes. Object identity covers private
++// memory; host ranges additionally cover distinct imports of an IOSurface or overlapping
++// no-copy buffers. Unknown arithmetic is conservative. Rebinding is not performed by this
++// consumer, and callers must not remap these ranges while the resources are in use.
++fn buffers_overlap(a: &Buffer, b: &Buffer) -> bool {
++    if a == b {
++        return true;
++    }
++    let (Some(a_start), Some(b_start)) = (a.contents(), b.contents()) else {
++        return false;
++    };
++    let (Ok(a_len), Ok(b_len)) = (usize::try_from(a.length()), usize::try_from(b.length())) else {
++        return true;
++    };
++    let a_start = a_start.as_ptr() as usize;
++    let b_start = b_start.as_ptr() as usize;
++    let (Some(a_end), Some(b_end)) = (a_start.checked_add(a_len), b_start.checked_add(b_len))
++    else {
++        return true;
++    };
++    a_start < b_end && b_start < a_end
++}
++
++impl UsedResources {
++    fn references_buffer(&self, buffer: &Buffer) -> bool {
++        if buffer.heap().is_some_and(|heap| self.heaps.contains(heap)) {
++            return true;
++        }
++        self.buffers
++            .iter()
++            .any(|other| buffers_overlap(buffer, other))
++            || self.heaps.iter().any(|heap| {
++                heap.bytes()
++                    .is_some_and(|bytes| buffers_overlap(buffer, bytes))
++            })
++    }
++
++    /// Whether this list names a resource's storage, including a view's root, a buffer
++    /// texture's backing buffer, a heap's resources and overlapping imported host ranges.
++    /// A caller may skip waiting only while this is false. This consumer does not rebind
++    /// or remap live backing ranges. Indirect command buffers remain conservative.
++    pub fn references_resource(&self, resource: super::resource::ResourceRef<'_>) -> bool {
++        use super::resource::ResourceRef;
++        match resource {
++            ResourceRef::Buffer(buffer) => self.references_buffer(buffer),
++            ResourceRef::Texture(texture) => match texture.memory() {
++                TextureMemory::Heap(heap) => self.references_heap(heap),
++                TextureMemory::Buffer(buffer) => self.references_buffer(buffer),
++                TextureMemory::Own(root) => self.textures.contains(root),
++            },
++            ResourceRef::IndirectCommandBuffer(_) => true,
++        }
++    }
++
++    /// Heap storage is treated as one dependency, conservatively including its disjoint
++    /// members. Imports over its host range are dependencies too.
++    pub fn references_heap(&self, heap: &Heap) -> bool {
++        self.heaps.contains(heap)
++            || heap
++                .bytes()
++                .is_some_and(|bytes| self.references_buffer(bytes))
++    }
++}
++
+ /// The kind of a command encoder ([`EndedEncoder::kind`]), by the Metal protocol it is.
+ #[non_exhaustive]
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
-index 414ffdc92..8a470ed41 100644
+index 8d9ef71b9..7bdd02cf4 100644
 --- a/crates/metal2vulkan-runtime/src/work_counts.rs
 +++ b/crates/metal2vulkan-runtime/src/work_counts.rs
-@@ -5053,6 +5053,16 @@ pub struct WorkCounts {
+@@ -5620,6 +5620,16 @@ pub struct WorkCounts {
      /// Its live dedicated blocks with their placement: a placement larger than half a block, one
      /// placed apart, or an exportable buffer's dedicated allocation (`exported_memory.rs`).
      pub dedicated_memory_blocks_live: u64,
@@ -3103,7 +3528,7 @@ index 414ffdc92..8a470ed41 100644
      /// Of `pooled_memory_blocks_made`, the blocks of the pool a color texture's host-transfer
      /// image places in made ready off the program's thread: allocated and every page of their
      /// mapping read once by the host, then added to the pool by the first placement there that
-@@ -8218,6 +8228,11 @@ impl Device {
+@@ -9267,6 +9277,11 @@ impl Device {
              pooled_memory_blocks_made: made,
              pooled_memory_blocks_freed: freed,
              dedicated_memory_blocks_live: census.dedicated,
@@ -3163,33 +3588,11 @@ index 195b83a42..e3b7d7027 100644
      /// The planes it converts, and the bytes of their buffer they lie in.
      pub(super) fn source(&self) -> (YCbCrPlanes, Range<u64>) {
          (self.source.0, self.source.1.clone())
-diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
-index e0a9a6af8..650064ca8 100644
---- a/crates/metal2vulkan/src/cache/mod.rs
-+++ b/crates/metal2vulkan/src/cache/mod.rs
-@@ -60,7 +60,7 @@ mod tests;
- /// unchanged version, and its bless records the version. Independent of the crate's version and of
- /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
- /// history.
--pub const SEMANTICS_VERSION: u32 = 2020;
-+pub const SEMANTICS_VERSION: u32 = 2022;
- 
- /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
- /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
-@@ -93,7 +93,7 @@ pub const ARTIFACT_FORMAT_VERSION: u32 = 500;
- /// changes no behaviour, and then updates that hash alone with the commit saying why, or changes
- /// behaviour and also bumps this version. The commit that bumps it says what changed; this comment
- /// keeps no history.
--pub const RUNTIME_VERSION: u32 = 2016;
-+pub const RUNTIME_VERSION: u32 = 2017;
- 
- /// The digest of the sources this build of the crate was compiled from: SHA-256, as lowercase hex,
- /// of the manifest, the build script, and exactly the files the crate roots' module tree compiles
 diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
-index 8d6c42df8..1231754ad 100644
+index fa9afdcc7..6eeb98a3e 100644
 --- a/crates/metal2vulkan/src/device/driver_facts.rs
 +++ b/crates/metal2vulkan/src/device/driver_facts.rs
-@@ -753,6 +753,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
+@@ -776,6 +776,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
  /// `intel-irisxe-rplp-anv`).
  pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
  
@@ -3203,7 +3606,7 @@ index 8d6c42df8..1231754ad 100644
  /// The row of `fact` measured on Mesa's `driver` on the GPU `(vendor, device)`.
  const fn mesa_on<F>(fact: F, driver: DriverId, (vendor, device): (u32, u32)) -> Measured<F> {
      Measured {
-@@ -1947,6 +1954,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
+@@ -1997,6 +2004,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
  /// row, ANV, Mesa 26.2.4, on the Iris Xe (RPL-P). Not listed: NVIDIA's 615.71.09, whose RTX 3080
  /// left a third answer; RADV on the RX 7900 XTX, clean at dd718a7905 at Mesa 26.0.8 but not
  /// measured since; and every GPU not measured, which store with `STORE`.
@@ -3220,7 +3623,7 @@ index 8d6c42df8..1231754ad 100644
  ///
  /// `InterlockOrdersDraws`, measured with no barrier between such draws on any driver (a scratch
  /// build of the commit that adds it), by `runtime_lane::interlocked_draw_order` (passes of 84
-@@ -2251,6 +2268,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
+@@ -2310,6 +2327,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
          DriverId::INTEL_OPEN_SOURCE_MESA,
          (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
      ),
@@ -3234,23 +3637,10 @@ index 8d6c42df8..1231754ad 100644
          DriverFact::ColorBlockDecodeIsMetals,
          DriverId::MESA_RADV,
 diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
-index 50a33bc70..87e34d010 100644
+index 4c8f8aed3..f5b5b4a2b 100644
 --- a/crates/metal2vulkan/src/device/policy.rs
 +++ b/crates/metal2vulkan/src/device/policy.rs
-@@ -327,13 +327,26 @@ pub enum HostPageTexturePolicy {
-     /// texels into before each use and merge back after each write, whose copies touch the
-     /// texels alone.
-     Shadow,
-+    /// [`InPlace`](Self::InPlace) for every usage, a texture that renders or writes too, with no
-+    /// check run and no verdict waited for, trusting the driver to touch no byte beside the
-+    /// texels: a window server's surfaces, which it renders into each frame, are otherwise copied
-+    /// into a shadow before each pass and merged back after it. A padded texture over a buffer of
-+    /// the runtime's own memory aliases its bytes too, a written one where its tile stores stay
-+    /// within its rows (`linear_plan::tile_store_fits`), where the device lays it out at the
-+    /// buffer's row pitch.
-+    InPlaceWrites,
- }
- 
+@@ -419,8 +419,13 @@ pub enum HostPageTexturePolicy {
  /// How a chain of `half` additions, subtractions and products rounds on a device without
  /// `shaderFloat16`, where a module computes each in `float` on its operands held widened and
  /// rounds its result by the device's `OpQuantizeToF16` (`PrecisionNote::NativeHalfQuantize`):
@@ -3361,10 +3751,10 @@ index c36613d53..0f1137956 100644
          _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
      }
 diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
-index 22a0042ed..f0755e81f 100644
+index d2cd4c642..f3e124f21 100644
 --- a/crates/metal2vulkan/src/lower/arith/math.rs
 +++ b/crates/metal2vulkan/src/lower/arith/math.rs
-@@ -1304,10 +1304,21 @@ pub fn float_fn(
+@@ -1307,10 +1307,21 @@ pub fn float_fn(
      let r = match op {
          _ if op.closed_on_narrow() => r,
          // A `half` `mix`, the device's `FMix` in `float`, rounds once.
@@ -3388,7 +3778,7 @@ index 22a0042ed..f0755e81f 100644
          _ => narrow::round(fb, f, r)?,
      };
      Ok(r)
-@@ -1416,9 +1427,9 @@ fn float_fn_core(
+@@ -1419,9 +1430,9 @@ fn float_fn_core(
          F::MulAdd => {
              // A narrow form takes the unfused choice, each step rounded once by the device.
              let p = bin(fb, BinOp::FMul, a, arg(args, 1)?)?;
@@ -3401,10 +3791,10 @@ index 22a0042ed..f0755e81f 100644
          F::Sqrt => g1(fb, GlslOp::Sqrt),
          F::Fma if f.float_fmt() == Some(FloatFmt::BFloat) => {
 diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
-index 1065191ea..3cc7fdfeb 100644
+index 07d6ff42e..874dd8fb9 100644
 --- a/crates/metal2vulkan/src/lower/arith/mod.rs
 +++ b/crates/metal2vulkan/src/lower/arith/mod.rs
-@@ -702,6 +702,10 @@ pub struct ArithPlan {
+@@ -743,6 +743,10 @@ pub struct ArithPlan {
      /// Whether [`ArithPlan::quantize`] is the device's own rounding (native half rounding,
      /// [`narrow::native_rounding`]), decided with it by [`finish`].
      pub native_half: bool,
@@ -3415,7 +3805,7 @@ index 1065191ea..3cc7fdfeb 100644
      /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
      /// through the conversion under the float controls ([`QuantizeForm::Controlled`]): a `half`
      /// texel takes the rounding's NaN (`narrow::round_texel`). Decided by [`finish`], on every
-@@ -785,6 +789,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+@@ -826,6 +830,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
      cx.families.arith.wide = legal::holds_wide(cx.profile);
      cx.families.arith.quantize = narrow::quantize_form(cx.profile);
      cx.families.arith.native_half = narrow::native_rounding(cx.families.arith.quantize).is_some();
@@ -3477,7 +3867,7 @@ index 800f97607..5a7eed682 100644
  /// to 16 bits and back under the float controls that make it Metal's by the Vulkan spec where the
  /// profile has `shaderFloat16` and them ([`QuantizeForm::Controlled`], [`controlled_modes`]), else
 diff --git a/crates/metal2vulkan/src/lower/arith/ops.rs b/crates/metal2vulkan/src/lower/arith/ops.rs
-index 98c9ff27f..59ad8c3ad 100644
+index e32eff20a..f8a6cc416 100644
 --- a/crates/metal2vulkan/src/lower/arith/ops.rs
 +++ b/crates/metal2vulkan/src/lower/arith/ops.rs
 @@ -252,7 +252,7 @@ pub fn float_binary(
@@ -3490,7 +3880,7 @@ index 98c9ff27f..59ad8c3ad 100644
  
  /// The census name of a `half` operator on the device's 16-bit arithmetic
 diff --git a/crates/metal2vulkan/src/lower/emit.rs b/crates/metal2vulkan/src/lower/emit.rs
-index 1ada9dd92..7b40368b9 100644
+index ba3952905..9f3a11ac2 100644
 --- a/crates/metal2vulkan/src/lower/emit.rs
 +++ b/crates/metal2vulkan/src/lower/emit.rs
 @@ -105,6 +105,7 @@ fn declare(mb: &mut ModuleBuilder, plan: &Plan) -> BResult<Declared> {
@@ -3502,7 +3892,7 @@ index 1ada9dd92..7b40368b9 100644
      let mut d = Declared::default();
      let modes = &mut d.modes;
 diff --git a/crates/metal2vulkan/src/memory/plan.rs b/crates/metal2vulkan/src/memory/plan.rs
-index 2108cca50..e9164f0aa 100644
+index fd31cf633..05f54f910 100644
 --- a/crates/metal2vulkan/src/memory/plan.rs
 +++ b/crates/metal2vulkan/src/memory/plan.rs
 @@ -33,7 +33,8 @@
@@ -3578,10 +3968,10 @@ index 2108cca50..e9164f0aa 100644
                  out.push(ConstGlobalPlan { global: g, form });
              }
 diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
-index 26810ac09..90c6283e7 100644
+index c3db90954..3ddbbadc6 100644
 --- a/crates/metal2vulkan/src/pipeline/compile.rs
 +++ b/crates/metal2vulkan/src/pipeline/compile.rs
-@@ -2808,9 +2808,13 @@ fn compile_kept<K>(
+@@ -2830,9 +2830,13 @@ fn compile_kept<K>(
      // Metal's (`DriverDeviation::MetalHalfConversion`) and every such rounding is of a form the
      // measurement covers (a `float` the function converts, or an image instruction's texel),
      // which the module then requires.
@@ -3596,8 +3986,26 @@ index 26810ac09..90c6283e7 100644
          && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
          && !crate::lower::arith::narrow::rounds_unmeasured(&module, m)?;
      // A `half` read from its bits by the device's widening, or encoded to them by its narrowing
+diff --git a/crates/metal2vulkan/src/reflection/function.rs b/crates/metal2vulkan/src/reflection/function.rs
+index 1be12a746..cc910cf3d 100644
+--- a/crates/metal2vulkan/src/reflection/function.rs
++++ b/crates/metal2vulkan/src/reflection/function.rs
+@@ -225,9 +225,12 @@ pub(crate) fn metallib_properties(
+                 2 => PatchType::Quad,
+                 _ => return Err(unmeasured()),
+             };
++            // A count of 0 is `[[patch(quad, 0)]]`: a patch with no control points, whose function
++            // reads its own data by `patch_id` (GFXBench's Car Chase draws its Bezier car body so).
++            // Metal answers it as stated: the patch type and 0.
+             let count = match byte >> 2 {
+                 63 => None,
+-                n @ 1..=32 => Some(u32::from(n)),
++                n @ 0..=32 => Some(u32::from(n)),
+                 _ => return Err(unmeasured()),
+             };
+             Some((kind, count))
 diff --git a/crates/metal2vulkan/src/spirv/builder/module.rs b/crates/metal2vulkan/src/spirv/builder/module.rs
-index 5ff8d5781..1edd8fb07 100644
+index bb85f0150..eb532d47f 100644
 --- a/crates/metal2vulkan/src/spirv/builder/module.rs
 +++ b/crates/metal2vulkan/src/spirv/builder/module.rs
 @@ -106,6 +106,9 @@ pub struct ModuleBuilder {
@@ -3620,7 +4028,7 @@ index 5ff8d5781..1edd8fb07 100644
  }
  
  /// How a float multiply the device must round on its own and never fuse is emitted
-@@ -318,6 +324,28 @@ impl ModuleBuilder {
+@@ -329,6 +335,28 @@ impl ModuleBuilder {
          self.native_half = native;
      }
  
@@ -3649,7 +4057,7 @@ index 5ff8d5781..1edd8fb07 100644
      /// Record `narrowed`, the narrowing to 16 bits of a conversion pair that rounds a `half` in a
      /// form measured to answer Metal's where the driver takes
      /// `DriverDeviation::MetalHalfConversion` (`narrow::round_measured`).
-@@ -393,6 +421,7 @@ impl ModuleBuilder {
+@@ -404,6 +432,7 @@ impl ModuleBuilder {
              )
              + tree_bytes(self.non_uniform.len(), std::mem::size_of::<Value>())
              + tree_bytes(self.measured_roundings.len(), std::mem::size_of::<Value>())
@@ -3657,7 +4065,7 @@ index 5ff8d5781..1edd8fb07 100644
              + tree_bytes(self.stored_texels.len(), std::mem::size_of::<Value>())
              + map_bytes(&self.bits)
              + map_bytes(&self.lanes)
-@@ -1401,6 +1430,7 @@ impl ModuleBuilder {
+@@ -1412,6 +1441,7 @@ impl ModuleBuilder {
              enabling: self.enabling,
              non_uniform: self.non_uniform,
              measured_roundings: self.measured_roundings,
@@ -3776,10 +4184,10 @@ index bc26130e3..0d469d1e7 100644
      Block = 2,
      ColMajor = 5,
 diff --git a/crates/metal2vulkan/src/tests/engine_arena.rs b/crates/metal2vulkan/src/tests/engine_arena.rs
-index d06163b78..aa26abc1f 100644
+index 6a8ca46a1..e364576f0 100644
 --- a/crates/metal2vulkan/src/tests/engine_arena.rs
 +++ b/crates/metal2vulkan/src/tests/engine_arena.rs
-@@ -1828,3 +1828,48 @@ fn an_integer_threadgroup_address_outside_the_static_objects_is_refused() {
+@@ -1832,3 +1832,48 @@ fn an_integer_threadgroup_address_outside_the_static_objects_is_refused() {
          }
      }
  }
@@ -3828,88 +4236,8 @@ index d06163b78..aa26abc1f 100644
 +        assert_eq!(run_both(&module, &res).expect("table output"), want);
 +    }
 +}
-diff --git a/crates/metal2vulkan/src/tests/engine_native_half.rs b/crates/metal2vulkan/src/tests/engine_native_half.rs
-index f23510ff5..026ac4aad 100644
---- a/crates/metal2vulkan/src/tests/engine_native_half.rs
-+++ b/crates/metal2vulkan/src/tests/engine_native_half.rs
-@@ -1001,3 +1001,62 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
-     }
-     assert_eq!(forms.len(), 3, "a profile of each form: {forms:?}");
- }
-+
-+/// The `OpDecorate`s of `RelaxedPrecision` in `words`.
-+fn relaxed_decorations(words: &[u32]) -> usize {
-+    let mut at = 5;
-+    let mut n = 0;
-+    while let Some(first) = words.get(at) {
-+        let (count, op) = ((first >> 16) as usize, first & 0xFFFF);
-+        // OpDecorate %target RelaxedPrecision
-+        if op == 71 && words.get(at + 2) == Some(&0) {
-+            n += 1;
-+        }
-+        at += count.max(1);
-+    }
-+    n
-+}
-+
-+/// On lavapipe (`shaderFloat16`, no `DenormPreserve` for 16 bits, no measured conversion) a `half`
-+/// sum is left to the device's own 16-bit precision by default: its `float` result is decorated
-+/// `RelaxedPrecision` and no conversion pair rounds it, recorded `NativeHalfConversion`
-+/// (`narrow::round_native`). Under `exact_answers` (`HalfChainPolicy::EachOperation`) the sum
-+/// keeps its conversion to 16 bits and back and nothing is decorated. A conversion from `float`
-+/// alone is never decorated, under either policy: its operand is a `float` the function holds.
-+/// MoltenVK, whose conversion is measured to be Metal's, and RADV, whose float controls make it
-+/// so, decorate nothing.
-+#[test]
-+fn a_half_operation_is_the_devices_16_bit_one_by_default_without_denorm_preserve() {
-+    let Some(bc) = bitcode() else {
-+        return;
-+    };
-+    let exact = DevicePolicy::default().exact_answers();
-+    let fast = profile("lavapipe", DevicePolicy::default()).expect("profile");
-+    let kept = profile("lavapipe", exact).expect("profile");
-+    assert!(crate::lower::arith::narrow::relaxes(&fast));
-+    assert!(!crate::lower::arith::narrow::relaxes(&kept));
-+    let sum = compile(&bc, "half_sum", &fast).expect("half_sum");
-+    link_and_validate(&sum, &fast).expect("L3");
-+    assert_eq!(relaxed_decorations(&sum.module.words), 1);
-+    assert!(sum.precision.contains(&PrecisionNote::NativeHalfConversion));
-+    // The two `fptrunc`s keep their pairs; the sum has none.
-+    let (r, k) = (
-+        rounding(&sum.module.words),
-+        rounding(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
-+    );
-+    assert_eq!((r.narrowings, k.narrowings), (2, 3));
-+    assert_eq!(
-+        relaxed_decorations(&compile(&bc, "half_sum", &kept).expect("kept").module.words),
-+        0
-+    );
-+    for p in [&fast, &kept] {
-+        let narrow = compile(&bc, "half_narrow", p).expect("half_narrow");
-+        assert_eq!(relaxed_decorations(&narrow.module.words), 0);
-+    }
-+    for stem in ["moltenvk-m3", "amd-780m-radv", "swiftshader"] {
-+        let p = profile(stem, DevicePolicy::default()).expect("profile");
-+        assert!(!crate::lower::arith::narrow::relaxes(&p), "{stem}");
-+        let a = compile(&bc, "half_sum", &p).expect(stem);
-+        assert_eq!(relaxed_decorations(&a.module.words), 0, "{stem}");
-+    }
-+}
-diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
-index aa37a1f92..fd70016e4 100644
---- a/crates/metal2vulkan/src/tests/fast_paths.rs
-+++ b/crates/metal2vulkan/src/tests/fast_paths.rs
-@@ -87,7 +87,7 @@ fn choices() -> Vec<Choice> {
-         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
-         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
-         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
--        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
-+        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow, InPlaceWrites }),
-         choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
-         choice!(p.ycbcr_in_place_reads: YCbCrInPlacePolicy { Model, Exact }),
-         choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
 diff --git a/docs/API.md b/docs/API.md
-index 6a4573d91..f5389e0e7 100644
+index c9683ff0e..459a58f3e 100644
 --- a/docs/API.md
 +++ b/docs/API.md
 @@ -123,8 +123,14 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
@@ -3929,53 +4257,6 @@ index 6a4573d91..f5389e0e7 100644
  - **Batches of a queue ordered by their ends** (`BatchOrderPolicy::Ends`, the runtime's choice; no
    pipeline differs). On ANV, RADV and NVIDIA's driver, each measured to start no kernel submission
    of a `VkQueue` before the one before it completed, each batch of command buffers ends with a
-diff --git a/docs/FAST-PATHS.md b/docs/FAST-PATHS.md
-index 1f13b41f8..4ce04b50c 100644
---- a/docs/FAST-PATHS.md
-+++ b/docs/FAST-PATHS.md
-@@ -35,14 +35,15 @@ three consumer pipelines: A2X (`a2x-s4`, `a2x-s96`), Xgc14 (`xgc14-bgra8`) and X
- | A blend into a packed 16-bit attachment the device renders through its word view (`A1BGR5Unorm`, `ABGR4Unorm` on the RTX 5080; `WordAttachment`), which the function computes in the interlocked storage form, reads the attachment's codes, where Metal's tile holds the pass's clear and each earlier blend's result as a `half`, finer; under fast math it also sums a few states otherwise than Metal. Every device rendering such an attachment. | The in-shader blend over the codes (no switch) | **Not built yet:** the extended-range attachments' `half` shadow (`render/extended_shadow.rs`, `VariantKey::extended_shadows`) taken by word attachments: the runtime's shadow start and end, its load of the codes and the clear's halves, and the word's shadowed variant in `lower::fragment::fetch`, for a single-sampled pass and a multisampled one (an extended-range color's shadow holds per sample, from the pass's clear). Fast math's regrouped sums have no model | One code: without fast math exact over a loaded attachment (the 2,891 states of the M3 sweep, every channel), under fast math 3,527 of 94,732,288 channels a code apart; after a clear or an earlier blend in the pass, a code apart where the two readings store different codes. `DeviceColorConversion` (`device-color-conversion`) | Not measured. Expected from the shadow's form: an `R16G16B16A16_SFLOAT` image of the pass's extent per such color (8 bytes a pixel, 16.6 MB at 1920x1080), set at the draw it starts by a fill or a load dispatch, and an 8-byte storage read and write per blended fragment inside the interlock beside the word's |
- | A heap's colour texture that Metal keeps losslessly compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage, 16 texels or more a side), on a driver whose compressed images may keep their texels apart from the memory they are bound to (`DriverFact::CompressedImagesHideAliasedWrites`: ANV), is the driver's compressed optimal image, its compression and fast clears kept. A texture Metal keeps uncompressed takes the uncompressed image under either value. The runtime's choice: no pipeline differs. | `heap_compression = HeapCompressionPolicy::Compressed` | `heap_compression = HeapCompressionPolicy::Uncompressed`: an image the driver keeps uncompressed in the heap's bytes, as for a texture Metal keeps uncompressed: host-transfer usage where the device enabled `hostImageCopy` (`heap-texture-host-transfer`), else a linear image (`heap-texture-linear`), else the optimal one (`heap-texture-hides-aliased-writes`) | A write through a buffer or another texture over the texture's bytes may leave its texels as they were or change them otherwise than as written, where Metal's texture reads opaque magenta (`0xffff00ff`) in every texel of drawn content the write covers and the written bytes where it held only a clear; the texture's own writes may show in those bytes compressed. Within Metal's contract: Metal documents such a texture's layout as its own (`allowGPUOptimizedContents` lets it "adjust the private layout"), so no write through another view over its bytes has a defined result there either. `HeapTextureCompressed` (`heap-texture-compressed`), announced once per device where such a texture is made; `runtime_lane::heap_textures` | ANV (Iris Xe of RPL-P; `heap_textures::heap_compression_costs`), a 2048x2048 `RGBA8Unorm` render target in a `Private` placement heap: a pass that clears it 26.9 us against 676.2-676.5 us; a copy into another such texture 647.7-649.1 us against 673.9-693.2 us |
- | Batches of command buffers committed on one queue that the scheduler finds ready together (a backlog) go to the driver in one `vkQueueSubmit`, at most four, only the last signalling the queue's timeline, on a device whose own check finds a submission that signals nothing merged into the next (`submit_check.rs`, once per driver, release and kernel: one `vkQueueSubmit` of four empty infos against four calls of one, merged where the one costs at most 0.6 of the four; Mesa 26.2.6's RADV on the Radeon 780M, the RX 7900 XTX and the RX 550 at 0.33-0.38, ANV on the Iris Xe of RPL-P at 0.39, MoltenVK 1.4.2 on the M3 Max at 0.98; a device whose check has not answered, or that does not merge, takes the ungrouped form under either value of the switch): one kernel submission, where ANV on i915 lists every `VkDeviceMemory` in each (the consumer's guest drag on the Iris Xe: about 300 entries per execbuffer, 260 of them its host imports, at 112 to 128 execbuffers a frame). A batch's event signals ride to the group's end, which signals each event's semaphore to the highest index the batches held signal it to (an event's indices rise in commit order). A batch that signals a binary semaphore, takes a fence, binds a sparse update, does first work, names the caller's wrapped image, or waits for anything not seen complete (an event, another queue's work) goes alone, after the batches held: a batch with a wait leads a group, never joins one. So that checked command buffers (the consumer checks each) are found ready together, the submission checks of up to three batches right behind a line's head that goes run with the head's, in commit order, none committed after another queue's batch: such a check runs before the previous batch's `vkQueueSubmit` rather than after it, in the scheduler pass that submits its own batch. A pass that finds no batch ready sends the batches held, unless two or more earlier submissions of their `VkQueue` are not seen complete: the GPU runs those first in any case, so the batches stay held, and those committed meanwhile join them, until one submission is left in flight (a completion turn wakes the scheduler at its value), the group fills, a later batch sends it, a head waits for the GPU, or a thread waits for one of their command buffers' completion, which sends them at once; nor are they kept where the scheduler's thread runs next a submission handler of another queue's command buffer: they go first, as Metal schedules a queue's command buffers whatever another queue's handler does (an M3 Max, probe `cross_queue_handler_waits`); a batch that ends a command buffer with a switch of storage forms riding on it, which settles by its submission's outcome, is never kept so. A batch a committing thread submits (`CommandBuffer::commit_and_submit`) goes alone where its `VkQueue` runs at most one earlier submission not seen complete, as the pass that held it would send the group at once; where two or more run it is left to the scheduler's thread, which holds it. A held batch that ends its command buffer is `Scheduled` as it is held, its submission handlers run first, then its scheduled handlers, and its kernel end time set, as an M3 Max schedules a command buffer committed behind running work 0.04 to 0.18 ms after its commit. The runtime's: no pipeline differs. | `completion = CompletionPolicy::Grouped` | `completion = CompletionPolicy::Exact`: one submission per batch, each signalling its own values; each line's head checked alone | Each command buffer of a submission but the last is seen complete (status, completed handlers, waits), and the event values it signals are reached (by the GPU waits on other queues, the host's waits, value reads and listeners), once the last completed: late by the GPU time of at most three later batches (about 0.1 to 0.2 ms each in the consumer's compositor frames on the Iris Xe; about 20 ms behind a 20 ms batch), never early, in commit order. Metal's contract states no bound on when completion is seen (an M3 Max reports a command buffer complete, its handlers, status, waits and event listeners alike, 0.04 to 0.10 ms after its GPU end), and no member but the first waits, so no wait holds a member back: a valid program sees only later completion, as of slower GPU work. A batch kept while earlier work runs is seen complete within the same bound, and, where the one submission left in flight ends before its group reaches the GPU, late besides by that gap: at most a completion turn's reaction and the group's `vkQueueSubmit`. Commands, barriers and GPU times are unchanged. `GroupedCompletion` (`grouped-completion`), announced once per device at its first such submission; `runtime_lane::grouped_submissions` | ANV (Iris Xe of RPL-P; `frame_costs::frame_costs_over_imports`, the checked device, 67 command buffers a frame, GPU at 467-783 MHz), with 520 host imports live, where the Exact form's submissions fall behind the commits as the guest's do: 32.0-33.2 kernel submissions a frame against 67.0, 3.4-3.5 ms of execbuffer ioctl a frame against 6.9-7.9 ms, the scheduler thread's CPU 61-63 us a command buffer against 121-136 us, a frame through completion 4.7-5.9 ms against 8.6-9.7 ms; in the guest's shape with 520 (a second queue taking every 20th command buffer, each signalling a shared event, every 10th waiting for one): 26.2-26.7 kernel submissions a frame against 67.0, 2.8 ms of ioctl a frame against 6.9-7.0 ms, the scheduler 52-53 us a command buffer against 122-123 us, a frame through completion 6.0 ms against 8.7 ms; with 260, where it keeps up, 64.9-66.3 kernel submissions a frame against 67.0, the CPU and wall times alike. The cost (`grouped_submissions::grouped_completion_delays`, 8 command buffers of 0.3-0.5 ms of GPU work ready together): the host saw each but a group's last complete later by the later ones' GPU time, the last 0.1-0.3 ms later than alone (the completion turn's per-command-buffer work for the group, done at its end). Keeping a group while earlier work runs (UHD 770 of RPL-S, ANV, the guest's shape with 520 host imports, a submission handler on every command buffer and a 16 MiB fill ahead of each, about 1.3 ms of GPU each; the kept form against the batches sent as found): committed every 1 ms, 18.1-18.2 groups kept a frame, 24.9-25.0 kernel submissions a frame against 57.9, 2.18-2.90 ms of execbuffer ioctl a frame against 4.64-5.43 ms, the scheduler thread's CPU 67-82 us a command buffer against 113-118 us, the GPU idle within a frame's span 0.61 ms against 0.68-0.69 ms, a frame through completion 89.5-89.6 ms alike, completion seen later (GPU end to completed handler: mean 1.82-1.86 ms against 0.43-0.46 ms, p50 1.57-1.60 against 0.11-0.13, p99 4.35-4.37 against 4.09-4.11, max 4.52-4.55 against 4.18-4.23); committed at once, 18.0 kernel submissions a frame against 23.4; with no fill, 18.0 against 20.6, the GPU idle 0.59 ms against 0.58-0.66 ms. In the consumer's guest drag on the Iris Xe (i9-13900H; three passes each way): 24.4-27.5 kernel submissions a frame against 42.4-43.8, the scheduler thread 0.4-1.7 ms of CPU a frame less, 15.7-17.3 frames a second against 16.4-17.6: the frame rate alike within noise, as the scheduler thread does not bound that frame. A batch a committing thread submits alone (RADV, Mesa 26.2.6, RX 7900 XTX, whose check finds submissions merged; two rounds each against the form that left every batch that may wait in a group to the scheduler's thread, `tests::completion_latency`): a checked fill's `commit_and_submit` to its submission handler p50 30.4-32.8 us, p90 32.3-35.9, p99 48.8-57.8 against 36.2-55.7, 56.4-176.3 and 112.1-198.5, the call returning after its submission (32-34 us against 4-8); committed 2 ms apart between two shapes of `commit`, its commit to submission p50 31.9-36.1 us, p90 102.6-135.7 against 39.2-50.1 and 152.1-169.7, and the `commit`s beside it alike (p50 32.1-47.3 us against 38.9-46.7, the scheduler thread's wake p50 4.0-4.5 us against 4.1), as the committing thread wakes that thread after a batch it submitted alone, as the batch's hand-off to it would have. On lavapipe, whose check finds no merge, the two forms alike, the scheduler's thread woken alike (a checked fill's p50 12.5-13.4 us against 12.4-13.4). |
--| Batches of command buffers on one `VkQueue`, on a driver measured to start no kernel submission of a queue before the one before it completed (ANV, RADV and NVIDIA's; `batch_order.rs`), are ordered by their ends: each ends with a barrier ordering its work before every later command of its `VkQueue` (the exact form's end orders it before the host's reads and writes alone), so a batch that depends on an earlier one there begins with no barrier of its own, often no command buffer of barriers, and its first encoder's GPU start is written at the bottom of the pipe, once everything before it completed. Metal starts an independent command buffer committed behind running work while that work runs (an M3 Max under macOS 27.0.1, probe `gpustart`); those drivers ran two batches of independent work one after the other under every shape measured (no end barrier, the host's or the widened one; in one `vkQueueSubmit` or two, merged into one kernel submission or not), where two dispatches of one command buffer ran side by side. The runtime's: no pipeline differs. | `batch_order = BatchOrderPolicy::Ends` | `batch_order = BatchOrderPolicy::Exact`: a barrier for each dependency of a batch's work on an earlier batch's of its `VkQueue`, the end's barrier to the host's reads and writes alone, the GPU start written at the top of the pipe; every other driver takes it under either value | None: on those drivers each batch starts once the one before it completed under either value, so the work's order, its results and its GPU times are the same, and a batch's GPU start is the end of the work before it, when such a driver starts it. Not announced; `runtime_lane::commit_work` and `runtime_lane::gpu_times` test both values | UHD 770 (ANV, RPL-S), the consumer's frame shape over 520 host imports, 67 command buffers a frame, Grouped completion, the widened end barrier against the exact form (a probe build of each): with no fill ahead of each command buffer, 67.0 command buffers submitted a frame against 129.3-129.7, the GPU's span a frame 1.84-1.90 ms against 1.99-2.06 ms, a frame through completion 2.13-2.22 ms against 2.27-2.38 ms; with a 1 MiB fill ahead of each, 134.0 against 262.9, 8.03-8.22 ms against 8.32-8.42 ms, 9.00-9.15 ms against 9.25-9.36 ms. Radeon 780M (RADV, Mesa 26.0.8), this switch: with no fill, 67.0 against 128.9-129.0, a frame through completion 48.3-48.6 ms against 42.6-47.0 ms; with a 16 MiB fill committed at once, 134.0 against 251.0-251.1, 50.6-50.8 ms against 50.8-57.3 ms; committed every 1 ms, 134.0 against 249.7-250.2, 71.3-83.6 ms against 106.3-113.6 ms (each kernel submission there leaves about 2.5 ms of the GPU idle over 520 host imports, which sets these frames) |
-+| Batches of command buffers on one `VkQueue`, on a driver measured to start no kernel submission of a queue before the one before it completed (ANV, RADV and NVIDIA's; Turnip by its source, one command processor running a queue's ring in order; `batch_order.rs`), are ordered by their ends: each ends with a barrier ordering its work before every later command of its `VkQueue` (the exact form's end orders it before the host's reads and writes alone), so a batch that depends on an earlier one there begins with no barrier of its own, often no command buffer of barriers, and its first encoder's GPU start is written at the bottom of the pipe, once everything before it completed. Metal starts an independent command buffer committed behind running work while that work runs (an M3 Max under macOS 27.0.1, probe `gpustart`); those drivers ran two batches of independent work one after the other under every shape measured (no end barrier, the host's or the widened one; in one `vkQueueSubmit` or two, merged into one kernel submission or not), where two dispatches of one command buffer ran side by side. The runtime's: no pipeline differs. | `batch_order = BatchOrderPolicy::Ends` | `batch_order = BatchOrderPolicy::Exact`: a barrier for each dependency of a batch's work on an earlier batch's of its `VkQueue`, the end's barrier to the host's reads and writes alone, the GPU start written at the top of the pipe; every other driver takes it under either value | None: on those drivers each batch starts once the one before it completed under either value, so the work's order, its results and its GPU times are the same, and a batch's GPU start is the end of the work before it, when such a driver starts it. Not announced; `runtime_lane::commit_work` and `runtime_lane::gpu_times` test both values | UHD 770 (ANV, RPL-S), the consumer's frame shape over 520 host imports, 67 command buffers a frame, Grouped completion, the widened end barrier against the exact form (a probe build of each): with no fill ahead of each command buffer, 67.0 command buffers submitted a frame against 129.3-129.7, the GPU's span a frame 1.84-1.90 ms against 1.99-2.06 ms, a frame through completion 2.13-2.22 ms against 2.27-2.38 ms; with a 1 MiB fill ahead of each, 134.0 against 262.9, 8.03-8.22 ms against 8.32-8.42 ms, 9.00-9.15 ms against 9.25-9.36 ms. Radeon 780M (RADV, Mesa 26.0.8), this switch: with no fill, 67.0 against 128.9-129.0, a frame through completion 48.3-48.6 ms against 42.6-47.0 ms; with a 16 MiB fill committed at once, 134.0 against 251.0-251.1, 50.6-50.8 ms against 50.8-57.3 ms; committed every 1 ms, 134.0 against 249.7-250.2, 71.3-83.6 ms against 106.3-113.6 ms (each kernel submission there leaves about 2.5 ms of the GPU idle over 520 host imports, which sets these frames) |
- | Command queues on a device whose GPU idles when consecutive work comes from another `VkQueue` share `VkQueue`s by choice (`queue_share.rs`): the runtime's own self-check, not a `DriverFact` row, measures that idling once per driver, release and runtime on a thread of its own and keeps its verdict (`Idles`, `DoesNotIdle`, `Unchecked`) in the shader cache's directory, as the in-place check keeps its own (`queue_switch_check.rs`: 48.7 to 51.3 us a switch on the RTX 5080 Laptop GPU, NVIDIA 615.71.09, `Idles` above 20 us). A command queue that makes a command buffer while it holds no other uncompleted one moves onto the busy `VkQueue` of its family whose oldest batch has run under 0.5 ms, the most batches in flight first, so short command buffers of several queues run with no switch between them. A queue one of whose command buffers ran on the GPU for over 2 ms, by its own timestamps (not the host's view of how long it ran as its `VkQueue`'s oldest, which also holds its wait for the GPU to start it and the waiter's lateness to see it complete), or held its `VkQueue` for over 2 ms from the submission of a batch that waited on the GPU for another `VkQueue`'s work (an `MTLEvent`'s signal, the tracker's wait, new resources' first work) to its own GPU end, is long: no queue joins its `VkQueue` while it lives, and it moves once more, at its next idle point, to an idle `VkQueue` no long or unshared queue holds. A queue whose command buffers must never wait behind another queue's (a compositor's beside an application's) is made with `Device::new_command_queue_unshared`: it never moves and no queue joins its `VkQueue`. Presenting queues and a queue that lent its `VkQueue` (`with_vk_queue`) never move. Before the verdict, and where it is not `Idles` or there are no two `VkQueue`s of one family (MoltenVK, RADV, lavapipe), every queue keeps the `VkQueue` it took at its creation; so does every queue of a device whose command buffers write no GPU timestamps it reads (`gpu_times_from_host`, or a driver whose timestamps wait for every queue's), which does not share and is counted (`WorkCounts::queue_sharing_untimed`). The runtime's: no pipeline differs. | `queue_sharing = QueueSharingPolicy::Adaptive` | `queue_sharing = QueueSharingPolicy::PerQueue`: each command queue keeps the `VkQueue` it took at its creation, round robin, and the check does not run | A command buffer waits behind the command buffers of the queues sharing its `VkQueue`, where Metal's queues wait for each other only inside one command. The residual stall: once per logical queue that goes long, for a queue that joined its `VkQueue` during its short phase, about one long command buffer's length: the command buffers committed behind that queue's first long one there wait for its whole length (and those behind its later ones while it holds work, until its next idle point). Measured on the RTX 5080 Laptop GPU beside an application that alternates draws with 30 ms command buffers: a shared compositor's commits at 4,800 a second had 64 completions over 10 ms, at most 26.4 to 30.1 ms, in each of 3 runs of each of two such shapes (one join each), against none over 10 ms under `PerQueue` in those 6 runs (at most 5.6 to 9.7 ms); with 2 ms of draws between long command buffers, none over 10 ms in 3 runs (at most 5.7 to 9.8 ms) against 7, 0 and 0 under `PerQueue` (at most 6.9 to 11.2 ms). On an unshared queue, 0 over 10 ms in every run. A command buffer's GPU start time includes the other queues' work before it. `QueueSharing` (`queue-sharing`), at the device's first join | Command buffers a second on the RTX 5080 Laptop GPU, one-draw command buffers, each thread its own queue, the default against `PerQueue`, runs after a lock hold's first: 8 threads with 3 in flight 50.7k to 54.7k against 27.4k to 28.0k (5 runs each); 8 threads with 1 in flight 47.0k to 50.1k against 13.9k to 14.3k (5); 2 threads with 3 in flight 28.0k to 53.7k against 21.4k to 28.0k (10 each, in turn, the default above `PerQueue` in each pair; no thread's queue marked long), and beside another process's 30 ms command buffers 5.1k to 6.7k against 4.0k to 4.1k (3 each; the host's view marked a thread's queue long in 1 of 3 runs, which then ran at `PerQueue`'s 4.1k); 2 threads with 1 in flight 16.9k to 20.7k against 10.1k to 11.5k (5); one thread over 16 queues in turn 21.7k to 43.3k against 10.2k to 11.1k, over 2,048 20.0k to 39.2k against 10.2k to 11.2k (4). Beside an application whose queue never shared with the compositor (isolation, 300 and 30 dispatches), both 0 over 10 ms |
- | A chain of `half` additions, subtractions and products on a device without `shaderFloat16` (vk12-floor, SwiftShader, Pascal; capability emulation: the module computes each in `float` and rounds it by the device's `OpQuantizeToF16`): an operation whose flags hold `contract` and `reassoc` and whose result only such operations read is held at `float` precision unrounded, so the chain rounds where a value leaves it (a store, an output, a conversion, a comparison, a call, a phi, a vector move, an operation without both flags), one quantize per exit instead of one per operation (`lower::arith::half_chain`). A device with `shaderFloat16` computes `half` alike under either value. | `half_chains = HalfChainPolicy::AtExits` | `half_chains = HalfChainPolicy::EachOperation`: every operation's result rounded to `half`, as the AIR computes it | The result may differ from the rounded operations' by the roundings the chain skips, each within half a unit in the last place of a `half` at its step, compounded along the chain; a value inside the chain past `half`'s range (65504) stays finite where the rounded operations reach infinity. Within the AIR's flags, which let a compiler regroup and fuse such operations. `FastMathRewrites` (`fast-math-rewrites`) | Not timed. Size on vk12-floor (the fixtures' SPIR-V words, the default against the accurate form): `hfb_filter_bank` 121,270 against 131,766 (1,024 quantizes against 2,464), `grd_half_many_samples` 82,019 against 84,627, `nan_half_fast` 9,808 against 9,832 |
-+| A `half` operation the device has one instruction for (`+ - * /`, `fma`, `dot`, `mix`, `sqrt`, `rsqrt`, `exp`, `exp2`, `log`, `log2`) on a device with `shaderFloat16` whose 16-bit floats keep no denormals (no `DenormPreserve` for 16 bits: Turnip on Adreno 6xx and 7xx), where no float controls make the conversion to 16 bits Metal's: its `float` result is decorated `RelaxedPrecision` and left to the device's own 16-bit precision (`narrow::round_native`, `narrow::relaxes`), in place of a conversion to 16 bits and back after it. Mesa's compiler folds that pair into nothing (`nir_opt_algebraic.py`, the inexact `f2f32` of an `f2f`), so the accurate form computes every such operation in `float` unrounded, on 32-bit registers. | `half_chains = HalfChainPolicy::AtExits` | `half_chains = HalfChainPolicy::EachOperation`: the operation in `float`, then the device's conversion to 16 bits and back | Each such result is the device's 16-bit one: within one unit in the last place of a `half` (a relative 2^-10) of the `float` result at its step, compounded along a chain; a magnitude below the smallest normal half (2^-14) may be zero; a magnitude from 65520 up is infinite. These are the values Metal's own `half` takes but for the denormals. `NativeHalfConversion` (`native-half-conversion`) | Not timed on a device. ir3 for the Adreno 740 (Mesa's own statistics, scalar operations on 16-bit registers of all in the fragment's body, the default against the accurate form): QuartzCore's `glass_background_all_lph` 724 of 1,085 against 113 of 1,010, its registers 12 against 16 and its waves 8 of 128 fibers against 12 of 64; `variable_blur_frag_lph` 620 of 968 against 43 of 902; `narrow_blur_27_frag_lph` 160 of 244 against 12 of 258 |
- | A texture that samples, reads, renders into it or is written through a shader (`ShaderWrite` or `ShaderAtomic` usage, of texels of 1, 2, 4, 8 or 16 bytes) over host pages (a no-copy buffer's, or a no-copy heap's buffer's, imported by their pointer or as dma-bufs; or a buffer in fresh pages; or a copied host buffer's copy of them, `copied.rs`, its image bound in the copy's memory where the check passed for the pages, and for the copy's fresh pages or, for a `DRM_FORMAT_MOD_LINEAR` image in memory the device allocates, its pooled memory, `WorkCounts::copied_textures_in_place`) is a linear image aliasing the pages in place, where the device makes the image (its format and usage linear, at the pages' pitch) and its own check shows that the operations Vulkan lets read and write every byte bound to it leave every byte alone while the CPU writes beside it: the image's first move (`VUID-VkImageCreateInfo-pNext-01443` makes such an image start `UNDEFINED`), and for one that renders a render pass's load and store operations and its moves into `ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT` and back, and for one a shader writes a kernel's storage writes of its texels (which of a linear image a driver may widen past a texel), each access checked apart (a shader's writes of 1- or 2-byte texels apart from those of wider ones, which a driver may store through a wider access), and each apart for texels that share a line of the device's memory (`nonCoherentAtomSize`, "the size and alignment in bytes that bounds concurrent access to host-mapped device memory") with bytes beside them and for texels that share none (their start, their end and, with bytes between rows, each row's start and end on a line; `in_place::RowEnds`): a byte changed beside texels that share none fails both, one changed beside texels that share one fails those alone (the Iris Xe, ANV, Mesa 26.2.6, whose clear and store, and draws, write back whole the 64-byte line that holds a row's last texels, fails renders, and writes, for rows that end inside a line, a byte between rows changed, and passes both for rows that end on one: a 3840x2160 `BGRA8Unorm` surface's 15360-byte rows are 240 lines each). A kernel's writes of a texture over a buffer's rows (no IOSurface plane's) whose rows, each to its pitch, start and end on a line, its buffer holding the last row to its pitch, take a verdict of their own from the same rounds, which a round that changed only bytes of its rows' padding (after a row's last texel, before its pitch, the last row's included) passes (`in_place::Padding`, `Access::BufferWrites`): Metal leaves those bytes to the GPU there (an Intel UHD Graphics 630 under macOS 26.7.1 wrote older values back over the CPU's writes to them under a kernel's writes of a texture over a buffer, the last row's included, where an M3 Max under macOS 27.0.1 and a Radeon Pro 5300M kept them, and all three kept them under draws, clears and stores and over IOSurfaces; `crates/metal2vulkan-conformance/probes/row_padding_writes.m`), and the rule follows the x86 Macs' envelope (docs/API.md, section 10, **Kernels**), so the Iris Xe's written textures over a buffer take the image in place whatever their rows' ends. A deliberate, scoped exception to relying on documented Vulkan behaviour alone, the owner's rulings (2026-10-26, and 2026-10-27 and 2026-11-07 for render targets and written textures: the GPU works on the caller's pages in place as a Mac's does, whatever a linear image costs it, on a discrete GPU too; `in_place.rs`). A texture over a buffer of the runtime's pooled memory whose rows the device's own linear image lays out otherwise (a padded pitch the driver does not take: ANV lays linear rows tight; rows apart only over a buffer that declares them unobserved, `BufferDescriptor::padding_unobserved`) is, by the same rule, a `DRM_FORMAT_MOD_LINEAR` image at Metal's pitch bound in the buffer's memory where the device makes one (no external memory, which Vulkan allows: `VUID-VkImageCreateInfo-tiling-02261`, `VUID-vkBindImageMemory-image-01445`), made `UNDEFINED` (`VUID-VkImageCreateInfo-initialLayout-12478`), whose first move the check's pooled class judges (`PagesClass::Pooled`: a buffer of that memory, its images at Metal's pitch alone; `WorkCounts::pooled_pitched_images`); a texture made before that class's verdict is a shadow that moves to that image once the verdict passes, as one over host pages moves in place (below; `WorkCounts::pooled_textures_moved_in_place`, `pooled_texture_shadows_freed_after_move`). A texture over a buffer whose memory the runtime exports (`exported_memory.rs`: a block that exportable buffers of one handle type share) is, by the same rule, the device's linear image or that `DRM_FORMAT_MOD_LINEAR` image made for the memory's handle type, which an image bound there must name (`VUID-vkBindImageMemory-memory-02728`), and so made `UNDEFINED` (`VUID-VkImageCreateInfo-pNext-01443`), whose first move the check's exported classes judge, one per handle type (`PagesClass::ExportedFd`, `PagesClass::ExportedDmaBuf`: an exportable buffer of that handle type, its textures taking the product's image), a texture made before their verdicts moving to it once they pass as over the pooled memory; a shadow, its notice naming why, where the memory is a buffer's dedicated allocation (`VUID-vkBindImageMemory-memory-10926`) or the device's image format query (`VkPhysicalDeviceExternalImageFormatInfo`) takes the handle type for no such image without a dedicated allocation. A texture over a buffer in a block of the runtime's buffers allocated exportable as an opaque file descriptor and never exported (`memory.rs`'s "Buffers in exportable blocks") is the device's linear image made for that handle type, made `UNDEFINED`, and never a `DRM_FORMAT_MOD_LINEAR` one (RADV asks a dedicated allocation of one made for any handle type), whose first move and accesses the check's class of such blocks judges (`PagesClass::FdBlocks`: a buffer in such a block, its textures taking the product's images, made only where such a block holds every image a texture over a plain block's buffer that keeps its padding takes in place, `texture/fd_blocks_cover.rs`); the device's buffers lie there only where those verdicts give every texture over one what it takes over a plain block's buffer (`in_place::fd_blocks_take`), in plain blocks until they are known, and a buffer that declares its padding unobserved lies in a plain block wherever, so that a texture over it whose rows lie apart keeps its `DRM_FORMAT_MOD_LINEAR` image. A texture that renders over a buffer that declares its padding unobserved, its rows each to its pitch sharing no line with bytes past them, takes the verdict of renders that lets a byte of its rows' padding change (`Access::UnobservedRenders`, `Padding::Unobserved`), which the renders' own rounds give as the writes' give theirs: the declaration lets a pass's load and store write those bytes (the Iris Xe's clear and store write back the 64-byte line that holds a row's last texels whole), and a byte past the last row's pitch, or a texel, fails it. The check runs once per driver and driver version (its record named by the driver and the check's own version, not the runtime release), per class of pages, access and row ends, on a thread of its own, the verdicts it measured kept in the shader cache's directory with those it could not check for a cause that lasts for the driver (the device lacks an extension, a feature, an import, a format or an image of the shape), while one it could not check for a cause that may pass (pages or memory not made, an import refused, its writer thread not started, a move or the stores that failed) is checked again by the next device, its reason noted; a texture made before its verdict is a shadow, made without waiting for the check (its rounds take seconds on some devices and builds; `host_texture_shadows_check_pending`), and moves in place once its class's verdicts pass, at the commit of the device's only uncommitted command buffer, with no copy (`host_textures_moved_in_place`), its shadow's image freed once the command buffer that took the move completed (`host_texture_shadows_freed_after_move`), or, where a view made before the move presents it, a shadow made over it holds it as its truth, or the texture is untracked, once those and the texture went. A texture a shader writes of texels of a width no check stores (none of 1, 2, 4, 8 and 16 bytes), a check that failed or made no image, and a format, usage or pitch no image takes keep the shadow (`shadowed-texture`, its reason named, `WorkCounts::host_texture_shadows_*`, those that render and those a shader writes counted apart in `host_texture_shadows_render_target` and `host_texture_shadows_shader_write`). On a discrete GPU a `Shared` texture and an IOSurface's are in place too, read across the bus, never copied to the device's memory for speed; a `Managed` texture over a no-copy buffer's bytes that only samples or reads, over memory that carries a log of its writes, is a device copy instead (`WorkCounts::device_copy_textures`), the GPU's copy of the two Metal keeps of a `Managed` resource on a Mac with a discrete GPU, its copies in only the rows the log reports changed. | `host_page_textures = HostPageTexturePolicy::InPlace` | `host_page_textures = HostPageTexturePolicy::Shadow`: every texture over host pages a shadow, its texels copied in before each command buffer that uses it and merged back after each write (the host-pages bullet under **Costs of matching Metal**) | Exact where the driver keeps what its check showed: the check covers texels, the bytes between rows and those after the image, of 1, 2, 4, 8 and 16-byte texels and a 3840x2160 surface, three rounds each, for an image that reads and one that renders (its pass a clear at load and a store, then a draw over its last column in a pass that loads and stores it; a resolve into it is not among the rounds), the CPU writing beside the texels sweep after sweep until each step completed, so that a device that writes back bytes it read beside them, wherever in the step, puts back an older value the check finds, and, for one a shader writes, of 4, 8 and 16-byte texels, rows apart (of widths no multiple of 4 and odd heights among them) or tight, and 1920x1080, and apart of 1- and 2-byte texels, rows apart at a 256-byte pitch (of rows that end inside a 4-byte word and odd heights) or tight, and 1024x64, each texel stored by a kernel through an unsigned-integer view (a program's atomics, and its stores through a float view, are not among the rounds); a driver whose operations changed a byte outside every round's window would undo a CPU write made meanwhile. A kernel's writes of a texture over a buffer whose padding is free may change that padding, as an x86 Mac's GPU's do (above). Not announced where the check passed. A CPU write reaches the image's reads as it reaches the buffer's (Host Write Ordering Guarantees) | See **Costs of matching Metal** (host pages): the shadow copies a sampled 3840x2160 surface in whole each command buffer, and a render target's shadow copies it in, keeps it and merges it back at each render pass instance |
- | A render or compute state's creation hands the driver's making of its predicted pipeline (`pipeline/predicted.rs`, `pipeline/dispatch_making.rs`) to the runtime's pool, kept by the state as a draw's or dispatch's making is, and waits for it `pipeline_creation_wait` at most; a committed command buffer's recordings wait until its commit plus `pipeline_commit_wait` at most, one deadline its commands share, for its draws' and dispatches' (a compute encoder's, a render pass's tile dispatches) pipelines still being made (the scheduler wakes at the bound, `StepWaits::until`), an execution's replayed draws (`render/pending.rs`) among them, whose pipelines the commit's settle hands to the pool (a device replay's, one recording for every command, waits until made under either value), then record each such command as nothing: a draw's barriers and visibility query, a dispatch's barrier (a tile dispatch's copies into its scratch and back), no draw or dispatch, the command buffer running on without error. The making goes on, and the command buffers after it draw and dispatch with the pipeline once made. Metal compiles inside `newRenderPipelineState`, so no draw of a made state waits or is dropped; a host that creates a state inside a command buffer's encoding (the consumer creates a guest's state at an execution's first lookup of it) held that execution through the driver's whole compile: 11.59 s inside one execution on an M2 Pro (MoltenVK 1.4.2, a cold Metal compiler service; a sample of such a stall finds the compile's thread waiting in `MVKMetalCompiler::compile` for Metal's compiler), past the guest's 10 s FIFO check, which ended the guest's task. Each bound is 4.5 s: a creation and a commit may fall in one step of the guest's FIFO (a task's jobs run one after another, and a draw's own variant waits under its command buffer's bound), and no runtime call waits for both, so one step waits 9 s at most for makings, under that 10 s check. A creation waits on no command buffer's deadline and a `commit` on no creation's; a `commit` waits until its own deadline at most (it records there what it can, an execution of render commands the CPU writes among them), every other recording on the scheduler's thread, a host step's on one of the steps' threads. Made until made under either value, in the call that makes them: a draw that records nothing, one in a pass of custom sample positions and one recorded again into another instance of its pass (each in the draw's call or an execution's replay), a device replay's draws (in its `commit`), and a failed making made again (`PipelineWaitPolicy`'s docs). The runtime's: no pipeline differs. | `pipeline_waits = PipelineWaitPolicy::Bounded`, `pipeline_creation_wait = 4.5 s`, `pipeline_commit_wait = 4.5 s` | `pipeline_waits = PipelineWaitPolicy::Exact`: the creation makes its predicted pipeline before it returns (a render state's first key on its own thread, the rest on the pool, joined; a compute state's on its own thread), an execution's settle makes its replayed draws' pipelines at the commit, and a command buffer waits for each draw's and dispatch's pipeline until it is made | A draw whose pipeline was still being made `pipeline_commit_wait` after its command buffer's commit renders nothing in that command buffer (only there: later ones draw it), where Metal's renders: content drawn once (a layer, a glyph cache) stays without it until redrawn. A creation returns after `pipeline_creation_wait` at most with its making in flight (`WorkCounts::creations_left_making`). `DrawDroppedStillMaking` (`draw-dropped-still-making`), at each such draw where `DeviceOptions::announce_each` asks, else once per device; `CommandBuffer::dropped_draw` names the first with `VK_TIMEOUT`; `WorkCounts::draws_dropped_still_making`; `deferred_calls::a_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing` and `under_the_exact_wait_a_held_making_holds_its_command_buffer_until_it_lands`. A dispatch whose pipeline was still being made then writes nothing in that command buffer, where Metal's runs: `DispatchDroppedStillMaking` (`dispatch-dropped-still-making`), `WorkCounts::dispatches_dropped_still_making`, the first named by `dropped_draw`; `deferred_calls::a_dispatch_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing`, `a_compute_state_s_creation_waits_its_bound_for_its_predicted_making` and `a_replayed_draw_whose_pipeline_is_still_being_made_at_its_bound_runs_nothing` | No GPU cost. The exact form holds the creating thread, and the command buffer, for the whole compile: up to 11.59 s on the M2 Pro's cold boot (that boot's 2,483 render state creations, translation included: 300 over 16 ms, 151 over 100 ms, 14 over 250 ms, 3 over 1 s, the longest 11.59 s, 5.82 s and 1.17 s), where the default holds a creation for 4.5 s at most and a command buffer for 4.5 s from its commit, which drops the draws of the compiles that outlast those (2 of that boot's 2,483 were over 4.5 s) for the command buffers committed before they land; bounds of 1 s dropped 39 draws in a cold boot on the M2 Pro, and the guest's menu bar, drawn once, stayed half drawn |
- | A line Apple's `setLineWidth:` widens (`w' = floor(16 w) / 16`, other than 1), and a triangle's edge in fill mode `Lines`, is drawn by the device's own lines at `w'` wherever it draws that width (`wideLines`, `w'` in `lineWidthRange` and above 0), where Metal draws the parallelogram Vulkan's non-strict wide lines may be (`render/line_width.rs`). No device's are taken as it, announced on every device: a strict device's rectangle with square ends (lavapipe, NVIDIA), lines Vulkan does not state as parallelograms (ANV, and every width below 1), a width rounded to the granularity, and a driver's parallelograms (`strictLines` unset, `nonStrictWideLinesUseParallelogram` set), whose ends the driver places (RADV on the Radeon RX 7900 XTX draws 21 of `runtime_lane::line_widths`'s 48 scattered lines at width 2.5 a row or a column off Metal's at an end). A mesh draw's lines and edges and a tessellated patch draw's edges take the device's lines under either value, the band not drawing them (at the nearest width they draw where they do not draw `w'`, announced `lines-at-nearest-width`: a known gap below). The runtime's: no pipeline's code differs. | `wide_lines = WideLinePolicy::Device` | `wide_lines = WideLinePolicy::Exact`: a draw of lines or edges the device's lines draw is the pipeline's band variant (`VariantKey::line_band`, `pipeline::link::band`) on a device with `tessellationShader` (the device's lines where it has none, or where the translator refuses the state's band or the draw's): two triangles over each line's parallelogram, and each triangle's three edges' parallelograms facing as the triangle, through a tessellation control and evaluation stage; every other width other than 1 is the band under either value | The lines can cover pixels the parallelogram does not, and miss others, at each end and along each edge: up to half the width past each end (square ends), a rounded width, and a row or a column at an end (a driver's parallelograms). `DeviceWideLines` (`device-wide-lines`), at each such draw where `DeviceOptions::announce_each` asks, else once per device; `WorkCounts::device_wide_line_draws`, `line_band_draws`, `nearest_width_line_draws`; `runtime_lane::line_widths` (the band matches Metal's maps of lines and of triangles' edges, their facing, culling, flat inputs, primitive IDs and depth on MoltenVK under both values, which has no `wideLines`; a band of edges under a depth bias is announced `wide-edge-depth-bias`) | Not measured. Expected from the band's form: a second pipeline variant made for each render state that draws such lines or edges (its two synthesized stages), each line tessellated as a patch of two control points into four corners and each triangle as a patch of three into 21 triangles (12 degenerate), and a strip, loop or fan drawn as the list of its primitives |
- | A blit or fill through a `BGRA10_XR` or `BGRA10_XR_sRGB` texture Metal keeps losslessly compressed (`allowGPUOptimizedContents`, 16 texels or more a side, neither `ShaderWrite` nor `PixelFormatView` usage, one sample, not over a buffer) is the device's copy, which keeps the bytes it moves, on every device: Metal's GPU blit into, out of or between such textures moves the texels through its compression, which writes each 16-bit field's low six bits cleared and the alpha code clamped to `[384, 894]`, and its fill clears the low six bits alone (an Apple M3 Max under macOS 27.0.1, every direction, storage mode, usage and size that decides the compression; CPU copies keep the bytes on Metal too). A pass's draws through such an attachment are the device-gap row below. The runtime's choice: no pipeline differs (`compressed_blit.rs`). | `extended_range_blits = ExtendedRangeBlitPolicy::Kept` | `extended_range_blits = ExtendedRangeBlitPolicy::Canonical`: after a blit writes such a texture's region, or a blit out of one writes a buffer's words, a texture over a buffer's or another texture's, a compute dispatch (`bind::extended_canonical_module`, `extended_canonical.rs`) rewrites the texels it wrote in Metal's encoding: in place in a buffer's bytes, an image's through a scratch buffer, a copy out and back around the dispatch; a fill's texel is encoded before it is written. A buffer whose words the device cannot bind (an offset or pitch off 4 bytes, a region past `maxStorageBufferRange`) and a texture over a buffer whose rows share bytes keep the bytes under either value, announced | Bytes no Metal write left (uploaded, CPU-copied or kernel-written texels: a field's low six bits, an alpha code outside `[384, 894]`) keep what Metal's blit would rewrite; a texel reads the same value either way, its low six bits unread and its alpha read clamped. `ExtendedRangeBitsKept` (`extended-range-bits-kept`), once per device; under `Canonical` not for the blits it makes exact; `runtime_lane::compressed_blits` (both values on MoltenVK), the conformance cases `compressed-blits-bgra10xr` and `compressed-blits-bgra10xr-srgb` | Measured, `Canonical` against `Kept`, on `Private` `BGRA10_XR` textures Metal keeps compressed (the sRGB twin and fills not measured), 256x256 and 2048x2048, one whole-texture blit a command buffer: p50 of 300 blits a run, the two values interleaved in one process, three runs a host. RTX 5080 Laptop (NVIDIA 615.71.09, the command buffer's GPU time): a buffer into the texture 23.5 against 11.5 us and 761 against 244 us from a `Private` buffer, 42 against 30 us and 1,945 against 1,176 us from a `Shared` one; the texture into a `Private` buffer 14.1 against 11.2 us and 287 against 246 us, into a `Shared` one, whose words the dispatch rewrites in system memory, 66 against 27 us and 3,386 against 1,182 us; texture into texture 22.5 against 9.7 us and 630 against 80 us. Apple M3 Max (MoltenVK 1.4.2, whose GPU times are the host's, so per blit of 16 in one command buffer), the same blits: into the texture +38 to +57 us and +536 to +548 us, out of it into a buffer +15 us and +84 to +94 us, texture into texture +46 to +48 us and +535 to +541 us. Every figure is above its `Kept` one in every run, by more than the runs' spread (under 1 us on the 5080): measurable at both sizes on both hosts. Into an image a blit adds a copy out into a scratch buffer of the region's size, the dispatch, a copy back and the barriers between them; into a buffer the dispatch and a barrier. The scratch is made without zeros, since the copy out writes every byte the dispatch and the copy back read; the figures above were taken while it was zeroed first, by a command buffer of its own (a fill on the 5080, a copy on MoltenVK). CPU from the command buffer's making through its commit, a blit alone: +1 to +3 us on the M3 Max, +1 to +127 us on the 5080, whose host other builds loaded; 16 blits into 2048x2048 images in one command buffer hold 16 scratch buffers of 32 MiB, and encoding each costs 141 to 165 us (5080) and 286 to 356 us (M3 Max), new memory blocks among it, against 2 to 6 us under `Kept`. Nothing for a texture Metal keeps uncompressed or of another format |
--| A colour attachment of a texture's own image (not over a buffer's bytes, not memoryless, resolving nothing) that a pass stores `DontCare` is stored as the driver stores it: `DONT_CARE` on a driver measured to keep one of Metal's two answers or to store as Metal's own (`DriverFact::DontCareStoreIsOneOfMetals`, `DontCareStoreIsMetals`), else `STORE`, the rendered texels (`render_target.rs`). Metal's documentation leaves the contents open (`MTLStoreAction.dontCare`: "You need to assume that GPU discarded the texture's contents"); Apple's GPU leaves the texels the attachment held before the pass, the pass's clear and draws both gone (the conformance case `pass-sequence-color-actions`, an M3 Max under macOS 27.0.1, eight runs alike), or the rendered ones where its tiler overflows. A pass MoltenVK runs as one instance is handed to Metal's own `DontCare` under either value. | `dont_care_colors = DontCareColorPolicy::Driver` | `dont_care_colors = DontCareColorPolicy::Kept`: the pass renders through a backing its command queue keeps, one image of the attachment's shape, into which a `Load` copies the texels first, and nothing is copied back, so the texture keeps its earlier texels exactly (`kept_bytes.rs`, `WorkCounts::kept_texels_passes`); where a format makes no such image, the pass stores as under `Driver`, announced | Under `Driver`, the attachment holds the rendered texels (`STORE`: NVIDIA, lavapipe) or what the driver's `DONT_CARE` leaves (RADV, ANV: measured to be one of Metal's two answers), where Metal's holds the earlier texels unless its tiler overflows. `DontCareStore` (`dont-care-store`), once per device; under `Kept` not for the passes it keeps; `runtime_lane::dont_care_stores` (both values), the conformance case `pass-sequence-color-actions` | Measured, `Kept` against the same pass stored `Store`, one pass of one draw over an `RGBA8Unorm` texture a command buffer, commit to completion, the median of 300 interleaved (a scratch measurement, `rows3_cost`): RTX 5080 Laptop (NVIDIA 615.71.09), a `Load` pass 19 µs more at 1920x1080 and 10 µs at 256x256 (16 µs and 7 µs of GPU time), a `Clear` pass 3 µs; lavapipe (llvmpipe, LLVM 23.1.4), a `Load` pass 0.5 to 0.8 ms more at 1920x1080 and 30 µs at 256x256, a `Clear` pass within the runs' spread. Memory: one backing image of the attachment's shape per command queue |
-+| A colour attachment of a texture's own image (not over a buffer's bytes, not memoryless, resolving nothing) that a pass stores `DontCare` is stored as the driver stores it: `DONT_CARE` on a driver measured to keep one of Metal's two answers or to store as Metal's own (`DriverFact::DontCareStoreIsOneOfMetals`, `DontCareStoreIsMetals`), else `STORE`, the rendered texels (`render_target.rs`). Metal's documentation leaves the contents open (`MTLStoreAction.dontCare`: "You need to assume that GPU discarded the texture's contents"); Apple's GPU leaves the texels the attachment held before the pass, the pass's clear and draws both gone (the conformance case `pass-sequence-color-actions`, an M3 Max under macOS 27.0.1, eight runs alike), or the rendered ones where its tiler overflows. A pass MoltenVK runs as one instance is handed to Metal's own `DontCare` under either value. | `dont_care_colors = DontCareColorPolicy::Driver` | `dont_care_colors = DontCareColorPolicy::Kept`: the pass renders through a backing its command queue keeps, one image of the attachment's shape, into which a `Load` copies the texels first, and nothing is copied back, so the texture keeps its earlier texels exactly (`kept_bytes.rs`, `WorkCounts::kept_texels_passes`); where a format makes no such image, the pass stores as under `Driver`, announced | Under `Driver`, the attachment holds the rendered texels (`STORE`: NVIDIA, lavapipe) or what the driver's `DONT_CARE` leaves (RADV, ANV: measured to be one of Metal's two answers; Turnip on the Adreno 740: read in Mesa's source to be one, a pass in tile memory skipping the attachment's tile store and one in system memory leaving the stored texels), where Metal's holds the earlier texels unless its tiler overflows. `DontCareStore` (`dont-care-store`), once per device; under `Kept` not for the passes it keeps; `runtime_lane::dont_care_stores` (both values), the conformance case `pass-sequence-color-actions` | Measured, `Kept` against the same pass stored `Store`, one pass of one draw over an `RGBA8Unorm` texture a command buffer, commit to completion, the median of 300 interleaved (a scratch measurement, `rows3_cost`): RTX 5080 Laptop (NVIDIA 615.71.09), a `Load` pass 19 µs more at 1920x1080 and 10 µs at 256x256 (16 µs and 7 µs of GPU time), a `Clear` pass 3 µs; lavapipe (llvmpipe, LLVM 23.1.4), a `Load` pass 0.5 to 0.8 ms more at 1920x1080 and 30 µs at 256x256, a `Clear` pass within the runs' spread. Memory: one backing image of the attachment's shape per command queue |
- | A linear sample of a two-plane YCbCr texture whose planes a function reads in place (`YCBCR8_420_2P`, `YCBCR10_420_2P` through a uniform texel buffer over their codes, on an integrated GPU or a CPU device; `lower::sampler::in_place`), through a sampler that addresses no border on either plane axis, with no texel offset placed by a parent's size, is Vulkan's Y′CbCr model of the codes, as the device's own conversion with a linear chroma filter computes it: the four luma codes around the point and the four chroma pairs around the same point of the chroma plane (Metal's midpoint siting) blended bilinearly, then the surface's range and matrix (Metal's coefficients) in `float`, each channel clamped into `[0, 1]`: eight fetches. A runtime sampler's word decides as the function runs. A nearest sample, a border mode, a parent-placed offset and a gather are Metal's under either value. | `ycbcr_in_place_reads = YCbCrInPlacePolicy::Model` | `ycbcr_in_place_reads = YCbCrInPlacePolicy::Exact`: every tap Metal's texel (its chroma weighted 9/3/3/1 and rounded to a code, the fixed-point conversion), and the sample Metal's sum of the four taps' steps on the grid `2048`: twenty fetches and four conversions | The model reconstructs each channel at the point where Metal converts four taps and sums them: within the `float` arithmetic's rounding of the model (checked against an `f64` model on the CPU interpreter, `engine_ycbcr_in_place`), it differs from Metal's by the chroma the taps reconstruct, by Metal's roundings to a code and to `1/2048`, and where a tap's channel leaves `[0, 1]`, which Metal clamps before it sums. `HalfSampleFilter` / `FloatSampleFilter` under the bound converted 4:2:0 format, announced `ycbcr-filter-not-exact` | Radeon 780M (RADV): a 3840 x 2160 `YCBCR10_420_2P` frame sampled linearly into a 3840 x 2160 `BGRA8Unorm` target, GPU time per frame (median of 60): 6.4-6.9 ms under the exact form (`runtime_lane::video_frames`) |
- 
- All at once: `DevicePolicy::exact_answers()` sets every switch above; each row states its own cost.
-@@ -117,6 +118,11 @@ known. The rest of the differences are docs/API.md section 9's precision notes.
- 
- ## Costs of matching Metal
- 
-+Dynamically indexed constant tables larger than 4 KiB use the pipeline's shared constant
-+buffer. Smaller typed tables stay in private storage while they fit the private-memory limit.
-+Constant GEP and pointer-cast expressions retain their byte offsets in either representation.
-+This storage choice preserves values and avoids a private copy of a large table per invocation.
-+
- Where matching what Metal observably does costs time, the runtime matches it and the cost is
- recorded here.
- 
-@@ -286,6 +292,12 @@ recorded here.
-   times covering 1.5% or 12.5%, where both builds take the snapshot and the query is the difference
-   (on the Radeon 780M 0.55 to 0.71 and 1.04, on the RX 7900 XTX 0.90 to 0.91 and 1.04 to 1.05).
-   Other devices are not measured.
-+- **`host_page_textures = HostPageTexturePolicy::InPlaceWrites` holds a texture over host pages or
-+  padded rows in place whatever its usage, rendered and written too,** where the policy's default
-+  and `HostPageTexturePolicy::Shadow` take the shadow below. It trusts the driver: an image's first
-+  move and a pass's load and store must touch the texels alone, which Vulkan does not promise. A
-+  consumer sets it where its driver is known to, as Turnip with its linear host images; nothing
-+  checks it, and no copy in or merge back is paid.
- - **A texture over a no-copy buffer's host pages, or over a host-visible buffer longer than 32
-   MiB, that a shader writes of texels of a width the check stores none of (none of 1, 2, 4, 8 and
-   16 bytes; or whose class's check has not passed for an access of its, or whose format, usage or
 diff --git a/scripts/regen-spirv-grammar/items.txt b/scripts/regen-spirv-grammar/items.txt
 index f4222232b..9216f38c4 100644
 --- a/scripts/regen-spirv-grammar/items.txt
