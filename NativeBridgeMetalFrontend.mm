@@ -1661,6 +1661,20 @@ static std::string quartzCoreCallers();
 // no runtime handle: it is stitched from its bitcode (functionBitcode) and refused as a pipeline's own function.
 static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name);
 static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(const std::string &,int)> &visit);
+static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString *detail) {
+ const char *wanted = name.UTF8String;
+ bool found = false;
+ // Core Image can search several libraries for the same kernel. Keep a missing
+ // function distinguishable from a failure to specialize a function that exists.
+ if(wanted && forEachLibraryEntry(library,[&](const std::string &entry,int) {
+  found = entry == wanted;
+  return !found;
+ }) && !found) {
+  return [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFunctionNotFound
+                         userInfo:@{NSLocalizedDescriptionKey:detail}];
+ }
+ return nbError(detail);
+}
 @implementation NBLibrary
 - (void)dealloc {DetailSpan timing(9,(uintptr_t)_handle);nmb_library_release(_handle);}
 - (id<MTLFunction>)newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values error:(NSError **)error {
@@ -1706,7 +1720,8 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  }
  if(!handle){
   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
-  if(error)*error=nbError([NSString stringWithFormat:@"specialized function: %@",lastError()]);return nil;
+  if(error)*error=functionLookupError(self,name,[NSString stringWithFormat:@"specialized function: %@",lastError()]);
+  return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.constantsText=text;function.library=self;function.constantValues=snapshot;if(error)*error=nil;return (id<MTLFunction>)function;
@@ -1720,7 +1735,10 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)d error:(NSError **)error {
  if(!d.name){if(error)*error=nbError(@"a function name is required");return nil;}
  NBFunction *function=(NBFunction *)(d.constantValues?[self newFunctionWithName:d.name constantValues:d.constantValues error:error]:[self newFunctionWithName:d.name]);
- if(!function){if(error && !d.constantValues)*error=nbError([NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);return nil;}
+ if(!function){
+  if(error && !d.constantValues)*error=functionLookupError(self,d.name,[NSString stringWithFormat:@"function %@: %@",d.name,lastError()]);
+  return nil;
+ }
  if(d.specializedName) {
   if(function.handle && !nmb_function_set_specialized_name(function.handle,d.specializedName.UTF8String)) {
    if(error)*error=nbError(lastError());return nil;
