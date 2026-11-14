@@ -876,7 +876,7 @@ static NSData *compileMetalSource(NSString *source,NSString *arguments,NSString 
  memcpy(request.data()+16,text.bytes,text.length);memcpy(request.data()+16+sourceBytes,options,optionBytes);
  return codeGenRequest(13,request,warnings,failure);
 }
-// The front end's arguments for a set of compile options, as Metal passes them: the language version, fast math (Metal's default),
+// The front end's arguments for a set of compile options, as Metal passes them: the language version, math mode and FP32 functions,
 // invariance, size optimization and the preprocessor macros; module caches in this process's temporary directory, which a sandboxed
 // client may write.
 static NSString *compileArgument(NSString *text) {
@@ -889,8 +889,26 @@ static NSString *compileArguments(MTLCompileOptions *options) {
  const NSUInteger version=options && options.languageVersion?(NSUInteger)options.languageVersion:(NSUInteger)MTLLanguageVersion3_1;
  const unsigned major=(unsigned)(version>>16),minor=(unsigned)(version&0xffff);
  [arguments addObject:[NSString stringWithFormat:major>=3?@"-std=metal%u.%u":@"-std=ios-metal%u.%u",major,minor]];
- const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
- [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ const SEL modeSelector=sel_registerName("mathMode"),functionsSelector=sel_registerName("mathFloatingPointFunctions");
+ NSString *modeName=nil,*functionsName=nil;
+ if([options respondsToSelector:modeSelector] && [options respondsToSelector:functionsSelector]) {
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,modeSelector)) {
+   case MTLMathModeSafe:modeName=@"safe";break;
+   case MTLMathModeRelaxed:modeName=@"relaxed";break;
+   case MTLMathModeFast:modeName=@"fast";break;
+  }
+  switch(((NSInteger (*)(id,SEL))objc_msgSend)(options,functionsSelector)) {
+   case MTLMathFloatingPointFunctionsFast:functionsName=@"fast";break;
+   case MTLMathFloatingPointFunctionsPrecise:functionsName=@"precise";break;
+  }
+ }
+ if(modeName && functionsName) {
+  [arguments addObject:[@"-fmetal-math-mode=" stringByAppendingString:modeName]];
+  [arguments addObject:[@"-fmetal-math-fp32-functions=" stringByAppendingString:functionsName]];
+ } else {
+  const BOOL fast=options?((BOOL (*)(id,SEL))objc_msgSend)(options,sel_registerName("fastMathEnabled")):YES;
+  [arguments addObject:fast?@"-ffast-math":@"-fno-fast-math"];
+ }
  if(options.preserveInvariance)[arguments addObject:@"-fpreserve-invariance"];
  if(options.optimizationLevel==MTLLibraryOptimizationLevelSize)[arguments addObject:@"-Os"];
  [options.preprocessorMacros enumerateKeysAndObjectsUsingBlock:^(NSString *name,NSObject *value,BOOL *) {
