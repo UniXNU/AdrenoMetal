@@ -6,6 +6,8 @@ The frontend uses metal2vulkan and Turnip with the kernel GPU interface and sele
 
 All clients use single-sample rendering by default. `NATIVE_METAL_SINGLE_SAMPLE=0` preserves a process's requested sample counts; `1` forces single-sample rendering. Texture types, pipeline sample counts and resolve outputs follow the selected policy. Same-user clients share writable shader caches. Resource aliasing, swizzles, range copies, function constants, specialized link names and allocation queries reach the runtime. Queue priorities aggregate current live requests without a process-name policy.
 
+Function lookup returns `MTLLibraryErrorFunctionNotFound` when the requested name is absent from the library.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno-metal). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Memory reuse
