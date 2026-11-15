@@ -19,11 +19,14 @@ def main():
     raw_sequence = 0
     for path in args.logs:
         for line in path.read_text(errors='replace').splitlines():
+            if line.startswith('native-metal dump '):
+                raw_sequence += 1
+                entries['stderr', 0, raw_sequence] = (1, {1: line})
+                continue
+            if 'NativeAdrenoMetal CB dump ' not in line:
+                continue
             match = pattern.search(line)
             if not match:
-                if line.startswith('native-metal dump '):
-                    raw_sequence += 1
-                    entries['stderr', 0, raw_sequence] = (1, {1: line})
                 continue
             process, pid, sequence, part, count, text = match.groups()
             key = process, int(pid), int(sequence)
