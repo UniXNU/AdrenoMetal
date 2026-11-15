@@ -50,6 +50,8 @@ MSL source compilation passes `mathMode` (safe, relaxed or fast) and `mathFloati
 
 ## Shader caches and priming
 
+Function reflection exposes vertex and stage-input attributes with their indices, data types and activity. Priming uses reflected constants and vertex inputs, and selects executable entry points from container stage tags. Apple GPU machine-code archives are listed separately from AIR inputs. Successful checkpoints retain their translator and driver identity; refused checkpoints include the primer input revision.
+
 Each process keeps its pipeline cache in the first directory its sandbox lets it write: the same-user shared directory, then Metal's own cache directory. Compiler replies for source and stitched libraries are kept beside it. A cache entry's access time is refreshed on a hit until the platform refuses the change once.
 
 The render server primes Metal libraries in the background while it draws nothing. On macOS any command buffer in the last quarter second counts as drawing. The build embeds a library inventory from the OS, SystemOS and App images. `prime.log` records the boot session, build and scope (`1` loaded bundles, `2` whole system); `complete=1` requires a valid inventory and every eligible library completed successfully. A planned reboot places `prime-resume` in the cache directory so the next pass retries its interrupted function and keeps completed checkpoints.
