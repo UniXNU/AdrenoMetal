@@ -2585,12 +2585,14 @@ static uint64_t encodeCommandOf(id object) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
- if(texture && stage==0 && (texture.usage&MTLTextureUsageShaderWrite) && dumpMaybe(_commandBuffer)) {
+ const bool captureInput=stage==2 && getenv("NATIVE_METAL_DUMP_INPUTS")!=nullptr;
+ if(texture && ((stage==0 && (texture.usage&MTLTextureUsageShaderWrite)) || captureInput) && dumpMaybe(_commandBuffer)) {
   if(!_dumpEntries)_dumpEntries=[NSMutableArray array];
   if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
   const NSUInteger before=_commandBuffer.dumpTargets.count;
   dumpNote(_commandBuffer,_commandBuffer.dumpTargets,texture,0,0,
-           [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
+           captureInput?[NSString stringWithFormat:@"pass %u input texture %lu",_commandBuffer.dumpPasses,(unsigned long)index]:
+                        [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
  if(texture){[_commandBuffer own:texture];}
