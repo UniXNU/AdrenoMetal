@@ -102,6 +102,9 @@ fn execute(loader: &CStr, cache: &CStr, mode: &str) -> Result<bool> {
     let validation_errors = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let errors = validation_errors.clone();
     options.messages = Some(MessageSink::new(move |m| {
+        if m.id_name.ends_with("device-recovered") {
+            fatal_gpu("Vulkan device recovered during acceptance");
+        }
         if m.severity >= MessageSeverity::Error {
             errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -476,6 +479,7 @@ fn fatal_gpu(why: &str) -> ! {
 
 struct Native<'a> {
     device: &'a Device,
+    owner: vk::Device,
     pool: vk::CommandPool,
     commands: [vk::CommandBuffer; 2],
     queries: vk::QueryPool,
@@ -501,7 +505,13 @@ impl<'a> Native<'a> {
         unsafe {
             let raw = device.raw();
             let vk = raw.device;
-            let family = queue.with_vk_queue(|_, _, f| f);
+            let owner = vk.handle();
+            let family = queue.with_vk_queue(|d, _, f| {
+                if d.handle() != owner {
+                    fatal_gpu("Vulkan device changed before native setup");
+                }
+                f
+            });
             let families = raw
                 .instance
                 .get_physical_device_queue_family_properties(raw.physical_device);
@@ -693,6 +703,7 @@ impl<'a> Native<'a> {
             }
             Ok(Self {
                 device,
+                owner,
                 pool,
                 commands,
                 queries,
@@ -712,9 +723,15 @@ impl<'a> Native<'a> {
         unsafe {
             let raw = self.device.raw();
             let vk = raw.device;
+            if vk.handle() != self.owner {
+                fatal_gpu("Vulkan device changed during native calibration");
+            }
             vk.reset_fences(&[self.fence]).map_err(err)?;
             queue
                 .with_vk_queue(|d, q, _| {
+                    if d.handle() != self.owner {
+                        fatal_gpu("Vulkan queue changed during native calibration");
+                    }
                     d.queue_submit(
                         q,
                         &[vk::SubmitInfo::default()
@@ -748,6 +765,9 @@ impl Drop for Native<'_> {
         unsafe {
             let raw = self.device.raw();
             let vk = raw.device;
+            if vk.handle() != self.owner {
+                fatal_gpu("Vulkan device changed during native calibration");
+            }
             vk.destroy_pipeline(self.pipeline, None);
             vk.destroy_shader_module(self.module, None);
             vk.destroy_descriptor_pool(self.descriptors, None);
