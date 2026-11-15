@@ -580,7 +580,7 @@ static bool isRenderServer() {return nativeIsRenderServer();}
 static void endRenderServerAfterGpuLoss() {
  static std::atomic<bool> ending{false};
  if(!isRenderServer() || ending.exchange(true))return;
- NBLOG(@"native-metal: the render server's GPU context is lost; ending backboardd so launchd starts it again");
+ NBLOG(@"native-metal: the render server's GPU context is lost; ending %s so launchd starts it again",NATIVE_RENDER_SERVER);
  dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(500*NSEC_PER_MSEC)),dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE,0),^{
   kill(getpid(),SIGTERM);
  });
@@ -3292,6 +3292,8 @@ static char kUserDictionaryKey;
 - (void)setProtectionOptions:(uint64_t)options {if(options)[self refuse:[NSString stringWithFormat:@"protection options 0x%llx",options]];}
 - (void)refuse:(NSString *)what {
  if(!self.encodeFailure){self.encodeFailure=what;NBLOG(@"native-metal: command buffer refused: %@",what);}
+ // Recovery creates a new runtime device; launchd restarts a render server whose retained objects belong to the previous device.
+ if([what rangeOfString:@"MadeBeforeRecovery"].location!=NSNotFound)endRenderServerAfterGpuLoss();
 }
 - (MTLCommandBufferStatus)status {
  if(self.failedLocally)return MTLCommandBufferStatusError;
