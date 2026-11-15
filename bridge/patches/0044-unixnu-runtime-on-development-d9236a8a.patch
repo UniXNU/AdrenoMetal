@@ -3274,7 +3274,7 @@ index 000000000..964ef7561
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index 899b85a14..2b06d75d4 100644
+index 899b85a14..bb0c0050a 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -208,7 +208,8 @@ mod ycbcr_image;
@@ -3296,11 +3296,11 @@ index 899b85a14..2b06d75d4 100644
 +                    TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC,
 +                );
 +                let holds = match holds {
-+                    Err(_) if policy == HostPageTexturePolicy::InPlaceWrites
++                    Err(_) if policy == metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites
 +                        && texels.layout.shared_bytes() == 0
 +                        && (!writes || super::linear_plan::tile_store_fits(
 +                            &texels.layout, u64::from(layout.extent[0]), texels.buffer.length(),
-+                        )) => Ok(()),
++                        )) => Ok(super::linear_plan::Between::Unobserved),
 +                    holds => holds,
 +                };
                  let over = (&*texels, &holds, usage);
