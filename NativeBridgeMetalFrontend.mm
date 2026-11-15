@@ -2221,6 +2221,8 @@ static NSString *dumpWords(const uint8_t *p,size_t n) {
  static const size_t words=[]{const char *v=getenv("NATIVE_METAL_DUMP_WORDS");return v && atoi(v)>0?size_t(atoi(v)):size_t(16);}();
  NSMutableString *s=[NSMutableString string];
  for(size_t i=0;i<std::min<size_t>(n/4,words);i++){float f;memcpy(&f,p+4*i,4);[s appendFormat:@" %.4g",f];}
+ [s appendString:@" hex"];
+ for(size_t i=0;i<std::min<size_t>(n/4,words);i++){uint32_t v;memcpy(&v,p+4*i,4);[s appendFormat:@" %08x",v];}
  size_t zero=0,nan=0;const size_t all=std::min<size_t>(n/4,256);
  for(size_t i=0;i<all;i++){uint32_t w;memcpy(&w,p+4*i,4);float f;memcpy(&f,&w,4);zero+=!w;nan+=std::isnan(f);}
  [s appendFormat:@" (of %zu words %zu zero, %zu NaN)",all,zero,nan];
@@ -3121,6 +3123,25 @@ static void dumpWrite(const char *format,...) {
  }
  free(text);
 }
+static void dumpShaderFunction(NBFunction *function) {
+ static NSArray<NSString *> *wanted=[]{
+  const char *value=getenv("NATIVE_METAL_DUMP_FUNCTIONS");
+  return value?[@(value) componentsSeparatedByString:@","]:@[];
+ }();
+ NSString *name=function.sourceName?:function.name;
+ bool selected=false;
+ for(NSString *prefix in wanted)if(prefix.length && ([prefix isEqualToString:@"all"] || [name containsString:prefix])){selected=true;break;}
+ if(!selected)return;
+ static std::mutex lock;static std::unordered_set<std::string> seen;static uint64_t sequence;
+ const std::string key=std::to_string((uintptr_t)function.library.bytes)+":"+(name.UTF8String?:"");
+ uint64_t entry;
+ {std::lock_guard<std::mutex> guard(lock);if(!seen.insert(key).second)return;entry=++sequence;}
+ NSData *data=functionBitcode(function);
+ if(!data.length || data.length>512*1024){dumpWrite("native-metal dump function %llu %s: unavailable (%lu bytes)\n",
+     (unsigned long long)entry,name.UTF8String,(unsigned long)data.length);return;}
+ NSString *encoded=[data base64EncodedStringWithOptions:0];
+ dumpWrite("native-metal dump function %llu %s: %s\n",(unsigned long long)entry,name.UTF8String,encoded.UTF8String);
+}
 static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  NSDictionary *t=read[@"target"];NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
  NSString *encoder=t[@"encoder"];
@@ -3982,6 +4003,14 @@ static bool renderDescriptor(MTLRenderPipelineDescriptor *d,NBRenderDescriptor *
 // NATIVE_METAL_DUMP_CB: a render pipeline's functions, color formats (b blends, m its write mask), depth format and vertex layout
 // (attribute=format@offset/buffer, layout=stride/step/rate), for its draws' lines.
 static NSString *renderDumpInfo(MTLRenderPipelineDescriptor *d) {
+ if(dumpRange().first) {
+  NBFunction *vertex=[(id)d.vertexFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.vertexFunction:nil;
+  NBFunction *fragment=[(id)d.fragmentFunction isKindOfClass:[NBFunction class]]?(NBFunction *)d.fragmentFunction:nil;
+  dumpWrite("native-metal dump pipeline %s | v %s source %s %s | f %s source %s %s\n",d.label.UTF8String?:"-",
+      vertex.name.UTF8String?:"-",vertex.sourceName.UTF8String?:"-",vertex?vertex.constantsText.c_str():"",
+      fragment.name.UTF8String?:"-",fragment.sourceName.UTF8String?:"-",fragment?fragment.constantsText.c_str():"");
+  if(vertex)dumpShaderFunction(vertex);if(fragment)dumpShaderFunction(fragment);
+ }
  NSMutableString *s=[NSMutableString stringWithFormat:@"%@ v=%@ f=%@",d.label?:@"-",d.vertexFunction.name?:@"-",d.fragmentFunction.name?:@"-"];
  for(unsigned i=0;i<8;i++) {
   MTLRenderPipelineColorAttachmentDescriptor *a=d.colorAttachments[i];if(a.pixelFormat==MTLPixelFormatInvalid)continue;

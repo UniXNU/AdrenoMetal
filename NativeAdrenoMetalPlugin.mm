@@ -412,6 +412,9 @@ static id deviceForPort(unsigned port) {
                         setenv("NATIVE_METAL_DUMP_CB", range, 0);
                         setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
                         setenv("NATIVE_METAL_DUMP_PASS", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_DRAWS", "1:64", 0);
+                        setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
+                        setenv("NATIVE_METAL_DUMP_FUNCTIONS", "alpha_effect,accumulator_color,stroke_lines,plane_color", 0);
                     }
                 }
         }
