@@ -2141,7 +2141,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NSMutableArray *dumpPassReads;
 @property(nonatomic) uint64_t dumpAppIndex;
 @property(nonatomic) uint32_t dumpPasses,dumpKernels;
-@property(nonatomic) BOOL dumpReadback;
+@property(nonatomic) BOOL dumpReadback,dumpCapture;
 @property(nonatomic,strong) NBTexture *wallpaperOutput;
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
@@ -2198,8 +2198,12 @@ static std::pair<uint32_t,uint32_t> dumpRange() {
 static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
  const auto range=dumpRange();
  if(!range.first || commandBuffer.dumpReadback)return false;
+ if(commandBuffer.dumpCapture)return true;
  const uint64_t next=gAppCommits.load()+1;
- return next+16>=range.first && next<(uint64_t)range.first+range.second;
+ const bool capture=next+16>=range.first && next<(uint64_t)range.first+range.second;
+ // Keep a selected buffer's complete encoding when other buffers commit before it.
+ if(capture)commandBuffer.dumpCapture=YES;
+ return capture;
 }
 static bool dumpAtPassEnd() {
  static const bool enabled=getenv("NATIVE_METAL_DUMP_PASS")!=nullptr;
