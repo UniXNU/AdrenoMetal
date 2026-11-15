@@ -65,7 +65,7 @@ int main(int argc,char **argv) {@autoreleasepool {
   CHECK(placed && placed.heap==storage && placed.allowGPUOptimizedContents==optimized);
   CHECK(placed.allocatedSize<=storage.size);
   auto alias=[placed newTextureViewWithPixelFormat:placed.pixelFormat];CHECK(alias && alias.allowGPUOptimizedContents==optimized);
-  auto overflow=[storage newTextureWithDescriptor:layout offset:footprint.align];CHECK(!overflow);
+  auto overflow=[storage newTextureWithDescriptor:layout offset:storage.size];CHECK(!overflow);
  }
  // Zero is a real swizzle, not a marker for the identity.
  td.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleZero);
