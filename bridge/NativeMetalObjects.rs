@@ -35,16 +35,39 @@ thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-pub(crate) fn set_error(why: String) {
-    // A refusal on a lost device names the place in the runtime that first recorded the loss.
-    let why = match metal2vulkan_runtime::Device::lost_at() {
+fn loss_description(why: String, origin: Option<(&str, u32)>) -> String {
+    match origin {
         // The place within the runtime's sources, not the build tree's path before them.
-        Some((file, line)) if why.contains("DeviceLost") => {
+        Some((file, line)) if ["DeviceLost", "GpuRecoveryVictim", "MadeBeforeRecovery"].iter().any(|name| why.contains(name)) => {
             let file = file.rfind("/src/").map_or(file, |at| &file[at + 5..]);
-            format!("{why} (lost at {file}:{line})")
+            format!("{why} (first process loss at {file}:{line})")
         }
         _ => why,
-    };
+    }
+}
+
+#[cfg(test)]
+mod loss_description_tests {
+    use super::loss_description;
+
+    #[test]
+    fn victims_keep_the_first_process_loss_origin() {
+        for error in ["DeviceLost", "GpuRecoveryVictim", "NotImplemented(MadeBeforeRecovery)"] {
+            let text = loss_description(error.into(), Some(("/build/runtime/src/device/submit.rs", 70)));
+            assert_eq!(text, format!("{error} (first process loss at device/submit.rs:70)"));
+        }
+    }
+
+    #[test]
+    fn ordinary_errors_and_missing_origins_stay_unchanged() {
+        assert_eq!(loss_description("OutOfMemory".into(), Some(("device.rs", 1))), "OutOfMemory");
+        assert_eq!(loss_description("DeviceLost".into(), None), "DeviceLost");
+        assert_eq!(loss_description(String::new(), Some(("device.rs", 1))), "");
+    }
+}
+
+pub(crate) fn set_error(why: String) {
+    let why = loss_description(why, Device::lost_at());
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -2880,7 +2903,7 @@ pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuff
     guard(0, || {
         let cb = &get(command_buffer)?.0;
         let description = cb.error_description().or_else(|| cb.error().map(|error| format!("{error:?}")));
-        Ok(description.map_or(0, |text| copy_out(&text, out, size)))
+        Ok(description.map_or(0, |text| copy_out(&loss_description(text, Device::lost_at()), out, size)))
     })
 }
 

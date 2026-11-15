@@ -16,6 +16,10 @@ that layout through the frontend and runtime.
 
 Function lookup returns `MTLLibraryErrorFunctionNotFound` when the requested name is absent from the library.
 
+Device-loss and recovery-victim errors include the first loss location recorded by
+the runtime in that process. Correlate it with Turnip and kernel recovery logs to
+distinguish a logical-device failure from a hardware reset.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno-metal). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Native half arithmetic
