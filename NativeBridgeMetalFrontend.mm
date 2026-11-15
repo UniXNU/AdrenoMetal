@@ -4290,10 +4290,11 @@ static char dvmMemoryReleaseKey;
   NSString *why=lastError();
   uint64_t answer[2]={0,0};
   (void)nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer);
-  GLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx",why,
+  GLOG(@"native-metal: heap texture refused: %@ | fmt %lu %lux%lu L%lu type %lu needs %#llx@%#llx heap %#lx used %#lx room %#lx usage %#lx options %#lx optimized %d descriptor %p",why,
         (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
         (unsigned long)_heapType,(unsigned long long)answer[0],(unsigned long long)answer[1],(unsigned long)nmb_heap_size(_handle),
-        (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1));
+        (unsigned long)nmb_heap_used_size(_handle),(unsigned long)nmb_heap_max_available_size(_handle,answer[1]?answer[1]:1),
+        (unsigned long)d.usage,(unsigned long)d.resourceOptions,(int)d.allowGPUOptimizedContents,d);
   if(offset!=UINT64_MAX)return nil;
   handle=nmb_texture_new(gDevice,&descriptor);
   if(!handle){NBLOG(@"native-metal: texture (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());return nil;}
@@ -4502,6 +4503,13 @@ static void fillBaseLimits(id device);
  NmbTextureDescriptor descriptor;uint64_t answer[2]={0,0};
  if(textureDescriptor(d,&descriptor)&&!nmb_device_heap_texture_size_and_align(gDevice,&descriptor,answer))
   NBLOG(@"native-metal: heap texture size (fmt %lu %lux%lu, %lu levels) refused: %@",(unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,lastError());
+ if(iconMetalTrace()) {
+  static std::atomic<unsigned> queries{0};
+  if(queries.fetch_add(1)<64)GLOG(@"native-metal: heap query fmt %lu %lux%lu L%lu usage %#lx options %#lx optimized %d -> %#llx@%#llx descriptor %p",
+      (unsigned long)d.pixelFormat,(unsigned long)d.width,(unsigned long)d.height,(unsigned long)d.mipmapLevelCount,
+      (unsigned long)d.usage,(unsigned long)d.resourceOptions,(int)d.allowGPUOptimizedContents,
+      (unsigned long long)answer[0],(unsigned long long)answer[1],d);
+ }
  return (MTLSizeAndAlign){answer[0],answer[1]};
 }
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
