@@ -79,7 +79,7 @@ With `diag=1`, the render server sends its telemetry table to the kernel log (`[
 
 ## Frame diagnostics
 
-With `diag=1`, the cache directory also contains `timing.log` (512 KiB) and `runtime-policy.log` (256 KiB). Timing lines contain boot, component, runtime and monotonic `uptime_us` identifiers. Encoder summaries are written every five seconds; command buffers taking at least 8 ms include encoder details. The policy log records actual Vulkan identity, float capabilities and submission, queue-switch and in-place checks.
+With `diag=1`, the cache directory also contains `timing.log` (512 KiB) and `runtime-policy.log` (64 KiB). Timing lines contain boot, component, runtime and monotonic `uptime_us` identifiers. Encoder summaries are written every five seconds; command buffers taking at least 8 ms include encoder details. The policy log records actual Vulkan identity, float capabilities and submission, queue-switch and in-place checks.
 
 With `gpu-trace=1`, the render server writes command phases, encoding batches, attachments and Turnip pass timings to its frame trace. Kernel event 63 identifies the render, encode and completion threads. In `iconservicesagent`, event 65 records the Metal device and queue, then up to eight completed command buffers containing draws or dispatches. Each work record includes the command buffer status and draw and dispatch counts. [GPU frame diagnostics](https://unixnu.com/porting/gpu-diagnostics)
 
