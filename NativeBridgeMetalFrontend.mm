@@ -1621,7 +1621,8 @@ static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) 
  if(length<8 || memcmp(file,"\xca\xfe\xba\xbe",4))return;
  auto word=[&](size_t at) {return ((uint32_t)file[at]<<24)|((uint32_t)file[at+1]<<16)|((uint32_t)file[at+2]<<8)|file[at+3];};
  const uint32_t count=word(4);
- for(uint32_t i=0;i<count && i<16;i++) {
+ if(count>(length-8)/20)return;
+ for(uint32_t i=0;i<count;i++) {
   const size_t at=8+20*(size_t)i;if(at>length || length-at<20)return;
   if(word(at)!=0x01000017)continue;
   const size_t offset=word(at+8),size=word(at+12);

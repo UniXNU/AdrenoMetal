@@ -210,6 +210,26 @@ static bool libraryOfDriverBundle(const std::string &path) {
     const char *slash = strchr(plain + sizeof kExtensions - 1, '/');
     return slash && slash - plain > 7 && strncmp(slash - 7, ".bundle", 7) == 0;
 }
+// A universal archive whose slices all contain Apple GPU machine code.
+static bool appleGpuArchive(const std::string &path) {
+    FILE *file = fopen(path.c_str(), "rb");
+    if (!file) return false;
+    struct stat st = {};
+    uint8_t header[8];
+    auto word = [](const uint8_t *p) {return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];};
+    bool archive = fstat(fileno(file), &st) == 0 && fread(header, 1, sizeof header, file) == sizeof header &&
+                   !memcmp(header, "\xca\xfe\xba\xbe", 4);
+    const uint32_t count = archive ? word(header + 4) : 0;
+    archive = archive && count && st.st_size >= 8 && count <= (uint64_t)(st.st_size - 8) / 20;
+    for (uint32_t i = 0; archive && i < count; ++i) {
+        uint8_t slice[20];
+        if (fread(slice, 1, sizeof slice, file) != sizeof slice) {archive = false; break;}
+        const uint64_t offset = word(slice + 8), size = word(slice + 12);
+        archive = word(slice) == 0x01000013 && size && offset <= (uint64_t)st.st_size && size <= (uint64_t)st.st_size - offset;
+    }
+    fclose(file);
+    return archive;
+}
 #endif
 
 extern "C" const char *nmb_runtime_build(void);
@@ -458,9 +478,16 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     const unsigned scope = 2;
 #endif
     appendLine(logPath, note + " inputs=3 boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
+    std::set<std::string> binaryArchives;
+#if TARGET_OS_OSX
+    if (wholeSystem) for (const std::string &path : paths) if (appleGpuArchive(path)) {
+        binaryArchives.insert(path);
+        appendLine(logPath, "archive " + path + " cpu=0x01000013");
+    }
+#endif
     auto selected = [&](const std::string &path) {
 #if TARGET_OS_OSX
-        return wholeSystem ? !libraryOfDriverBundle(path) : libraryOfLoadedBundle(path);
+        return wholeSystem ? !libraryOfDriverBundle(path) && !binaryArchives.count(path) : libraryOfLoadedBundle(path);
 #else
         (void)path;
         (void)wholeSystem;
@@ -499,9 +526,9 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_compiling = 0;
     native_prime_pass_complete = eligible && finished == eligible && !native_prime_libraries_failed && !native_prime_inventory_failed ? 1 : 2;
     char line[512];
-    snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s inputs=3 libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
+    snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s inputs=3 libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u binary=%zu complete=%u ms=%llu",
              boot.c_str(), scope, build.c_str(), libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
-             native_prime_inventory_failed, foreign, native_prime_pass_complete, (unsigned long long)(nowMs() - began));
+             native_prime_inventory_failed, foreign, binaryArchives.size(), native_prime_pass_complete, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
 }
 }  // namespace prime

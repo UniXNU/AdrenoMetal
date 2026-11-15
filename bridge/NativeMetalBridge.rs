@@ -238,7 +238,8 @@ pub fn air_slice(bytes: &[u8]) -> Option<&[u8]> {
         return Some(bytes);
     }
     let count = word(4)? as usize;
-    for i in 0..count.min(16) {
+    if count > (bytes.len() - 8) / 20 { return None; }
+    for i in 0..count {
         let at = 8 + 20 * i;
         if word(at)? == AIR64 {
             let (offset, size) = (word(at + 8)? as usize, word(at + 12)? as usize);
