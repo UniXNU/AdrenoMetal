@@ -403,8 +403,9 @@ static id deviceForPort(unsigned port) {
             size_t size = sizeof args - 1;
             if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
                 if (const char *at = bootArgToken(args, "icon-cb=")) {
-                    unsigned first = 0, count = 0;
-                    if (sscanf(at + strlen("icon-cb="), "%u:%u", &first, &count) == 2 && first && count && count <= 32) {
+                    unsigned first = 0, count = 0, pass = 0, skipFirst = 0, skipLast = 0;
+                    const int fields = sscanf(at + strlen("icon-cb="), "%u:%u:%u:%u:%u", &first, &count, &pass, &skipFirst, &skipLast);
+                    if ((fields == 2 || fields == 5) && first && count && count <= 32) {
                         char range[32];snprintf(range, sizeof range, "%u:%u", first, count);
                         setenv("NATIVE_METAL_DUMP_CB", range, 0);
                         setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
@@ -413,6 +414,10 @@ static id deviceForPort(unsigned port) {
                         setenv("NATIVE_METAL_DUMP_DRAWS", "1:64", 0);
                         setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
                         setenv("NATIVE_METAL_DUMP_FUNCTIONS", "alpha_effect,accumulator_color,stroke_lines,plane_color", 0);
+                        if (fields == 5 && pass && skipFirst && skipLast >= skipFirst) {
+                            char skip[48];snprintf(skip, sizeof skip, "%u:%u:%u", pass, skipFirst, skipLast);
+                            setenv("NATIVE_METAL_SKIP_DRAWS", skip, 0);
+                        }
                     }
                 }
         }
