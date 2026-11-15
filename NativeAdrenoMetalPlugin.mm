@@ -647,7 +647,7 @@ static id deviceForPort(unsigned port) {
         // The translator recurses deeply on large functions: give it the stack of a main thread.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
-        pthread_create(&primer, &attributes, [](void *) -> void * {
+        if (!bootArgSet("gpu-prime=0")) pthread_create(&primer, &attributes, [](void *) -> void * {
                 pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
                 char list[1024];
                 prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
