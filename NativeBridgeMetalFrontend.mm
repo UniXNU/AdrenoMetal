@@ -3114,6 +3114,29 @@ static void dumpWrite(const char *format,...) {
  const int length=vasprintf(&text,format,args);va_end(args);
  if(length<0 || !text)return;
  fwrite(text,1,(size_t)length,stderr);
+ static const bool file=getenv("NATIVE_METAL_DUMP_FILE")!=nullptr;
+ if(file && !gCacheRoot.empty()) {
+  static std::mutex lock;
+  static int fd=-1;
+  static size_t written=0;
+  static bool stopped=false;
+  std::lock_guard<std::mutex> hold(lock);
+  if(!stopped) {
+   if(fd<0)fd=open((gCacheRoot+"/command-buffer.log").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOFOLLOW,0600);
+   constexpr size_t limit=2*1024*1024;
+   const char capped[]="native-metal dump capture limit reached\n";
+   const bool fits=(size_t)length<=limit-sizeof capped-written;
+   const char *data=fits?text:capped;
+   size_t left=fits?(size_t)length:sizeof capped-1;
+   while(fd>=0 && left) {
+    const ssize_t n=write(fd,data,left);
+    if(n<0 && errno==EINTR)continue;
+    if(n<=0){close(fd);fd=-1;stopped=true;break;}
+    written+=(size_t)n;data+=n;left-=(size_t)n;
+   }
+   if(!fits && fd>=0){close(fd);fd=-1;stopped=true;}
+  }
+ }
  static const bool unified=[]{const char *value=getenv("NATIVE_METAL_DUMP_LOG");return value && !strcmp(value,"1");}();
  if(unified) {
   static std::atomic<uint64_t> sequence;

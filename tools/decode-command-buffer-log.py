@@ -48,6 +48,9 @@ def main():
             print(f'{process}[{pid}] entry {sequence}: missing fragments {sorted(missing)}', file=sys.stderr)
             continue
         text = ''.join(chunks[part] for part in range(1, count + 1))
+        if text.strip() == 'native-metal dump capture limit reached':
+            incomplete += 1
+            print('command-buffer capture reached its file limit', file=sys.stderr)
         function = re.fullmatch(r'native-metal dump function (\d+) (\S+): (.*)', text)
         if function and args.functions:
             index, name, encoded = function.groups()

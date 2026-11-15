@@ -408,6 +408,7 @@ static id deviceForPort(unsigned port) {
                         char range[32];snprintf(range, sizeof range, "%u:%u", first, count);
                         setenv("NATIVE_METAL_DUMP_CB", range, 0);
                         setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_FILE", "1", 0);
                         setenv("NATIVE_METAL_DUMP_PASS", "1", 0);
                         setenv("NATIVE_METAL_DUMP_DRAWS", "1:64", 0);
                         setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
