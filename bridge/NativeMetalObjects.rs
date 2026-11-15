@@ -1962,6 +1962,28 @@ pub extern "C" fn nmb_function_type(function: *const NmbFunction) -> u64 {
     guard(0, || Ok(get(function)?.0.function_type().map_err(e("function type"))?.as_raw() as u64))
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_attribute_count(function: *const NmbFunction) -> i32 {
+    guard(-1, || Ok(get(function)?.0.stage_input_attributes().map_err(e("function attributes"))?.map_or(0, |a| a.len() as i32)))
+}
+
+/// # Safety
+/// `name` has `capacity` writable bytes and `facts` holds five writable words.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_attribute_at(function: *const NmbFunction, at: u32, name: *mut c_char,
+                                                capacity: usize, facts: *mut u64) -> usize {
+    guard(0, || {
+        let attributes = get(function)?.0.stage_input_attributes().map_err(e("function attributes"))?.unwrap_or_default();
+        let a = attributes.get(at as usize).ok_or("function attribute index")?;
+        if facts.is_null() { return Err("null attribute facts".into()); }
+        let values = [a.attribute_index() as u64, a.attribute_type().as_raw() as u64, a.is_active() as u64,
+                      a.is_patch_data() as u64, a.is_patch_control_point_data() as u64];
+        // SAFETY: the caller supplies five writable words.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), facts, values.len()); }
+        Ok(copy_out(a.name(), name, capacity))
+    })
+}
+
 /// `patchType`: 0 (none) for a function other than a post-tessellation vertex function.
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_patch_type(function: *const NmbFunction) -> u64 {

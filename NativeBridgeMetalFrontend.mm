@@ -1605,7 +1605,31 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 @implementation NBFunctionConstant
 @end
+@interface NBFunctionAttribute : NSObject
+@property(nonatomic,copy) NSString *name;
+@property(nonatomic) NSUInteger attributeIndex;
+@property(nonatomic) MTLDataType attributeType;
+@property(nonatomic,getter=isActive) BOOL active;
+@property(nonatomic,getter=isPatchData) BOOL patchData;
+@property(nonatomic,getter=isPatchControlPointData) BOOL patchControlPointData;
+@end
+@implementation NBFunctionAttribute
+@end
 @implementation NBFunction
+- (NSArray *)stageInputAttributes {
+ if(!_handle)return nil;
+ int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
+ NSMutableArray *attributes=[NSMutableArray arrayWithCapacity:count];
+ for(int32_t i=0;i<count;i++) {
+  char name[1024];uint64_t facts[5]={};
+  size_t length=nmb_function_attribute_at(_handle,(uint32_t)i,name,sizeof name,facts);
+  if(!length || length>sizeof name)return nil;
+  NBFunctionAttribute *a=[NBFunctionAttribute new];a.name=@(name);a.attributeIndex=facts[0];a.attributeType=(MTLDataType)facts[1];
+  a.active=facts[2];a.patchData=facts[3];a.patchControlPointData=facts[4];[attributes addObject:a];
+ }
+ return attributes;
+}
+- (NSArray *)vertexAttributes {return self.functionType==MTLFunctionTypeVertex?[self stageInputAttributes]:nil;}
 - (NSDictionary<NSString *,MTLFunctionConstant *> *)functionConstantsDictionary {
  NSMutableDictionary *result=[NSMutableDictionary dictionary];
  if(!_handle)return result;
@@ -1762,6 +1786,14 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  }
  return names;
 }
+- (NSArray<NSString *> *)nb_primeFunctionNames {
+ NSMutableArray<NSString *> *names=[NSMutableArray array];
+ if(!forEachLibraryEntry(self,[&](const std::string &entry,int type) {
+  if((type==0 || type==2) && !entry.empty())[names addObject:@(entry.c_str())];
+  return true;
+ }))return self.functionNames;
+ return names;
+}
 // _MTLLibrary's externFunctionNames: the entries of external linkage (TYPE 5), an empty array for a library without any. iPadOS 27's Core
 // Image collects the precompiled kernels' names so (DAGPrecompiledKernels: [CIKernelLibrary externFunctionNames] of ci_stdlib and
 // ci_filters) and links a kernel into its DAG only when its name is there or in a stitchable library; without the answer (nil, an unknown
@@ -1792,6 +1824,7 @@ static bool forEachLibraryEntry(NBLibrary *library,const std::function<bool(cons
  NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
+ function.library=self;
  return (id<MTLFunction>)function;
 }
 @end

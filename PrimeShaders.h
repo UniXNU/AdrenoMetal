@@ -28,6 +28,7 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 
 @interface NSObject (NBPrimeZeroConstants)
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
+- (NSArray<NSString *> *)nb_primeFunctionNames;
 @end
 
 // Priming's progress for the telemetry table (the PR row): what the thread does (1 a pipeline compiles, 2 it waits for the desktop to
@@ -261,6 +262,9 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
         [symbols addObject:symbol];
         id<MTLFunction> callee = [lib newFunctionWithName:symbol];
         if (!callee) return false;
+        if (callee.functionConstantsDictionary.count && [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)])
+            callee = [(NSObject *)lib nb_newFunctionWithZeroConstants:symbol];
+        if (!callee) return false;
         [linked addObject:callee];
         MTLComputePipelineDescriptor *d = [MTLComputePipelineDescriptor new];
         d.computeFunction = kernel;
@@ -271,6 +275,49 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
         if ([device newComputePipelineStateWithDescriptor:d options:MTLPipelineOptionNone reflection:nil error:error]) return true;
     }
     return false;
+}
+
+static id<MTLFunction> defaultFunction(id<MTLLibrary> lib, NSString *name, unsigned &zeroed) {
+    id<MTLFunction> function = [lib newFunctionWithName:name];
+    if (function.functionConstantsDictionary.count && [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
+        function = [(NSObject *)lib nb_newFunctionWithZeroConstants:name];
+        if (function) ++zeroed;
+    }
+    return function;
+}
+
+// Canonical packed inputs follow the function's reflected scalar type and lane count.
+static MTLVertexDescriptor *vertexInputs(id<MTLFunction> function) {
+    MTLVertexDescriptor *descriptor = [MTLVertexDescriptor vertexDescriptor];
+    for (MTLVertexAttribute *attribute in function.vertexAttributes) {
+        const NSUInteger index = attribute.attributeIndex, type = attribute.attributeType;
+        if (index >= 31 || !attribute.isActive) continue;
+        MTLVertexFormat format = MTLVertexFormatInvalid;
+        NSUInteger bytes = 0;
+        struct Family {NSUInteger type, bytes; MTLVertexFormat scalar, vector2;};
+        static const Family families[] = {
+            {MTLDataTypeFloat,4,MTLVertexFormatFloat,MTLVertexFormatFloat2},
+            {MTLDataTypeHalf,2,MTLVertexFormatHalf,MTLVertexFormatHalf2},
+            {MTLDataTypeInt,4,MTLVertexFormatInt,MTLVertexFormatInt2},
+            {MTLDataTypeUInt,4,MTLVertexFormatUInt,MTLVertexFormatUInt2},
+            {MTLDataTypeShort,2,MTLVertexFormatShort,MTLVertexFormatShort2},
+            {MTLDataTypeUShort,2,MTLVertexFormatUShort,MTLVertexFormatUShort2},
+            {MTLDataTypeChar,1,MTLVertexFormatChar,MTLVertexFormatChar2},
+            {MTLDataTypeUChar,1,MTLVertexFormatUChar,MTLVertexFormatUChar2},
+        };
+        for (const Family &family : families) if (type >= family.type && type < family.type + 4) {
+            const NSUInteger lanes = type - family.type + 1;
+            format = lanes == 1 ? family.scalar : (MTLVertexFormat)(family.vector2 + lanes - 2);
+            bytes = family.bytes * lanes;
+            break;
+        }
+        if (format == MTLVertexFormatInvalid) continue;
+        descriptor.attributes[index].format = format;
+        descriptor.attributes[index].bufferIndex = index;
+        descriptor.layouts[index].stride = bytes;
+        descriptor.layouts[index].stepFunction = MTLVertexStepFunctionPerVertex;
+    }
+    return descriptor;
 }
 
 // One library: every function it names, in its order; returns the log line.
@@ -292,16 +339,18 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         native_prime_compiling = 0;
         if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
         NSArray<NSString *> *names = lib.functionNames;
-        for (NSString *name in names) {
+        NSArray<NSString *> *entries = [lib respondsToSelector:@selector(nb_primeFunctionNames)] ? [(NSObject *)lib nb_primeFunctionNames] : names;
+        for (NSString *name in entries) {
             @autoreleasepool {
                 const std::string key = path + "\t" + name.UTF8String;
                 const std::string doneKey = key + "\t" + build;
                 native_prime_compiling = 3;
                 if (bad.count(doneKey)) {++skipped; continue;}
-                if (refusedDone.count(doneKey)) {++refused; continue;}
+                const std::string attemptKey = doneKey + "-inputs3";
+                if (refusedDone.count(attemptKey)) {++refused; continue;}
                 if (functionsDone.count(doneKey)) {++made; native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
-                id<MTLFunction> function = [lib newFunctionWithName:name];
-                if (!function) {++refused; appendLine(refusedPath, doneKey); continue;}
+                id<MTLFunction> function = defaultFunction(lib, name, zeroed);
+                if (!function) {++refused; appendLine(refusedPath, attemptKey); continue;}
                 const MTLFunctionType type = function.functionType;
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
                 waited += waitForQuiet();
@@ -312,13 +361,6 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     if (type == MTLFunctionTypeKernel) {
                         ++kernels;
                         ok = [device newComputePipelineStateWithFunction:function error:&error] != nil;
-                        // A kernel that uses a function constant's value needs one: prime the variant with every constant zero, which
-                        // still takes the module through translation and the driver (int-245: 2901 kernels refused for want of one).
-                        if (!ok && [error.localizedDescription containsString:@"FunctionConstant"] &&
-                            [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
-                            id<MTLFunction> zero = [(NSObject *)lib nb_newFunctionWithZeroConstants:name];
-                            if (zero) {error = nil; ok = [device newComputePipelineStateWithFunction:zero error:&error] != nil; if (ok) ++zeroed;}
-                        }
                         if (!ok && [error.localizedDescription containsString:@"LinkedFunction"]) {
                             ok = linkedKernel(device, lib, function, &error);
                             if (ok) ++linkedMade;
@@ -327,6 +369,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                         ++renders;
                         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
                         d.vertexFunction = function;
+                        d.vertexDescriptor = vertexInputs(function);
                         d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
                         // The fragment function of the same stem under the libraries' usual spellings; without one the pipeline still
                         // rasterizes (Metal refuses an unrasterized pipeline whose vertex function returns a position, int-245: 732 refusals).
@@ -335,11 +378,16 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                         for (const auto &pair : kPairs) {
                             NSString *fragment = [name stringByReplacingOccurrencesOfString:pair[0] withString:pair[1]];
                             if (![fragment isEqualToString:name] && [names containsObject:fragment]) {
-                                d.fragmentFunction = [lib newFunctionWithName:fragment];
+                                d.fragmentFunction = defaultFunction(lib, fragment, zeroed);
                                 if (d.fragmentFunction) break;
                             }
                         }
                         ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                        if (!ok && [error.localizedDescription containsString:@"RasterizedVoidVertex"]) {
+                            d.rasterizationEnabled = NO;
+                            error = nil;
+                            ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                        }
                         // The render server's framebuffer is half-float (RGhA) on this board: its pipelines draw into RGBA16Float, a state
                         // of its own to Turnip, so the same pair is made for it too.
                         if (ok) {
@@ -352,7 +400,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 native_prime_compiling = 0;
-                appendLine(ok ? functionsPath : refusedPath, doneKey);
+                appendLine(ok ? functionsPath : refusedPath, ok ? doneKey : attemptKey);
                 ok ? ++made : ++refused;
                 if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {

@@ -202,6 +202,8 @@ NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t
 uint32_t nmb_function_constant_count(const NmbFunction *);
 size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
 bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
+int32_t nmb_function_attribute_count(const NmbFunction *);
+size_t nmb_function_attribute_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t facts[5]);
 bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
 bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
 void nmb_texture_release(NmbTexture *);
