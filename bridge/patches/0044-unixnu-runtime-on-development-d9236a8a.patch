@@ -193,10 +193,10 @@ index 429263180..9f60777fd 100644
              (Owner::Caller, _) => return Err(Left::NoCopy),
              (Owner::Vulkan, _) | (Owner::Runtime, Lie::Host(_)) => return Err(Left::Caller),
 diff --git a/crates/metal2vulkan-runtime/src/buffer_texture.rs b/crates/metal2vulkan-runtime/src/buffer_texture.rs
-index d85d7b253..0e9554781 100644
+index 78ed4c5de..41a608ee4 100644
 --- a/crates/metal2vulkan-runtime/src/buffer_texture.rs
 +++ b/crates/metal2vulkan-runtime/src/buffer_texture.rs
-@@ -1047,9 +1047,19 @@ impl Buffer {
+@@ -1049,9 +1049,19 @@ impl Buffer {
              let texels = Texels::placed(self.clone(), placed, texel_bytes, descriptor)
                  .with_options(options)
                  .over_surface(surface);
@@ -217,7 +217,7 @@ index d85d7b253..0e9554781 100644
                  .map(Over::Made);
          }
          if layout.texture_type == TextureType::TextureBuffer {
-@@ -1418,7 +1428,7 @@ fn shape_over(
+@@ -1420,7 +1430,7 @@ fn shape_over(
          (None, None) => {
              return Err(Error::Unsupported(
                  Unsupported::not_implemented(Feature::Format).naming_format(pf),
@@ -292,10 +292,10 @@ index d22786f8e..99fdce21d 100644
      match error {
          vk::Result::ERROR_DEVICE_LOST => {
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-index 9ab3aef8a..1c8cc4046 100644
+index b27e3a36c..e668a7d72 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/mod.rs
-@@ -2582,6 +2582,11 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
+@@ -2588,6 +2588,11 @@ fn write_fields(upload: &Upload, table: u64, set: u64, count: u64) -> Result<(),
  }
  
  impl CommandBuffer {
@@ -307,7 +307,7 @@ index 9ab3aef8a..1c8cc4046 100644
      /// A new command buffer of `root`, on its place `queue`, holding `slot` of it.
      pub(super) fn new(queue: &QueueGen, root: &CommandQueue, slot: Slot) -> CommandBuffer {
          let footprints = Footprints::default();
-@@ -3457,7 +3462,7 @@ impl CommandBuffer {
+@@ -3472,7 +3477,7 @@ impl CommandBuffer {
                      CommandBufferStatus::Completed | CommandBufferStatus::Error
                  ) =>
              {
@@ -316,7 +316,7 @@ index 9ab3aef8a..1c8cc4046 100644
              }
              Some(Problem::AlreadyCommitted) => {}
              Some(problem) => return Err(invalid(CALL, problem)),
-@@ -3800,9 +3805,12 @@ impl CommandBuffer {
+@@ -3815,9 +3820,12 @@ impl CommandBuffer {
          let modified = &shared.modified;
          let commit = modified.take_at_commit(|wanted, count| self.may_use(wanted, count));
          self.state().commit = commit;
@@ -329,7 +329,7 @@ index 9ab3aef8a..1c8cc4046 100644
              return Ok(());
          }
          // The last render encoder's end, where its call left it to the device's lowering thread.
-@@ -3905,6 +3913,16 @@ impl CommandBuffer {
+@@ -3920,6 +3928,16 @@ impl CommandBuffer {
          run: CommitRun,
          hand: Hand,
      ) -> Result<(), Error> {
@@ -346,7 +346,7 @@ index 9ab3aef8a..1c8cc4046 100644
          let _for = self.notices_for();
          // The waiting fetched render targets take their storage form at this commit where it
          // allows (`storage_form.rs`): one atomic read where none waits. The scheduler's thread
-@@ -4197,6 +4215,11 @@ impl CommandBuffer {
+@@ -4212,6 +4230,11 @@ impl CommandBuffer {
                  return Err(error);
              }
          };
@@ -358,7 +358,7 @@ index 9ab3aef8a..1c8cc4046 100644
          // The first segment a host step records, which the device announces (a loop's check
          // and a staged scatter's CPU copy record nothing).
          let announced = segments
-@@ -4940,7 +4963,7 @@ impl CommandBuffer {
+@@ -4957,7 +4980,7 @@ impl CommandBuffer {
              Answer::Return => {
                  return self
                      .trailed(None)
@@ -367,7 +367,7 @@ index 9ab3aef8a..1c8cc4046 100644
              }
              Answer::Refuse(cause) => return Err(cause.into()),
              Answer::Wait => None,
-@@ -6270,6 +6293,7 @@ impl CommandBufferShared {
+@@ -6346,6 +6369,7 @@ impl CommandBufferShared {
          result: Result<(), CommandBufferError>,
      ) {
          let (contexts, queue) = (buffer.device.shared().contexts.clone(), buffer.queue.id());
@@ -375,7 +375,7 @@ index 9ab3aef8a..1c8cc4046 100644
          let (signallers, own): (Vec<Arc<Follow>>, _) = {
              let state = lock(&buffer.state);
              let signallers = (state.waited.iter())
-@@ -6318,12 +6342,16 @@ impl CommandBufferShared {
+@@ -6394,12 +6418,16 @@ impl CommandBufferShared {
                  let ran = contexts.run_here(queue, item, may_run);
                  drop(unheld);
                  match ran {
@@ -393,7 +393,7 @@ index 9ab3aef8a..1c8cc4046 100644
          contexts.post(queue, item.whole());
          posted();
      }
-@@ -6344,6 +6372,8 @@ impl CommandBufferShared {
+@@ -6420,6 +6448,8 @@ impl CommandBufferShared {
      /// The first part of [`complete`](Self::complete), to its completion-seen handlers: its
      /// status final, they ran. What the rest needs is answered.
      fn complete_seen(self: &Arc<Self>, result: Result<(), CommandBufferError>) -> Rest {
@@ -402,7 +402,7 @@ index 9ab3aef8a..1c8cc4046 100644
          // A thread sleeps on `changed`, as the state's lock below reads.
          let parked;
          // Its command pool, where it settled, whose primary the device's spares begin ahead once
-@@ -6563,6 +6593,7 @@ impl CommandBufferShared {
+@@ -6639,6 +6669,7 @@ impl CommandBufferShared {
          }
          // The holds taken above go here, with no lock of the command buffer's held, before any
          // handler of its runs: a detach from one of them detaches (`detach.rs`).
@@ -410,7 +410,7 @@ index 9ab3aef8a..1c8cc4046 100644
          drop(submitted_holds);
          #[cfg(unix)]
          self.release_sync_file(sync_file);
-@@ -6595,6 +6626,7 @@ impl CommandBufferShared {
+@@ -6671,6 +6702,7 @@ impl CommandBufferShared {
      /// handlers ran ([`complete_seen`](Self::complete_seen)): its completed handlers, its queue's
      /// slot, its releases and its gate.
      fn complete_rest(self: &Arc<Self>, rest: Rest) {
@@ -418,7 +418,7 @@ index 9ab3aef8a..1c8cc4046 100644
          let Rest {
              settled_pool,
              released_versions,
-@@ -6621,6 +6653,7 @@ impl CommandBufferShared {
+@@ -6697,6 +6729,7 @@ impl CommandBufferShared {
                  exit_guard::program(|| handler(&buffer));
              }
          }
@@ -426,7 +426,7 @@ index 9ab3aef8a..1c8cc4046 100644
          let handled = Instant::now();
          drop(buffer);
          // Its queue's slot comes back as its last completed handler returns, as Metal's does: a
-@@ -6710,6 +6743,7 @@ impl CommandBufferShared {
+@@ -6786,6 +6819,7 @@ impl CommandBufferShared {
          }
          // The gate notifies its waiters only where it opened here, which this transition's own
          // hold holds it from: the notify for them is that hold's, as it goes (`gate.rs`).
@@ -434,7 +434,7 @@ index 9ab3aef8a..1c8cc4046 100644
          let notified = self.gate.finish();
          self.device.shared().counts.command_buffer_wake(notified);
          // Its pool's primary begun ahead, where no command buffer took the pool since
-@@ -6720,6 +6754,7 @@ impl CommandBufferShared {
+@@ -6796,6 +6830,7 @@ impl CommandBufferShared {
              let shared = self.device.shared();
              shared.spares.begin_ahead(shared, pool);
          }
@@ -443,7 +443,7 @@ index 9ab3aef8a..1c8cc4046 100644
  }
  
 diff --git a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
-index 89acee6a7..223c3e120 100644
+index cebb924d7..c6dd3807f 100644
 --- a/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/command_buffer/submit.rs
 @@ -441,6 +441,30 @@ impl CommandBufferShared {
@@ -561,7 +561,7 @@ index 89acee6a7..223c3e120 100644
          // From here its heap set versions may be pending: nothing writes them any more, and its
          // first batch takes the ticket a texture that goes from now on waits for
          // (`heap_sets.rs`). One committed and not yet submitted holds no gone texture.
-@@ -1426,6 +1461,11 @@ impl CommandBufferShared {
+@@ -1432,6 +1467,11 @@ impl CommandBufferShared {
              if last && submitted.is_ok() && shared.timing.queue_times() {
                  self.kernel.returned_at(gpu_time::host_nanos());
              }
@@ -573,7 +573,7 @@ index 89acee6a7..223c3e120 100644
              // A test's stand-in for a scheduler thread preempted once the call returned.
              #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
              super::completion::trace::submit_returned();
-@@ -1605,6 +1645,11 @@ impl CommandBufferShared {
+@@ -1615,6 +1655,11 @@ impl CommandBufferShared {
              finishes_after(&batches.all()[index].waits, (queue, self), waited)
          };
          drop(state);
@@ -585,7 +585,7 @@ index 89acee6a7..223c3e120 100644
          if rebound {
              device.degrade_encoded_use_rebound(rebound_use);
          }
-@@ -2324,3 +2369,15 @@ fn first_overwrites(parts: &[Recorded], ended: &[EncoderRecord]) -> Vec<Resource
+@@ -2336,3 +2381,15 @@ fn first_overwrites(parts: &[Recorded], ended: &[EncoderRecord]) -> Vec<Resource
      }
      overwritten
  }
@@ -722,7 +722,7 @@ index efd709070..cf70123f0 100644
      }
      // The driver diagnostics this thread's call is measured to report: the driver reports them
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index ac6bb9210..6762d5ff4 100644
+index 03073ee72..9fd223e5e 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 @@ -31,6 +31,10 @@ pub(super) mod prime;
@@ -736,7 +736,7 @@ index ac6bb9210..6762d5ff4 100644
  mod staging;
  pub(super) mod submit;
  pub(crate) mod submit_stalls;
-@@ -776,6 +780,9 @@ pub(super) struct DeviceShared {
+@@ -784,6 +788,9 @@ pub(super) struct DeviceShared {
      /// The thread that lets go of what a released state's pool pieces gave back as they ended
      /// (`pipeline/reaper.rs`).
      pub(super) reaper: Arc<crate::pipeline::reaper::Reaper>,
@@ -746,7 +746,7 @@ index ac6bb9210..6762d5ff4 100644
      /// The trails its threads open between a signal and their last let-go of what they held for
      /// the work, which a command buffer's waiters wait for (`trails.rs`).
      pub(crate) trails: Arc<crate::trails::Trails>,
-@@ -1204,6 +1211,9 @@ impl Drop for DeviceShared {
+@@ -1217,6 +1224,9 @@ impl Drop for DeviceShared {
          // What the reaper is handed holds the device: none is left, and it only stops, unless
          // this teardown runs on its thread.
          self.reaper.stop();
@@ -756,7 +756,7 @@ index ac6bb9210..6762d5ff4 100644
          // What the residency thread releases holds the device: none is left.
          #[cfg(unix)]
          self.residency.stop();
-@@ -1719,11 +1729,52 @@ impl Device {
+@@ -1732,11 +1742,52 @@ impl Device {
      /// state's, a buffer's, a texture's, a heap's), so that no encoding or commit makes a memory
      /// block, whose `vkAllocateMemory` waited 2.37 s for other processes' GPU work on NVIDIA's
      /// driver. Nothing in a host step, a serial point of the command buffers' stream that makes
@@ -810,7 +810,7 @@ index ac6bb9210..6762d5ff4 100644
          let shared = self.shared();
          // The idle sweep's thread, from the device's first such call on (`idle_sweep.rs`).
          shared.idle_sweep.start(|| crate::idle_sweep::SweepTargets {
-@@ -1776,6 +1827,13 @@ impl Device {
+@@ -1789,6 +1840,13 @@ impl Device {
          Arc::ptr_eq(self.line(), other.line())
      }
  
@@ -824,7 +824,7 @@ index ac6bb9210..6762d5ff4 100644
      /// Whether the device was lost: not to a public call that took its arguments on it before
      /// its loss, which the loss follows (`Device::at_serving_taking`, `line.rs`).
      pub(super) fn is_lost(&self) -> bool {
-@@ -1802,8 +1860,12 @@ impl Device {
+@@ -1815,8 +1873,12 @@ impl Device {
      }
  
      /// Record that the device was lost: its line recovers at the next call that needs the device,
@@ -838,7 +838,7 @@ index ac6bb9210..6762d5ff4 100644
          let shared = self.shared();
          shared.lost.store(true, Ordering::Release);
          shared.line.lose(shared);
-@@ -2505,6 +2567,28 @@ impl Device {
+@@ -2549,6 +2611,28 @@ impl Device {
          // object where the device is the first after one. A device that registers nothing (one
          // of an identity registered since the last load) is not primed: an earlier device's
          // priming made those calls first, on what stays loaded.
@@ -867,7 +867,7 @@ index ac6bb9210..6762d5ff4 100644
          let primes = exit_guard::before_priming(&guard_identity);
          if let Err(error) = match primes {
              false => Ok(()),
-@@ -2548,6 +2632,7 @@ impl Device {
+@@ -2592,6 +2676,7 @@ impl Device {
                      calibrated,
                      drawn,
                      ycbcr_formats.primer(),
@@ -875,7 +875,7 @@ index ac6bb9210..6762d5ff4 100644
                  )
              },
          } {
-@@ -3206,6 +3291,7 @@ impl Device {
+@@ -3258,6 +3343,7 @@ impl Device {
              uncommitted: Arc::default(),
              pipeline_pool: Default::default(),
              reaper: Default::default(),
@@ -1197,10 +1197,10 @@ index 9c0da06da..2ca70d230 100644
      true
  }
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
-index da4fbfd3a..49ff294b6 100644
+index 645c0cdf1..47a81ba25 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
 +++ b/crates/metal2vulkan-runtime/src/lib.rs
-@@ -105,6 +105,7 @@ mod exactness;
+@@ -106,6 +106,7 @@ mod exactness;
  mod execution;
  mod extended_canonical;
  mod families;
@@ -1208,7 +1208,7 @@ index da4fbfd3a..49ff294b6 100644
  #[doc(hidden)]
  pub use execution::{ExecutedPipeline, Execution};
  mod exit_guard;
-@@ -295,6 +296,7 @@ pub use command_buffer::checks::{Submission, SubmissionCheck};
+@@ -296,6 +297,7 @@ pub use command_buffer::checks::{Submission, SubmissionCheck};
  pub use command_buffer::{CommandBuffer, CommitFailure, FailedEncoders, Handler};
  pub use compute::ComputeCommandEncoder;
  pub use copy_plan::{BlitOption, CopyProblem};
@@ -1216,7 +1216,7 @@ index da4fbfd3a..49ff294b6 100644
  pub use degradation::{Degradation, DegradationCategory, DegradeNotice};
  pub use degradation::{MisplacedNotice, NoticePlace};
  pub use depth_stencil::DepthStencilState;
-@@ -355,6 +357,7 @@ pub use indirect_command_buffer::{
+@@ -356,6 +358,7 @@ pub use indirect_command_buffer::{
  pub use interop::{SemaphoreProblem, VkEventSignal, VkEventWait, VkHostMemory};
  pub use library::{Function, FunctionDescriptor, Library};
  pub use linear_plan::BufferTextureProblem;
@@ -1224,7 +1224,7 @@ index da4fbfd3a..49ff294b6 100644
  pub use metal2vulkan::device::DriverFact;
  pub use metal_release::MACOS_RELEASE;
  pub use mipmap_plan::MipmapProblem;
-@@ -390,12 +393,16 @@ pub use render_values::{
+@@ -391,12 +394,16 @@ pub use render_values::{
  pub use resource::{ObjectId, ResourceRef};
  pub use resource_ids::{IdPlacement, ResourceId, ResourceIdKind};
  pub use sampler::{sampler_border_color, SamplerState, SamplerStateOptions};
@@ -1863,10 +1863,10 @@ index 8c57ca1ab..31b57ebfc 100644
      /// for the device's idle sweep (`idle_sweep.rs`); and when the next still parked goes.
      pub(crate) fn sweep(&mut self, now: Instant) -> (Gone<R>, Option<Instant>) {
 diff --git a/crates/metal2vulkan-runtime/src/render.rs b/crates/metal2vulkan-runtime/src/render.rs
-index 7b0374b37..04c36b81f 100644
+index e52f86f29..f9b0d16a6 100644
 --- a/crates/metal2vulkan-runtime/src/render.rs
 +++ b/crates/metal2vulkan-runtime/src/render.rs
-@@ -6998,7 +6998,7 @@ impl RenderLowering {
+@@ -7042,7 +7042,7 @@ impl RenderLowering {
                  StorageAttachmentView::SamplePlanes { .. } => {
                      return Err(internal(
                          "sample planes of another count than the pass's samples",
@@ -1875,7 +1875,7 @@ index 7b0374b37..04c36b81f 100644
                  }
              }
          }
-@@ -9733,7 +9733,7 @@ impl RenderLowering {
+@@ -9774,7 +9774,7 @@ impl RenderLowering {
                  )?)
              }
              (Some(_), None, false) => {
@@ -1884,7 +1884,7 @@ index 7b0374b37..04c36b81f 100644
              }
              _ => None,
          };
-@@ -10800,14 +10800,14 @@ impl RenderLowering {
+@@ -10850,14 +10850,14 @@ impl RenderLowering {
                      }
                      (None, _) => None,
                      (Some(_), None) => {
@@ -1901,7 +1901,7 @@ index 7b0374b37..04c36b81f 100644
                      }
                  };
                  Some(tessellation_scan::TessellationSteps::new(
-@@ -10850,7 +10850,7 @@ impl RenderLowering {
+@@ -10900,7 +10900,7 @@ impl RenderLowering {
                      )?),
                      (None, _) => None,
                      (Some(_), None) => {
@@ -1910,7 +1910,7 @@ index 7b0374b37..04c36b81f 100644
                      }
                  };
                  let launch = match (dispatch.object_groups, &arguments) {
-@@ -10868,7 +10868,7 @@ impl RenderLowering {
+@@ -10918,7 +10918,7 @@ impl RenderLowering {
                      (Some(launch), Some(pipeline)) => Some((pipeline, launch)),
                      (None, _) => None,
                      (Some(_), None) => {
@@ -1919,7 +1919,7 @@ index 7b0374b37..04c36b81f 100644
                      }
                  };
                  let (scan, launch) = match dispatch.mesh {
-@@ -10878,7 +10878,7 @@ impl RenderLowering {
+@@ -10928,7 +10928,7 @@ impl RenderLowering {
                              (Some(range), Some(source)) => Some((source.raw, range)),
                              (None, _) => None,
                              (Some(_), None) => {
@@ -1928,7 +1928,7 @@ index 7b0374b37..04c36b81f 100644
                              }
                          };
                          let scan = mesh::Scan::new(
-@@ -12106,7 +12106,7 @@ impl RenderLowering {
+@@ -12186,7 +12186,7 @@ impl RenderLowering {
              Some(fan) => Some(fan),
              // The probe's run records its probes alone.
              None if (self.fan_run.as_ref()).is_some_and(fan_out::FanOutRun::probes) => {
@@ -1937,7 +1937,7 @@ index 7b0374b37..04c36b81f 100644
              }
              None => None,
          };
-@@ -13636,6 +13636,11 @@ impl Recording<'_> {
+@@ -13770,6 +13770,11 @@ impl Recording<'_> {
      /// recorded into it bound (each recorded through it). With a pair, the pass is one
      /// `render_target` made, of no views (`snapshot::Pair::record`).
      unsafe fn record(&self, bound: &mut Bound) -> Recorded {
@@ -1949,7 +1949,7 @@ index 7b0374b37..04c36b81f 100644
          let (raw, cb) = (self.raw, self.command_buffer);
          bound.follow(cb);
          let mut recorded = 0;
-@@ -14495,7 +14500,7 @@ fn late_store(
+@@ -14630,7 +14635,7 @@ fn late_store(
              return Err(store_problem(
                  call,
                  RenderPassProblem::CustomSampleDepthStore(which),
@@ -1959,10 +1959,10 @@ index 7b0374b37..04c36b81f 100644
          _ => action,
      };
 diff --git a/crates/metal2vulkan-runtime/src/scheduler/mod.rs b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-index e2e0b01b3..89373e259 100644
+index 316365f48..707405b2b 100644
 --- a/crates/metal2vulkan-runtime/src/scheduler/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/scheduler/mod.rs
-@@ -550,6 +550,9 @@ impl SchedulerShared {
+@@ -572,6 +572,9 @@ impl SchedulerShared {
      /// lock of its sleep; one that sleeps later reads what the waker wrote first), counted as
      /// `woken`; else the notify, a system call, is spared.
      fn woken(&self, woken: Woken, asleep: Asleep) {
@@ -1972,7 +1972,7 @@ index e2e0b01b3..89373e259 100644
          match asleep {
              // The thread alone waits on it.
              Asleep::OnCondvar => {
-@@ -762,6 +765,8 @@ struct Held {
+@@ -790,6 +793,8 @@ struct Held {
      /// `VkQueue` (`SlotShare::posted_unshared`): it holds another queue's batch there whose room
      /// came after it was posted while it is on its way ([`unshared_on_their_way`]).
      unshared_place: Option<u64>,
@@ -1981,7 +1981,7 @@ index e2e0b01b3..89373e259 100644
  }
  
  impl Held {
-@@ -770,6 +775,15 @@ impl Held {
+@@ -798,6 +803,15 @@ impl Held {
      /// read from the host's clock while nothing waits.
      fn held_for(&mut self, reason: HeldFor) {
          (self.buffer.device().shared().counts).head_held_for(reason);
@@ -1997,7 +1997,7 @@ index e2e0b01b3..89373e259 100644
          if self.held_since.is_none() {
              self.held_since = Some(gpu_time::host_nanos());
          }
-@@ -919,6 +933,11 @@ impl Scheduler {
+@@ -947,6 +961,11 @@ impl Scheduler {
              let share = &buffer.device().shared().queues[index].share;
              (index, share.posted_unshared())
          });
@@ -2009,7 +2009,7 @@ index e2e0b01b3..89373e259 100644
          let committed = Committed {
              buffer: buffer.hold(),
              queue,
-@@ -1341,6 +1360,7 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1373,6 +1392,7 @@ fn run(shared: &Arc<SchedulerShared>) {
                  && bound.is_none()
                  && stalls.is_none();
              let slice = bound.map_or(slice, |left| left.min(slice));
@@ -2017,7 +2017,7 @@ index e2e0b01b3..89373e259 100644
              let on_gpu = shared.nudge.get().filter(|_| shared.gpu_waits(&mut gpu));
              // The lock of the sleep ([`Sleep`]), under the scheduler's: a waker that found no
              // pass under way wrote what it asks for before it took it, so its commit or nudge is
-@@ -1351,12 +1371,19 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1383,12 +1403,19 @@ fn run(shared: &Arc<SchedulerShared>) {
              }
              shared.sleeps.fetch_add(1, Ordering::Relaxed);
              if let Some(nudge) = on_gpu {
@@ -2037,7 +2037,7 @@ index e2e0b01b3..89373e259 100644
              // A waker that marks the state under the scheduler's lock takes it once this lets
              // go of it, and then the sleep's, which the wait lets go of.
              drop(state);
-@@ -1373,6 +1400,11 @@ fn run(shared: &Arc<SchedulerShared>) {
+@@ -1405,6 +1432,11 @@ fn run(shared: &Arc<SchedulerShared>) {
                      waited.timed_out()
                  }
              };
@@ -2049,7 +2049,7 @@ index e2e0b01b3..89373e259 100644
              sleep.asleep = false;
              drop(sleep);
              #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-@@ -1502,8 +1534,16 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
+@@ -1538,8 +1570,16 @@ fn run_work(shared: &Arc<SchedulerShared>, kind: Kind, work: Work) -> bool {
  fn round(shared: &SchedulerShared, left: &mut Left<Work>, passed: &mut Passed) -> bool {
      (shared.inbox).pass(|state, commits| {
          shared.passes.fetch_add(1, Ordering::Relaxed);
@@ -2066,7 +2066,7 @@ index e2e0b01b3..89373e259 100644
          !passed.exiting && left.is_empty() && !passed.more
      });
      passed.more = false;
-@@ -1568,6 +1608,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
+@@ -1604,6 +1644,11 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
                  .took_in_unshared();
          }
          let count = batches.len();
@@ -2078,7 +2078,7 @@ index e2e0b01b3..89373e259 100644
          let State { order, binary, .. } = &mut *state;
          let held = batches.into_iter().enumerate().map(|(index, batch)| Held {
              buffer: buffer.hold(),
-@@ -1585,6 +1630,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
+@@ -1622,6 +1667,7 @@ fn take_in(state: &mut State, commits: &mut Vec<Committed>, spent: &mut Spent) -
              held_since: None,
              unshared_noted: None,
              unshared_place: unshared.map(|(_, place)| place),
@@ -3236,7 +3236,7 @@ index 000000000..964ef7561
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index beb0f296b..ee500523a 100644
+index 899b85a14..cf9f78cee 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -208,7 +208,8 @@ mod ycbcr_image;
@@ -3249,7 +3249,7 @@ index beb0f296b..ee500523a 100644
  pub(crate) use ycbcr_planes::KeptTexels;
  
  pub(crate) use attached_reads::{
-@@ -2898,7 +2899,7 @@ impl Device {
+@@ -2904,7 +2905,7 @@ impl Device {
                      // The device's check of its pooled or exported memory makes no shadow:
                      // its round is not made, refused with why.
                      Err((why, _)) if in_place::checking() => {
@@ -3258,7 +3258,7 @@ index beb0f296b..ee500523a 100644
                      }
                      // Made before its class's verdict (the pooled memory's, for an image at
                      // Metal's pitch; the exported memory's, for any image there): the shadow
-@@ -3894,7 +3895,7 @@ impl Device {
+@@ -3900,7 +3901,7 @@ impl Device {
                       the runtime's"
                          .to_owned(),
                      None,
@@ -3267,7 +3267,7 @@ index beb0f296b..ee500523a 100644
              }
          }
          let between = match holds {
-@@ -3914,7 +3915,7 @@ impl Device {
+@@ -3920,7 +3921,7 @@ impl Device {
                      None => Err((format!("{linear}; and {}", cause.words()), Some(cause))),
                      Some(Err((why, cause))) => Err((format!("{linear}; and {why}"), Some(cause))),
                      Some(Ok(None)) => {
@@ -3276,7 +3276,7 @@ index beb0f296b..ee500523a 100644
                      }
                      Some(Ok(Some(made))) => {
                          Ok(self.exported_dma_buf_texture_image(made, plan, descriptor, texels))
-@@ -4541,6 +4542,15 @@ impl Device {
+@@ -4547,6 +4548,15 @@ impl Device {
          Ok((raw, placement))
      }
  
@@ -3292,7 +3292,7 @@ index beb0f296b..ee500523a 100644
      /// Destroy the parked images the recycler let go of, `gone`.
      fn let_go_parked(&self, gone: recycle::Gone<vk::Image>) {
          if gone.is_empty() {
-@@ -6022,6 +6032,7 @@ impl Texture {
+@@ -6028,6 +6038,7 @@ impl Texture {
      /// The buffer's bytes a texture buffer is, or `None` for a texture with an image.
      pub(super) fn texels(&self) -> Option<&Texels> {
          match self.stored() {
@@ -3300,7 +3300,7 @@ index beb0f296b..ee500523a 100644
              Stored::Made(Storage::Texels(texels)) => Some(texels),
              Stored::Made(Storage::Image(_) | Storage::Alias { .. } | Storage::Shadow { .. })
              | Stored::Unmade(_) => None,
-@@ -6700,7 +6711,7 @@ impl Texture {
+@@ -6706,7 +6717,7 @@ impl Texture {
              Stored::Made(Storage::Image(image) | Storage::Shadow { image, .. }) => image,
              // An aliasing image's uses are uses of the buffer's bytes it lies in.
              Stored::Made(Storage::Texels(texels) | Storage::Alias { texels, .. }) => {
@@ -3309,7 +3309,7 @@ index beb0f296b..ee500523a 100644
              }
              // A shadow left unmade: a use of the image it will be, its key taken as the texture
              // was made, in memory of its own (`texture/lazy_shadow.rs`).
-@@ -6716,7 +6727,7 @@ impl Texture {
+@@ -6722,7 +6733,7 @@ impl Texture {
                      },
                      read,
                      write,
@@ -3318,7 +3318,7 @@ index beb0f296b..ee500523a 100644
              }
          };
          let identity = image.identity;
-@@ -7032,6 +7043,30 @@ impl Texture {
+@@ -7038,6 +7049,30 @@ impl Texture {
          self.heap_place().map(|place| place.size)
      }
  
@@ -3349,7 +3349,7 @@ index beb0f296b..ee500523a 100644
      /// `makeAliasable`: a heap texture's bytes may be another resource's from now on. An
      /// automatic heap gives its range to the next resource it places; a placement heap's texture
      /// is aliasable from the start, so nothing changes. Using the texture after is the program's
-@@ -7600,13 +7635,13 @@ impl Texture {
+@@ -7606,13 +7641,13 @@ impl Texture {
              // (`Buffer::new_tiled_texture`).
              Stored::Made(Storage::Shadow { image, .. }) if self.level_in_image(level) => image,
              Stored::Made(Storage::Texels(texels) | Storage::Alias { texels, .. }) => {
@@ -3856,10 +3856,10 @@ index 00af12151..d00c4106b 100644
  #[non_exhaustive]
  #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 diff --git a/crates/metal2vulkan-runtime/src/work_counts.rs b/crates/metal2vulkan-runtime/src/work_counts.rs
-index 8bfb1ba0b..7a9a04555 100644
+index 47e042627..3350902cb 100644
 --- a/crates/metal2vulkan-runtime/src/work_counts.rs
 +++ b/crates/metal2vulkan-runtime/src/work_counts.rs
-@@ -6710,6 +6710,16 @@ pub struct WorkCounts {
+@@ -6861,6 +6861,16 @@ pub struct WorkCounts {
      /// Its live dedicated blocks with their placement: a placement larger than half a block, one
      /// placed apart, or an exportable buffer's dedicated allocation (`exported_memory.rs`).
      pub dedicated_memory_blocks_live: u64,
@@ -3876,7 +3876,7 @@ index 8bfb1ba0b..7a9a04555 100644
      /// Of `pooled_memory_blocks_made`, the blocks of the pool a color texture's host-transfer
      /// image places in made ready off the program's thread: allocated and every page of their
      /// mapping read once by the host, then added to the pool by the first placement there that
-@@ -11200,6 +11210,11 @@ impl Device {
+@@ -11444,6 +11454,11 @@ impl Device {
              pooled_memory_blocks_made: made,
              pooled_memory_blocks_freed: freed,
              dedicated_memory_blocks_live: census.dedicated,
@@ -3937,10 +3937,10 @@ index d2fd0a397..080f24b93 100644
      pub(super) fn source(&self) -> (YCbCrPlanes, Range<u64>) {
          (self.source.0, self.source.1.clone())
 diff --git a/crates/metal2vulkan/src/device/driver_facts.rs b/crates/metal2vulkan/src/device/driver_facts.rs
-index fa9afdcc7..6eeb98a3e 100644
+index 68b22d7d9..58bb0f000 100644
 --- a/crates/metal2vulkan/src/device/driver_facts.rs
 +++ b/crates/metal2vulkan/src/device/driver_facts.rs
-@@ -776,6 +776,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
+@@ -779,6 +779,13 @@ pub(crate) const INTEL_UHD_770_RPL_S: u32 = 0xa780;
  /// `intel-irisxe-rplp-anv`).
  pub(crate) const INTEL_IRIS_XE_RPL_P: u32 = 0xa7a0;
  
@@ -3954,7 +3954,7 @@ index fa9afdcc7..6eeb98a3e 100644
  /// The row of `fact` measured on Mesa's `driver` on the GPU `(vendor, device)`.
  const fn mesa_on<F>(fact: F, driver: DriverId, (vendor, device): (u32, u32)) -> Measured<F> {
      Measured {
-@@ -1997,6 +2004,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
+@@ -2039,6 +2046,16 @@ const DYNAMIC_RESTART_WARNING: DriverDiagnostic = DriverDiagnostic {
  /// row, ANV, Mesa 26.2.4, on the Iris Xe (RPL-P). Not listed: NVIDIA's 615.71.09, whose RTX 3080
  /// left a third answer; RADV on the RX 7900 XTX, clean at dd718a7905 at Mesa 26.0.8 but not
  /// measured since; and every GPU not measured, which store with `STORE`.
@@ -3971,7 +3971,7 @@ index fa9afdcc7..6eeb98a3e 100644
  ///
  /// `InterlockOrdersDraws`, measured with no barrier between such draws on any driver (a scratch
  /// build of the commit that adds it), by `runtime_lane::interlocked_draw_order` (passes of 84
-@@ -2310,6 +2327,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
+@@ -2356,6 +2373,12 @@ pub(crate) const MEASURED: &[Measured<DriverFact>] = &[
          DriverId::INTEL_OPEN_SOURCE_MESA,
          (INTEL_VENDOR_ID, INTEL_IRIS_XE_RPL_P),
      ),
@@ -4168,10 +4168,10 @@ index 759be5b59..b3e6e673d 100644
          F::Sqrt => g1(fb, GlslOp::Sqrt),
          F::Fma if f.float_fmt() == Some(FloatFmt::BFloat) => {
 diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
-index 0889470d3..3163fcc1e 100644
+index 86e8ff9aa..a34c4716a 100644
 --- a/crates/metal2vulkan/src/lower/arith/mod.rs
 +++ b/crates/metal2vulkan/src/lower/arith/mod.rs
-@@ -753,6 +753,10 @@ pub struct ArithPlan {
+@@ -756,6 +756,10 @@ pub struct ArithPlan {
      /// Whether [`ArithPlan::quantize`] is the device's own rounding (native half rounding,
      /// [`narrow::native_rounding`]), decided with it by [`finish`].
      pub native_half: bool,
@@ -4182,7 +4182,7 @@ index 0889470d3..3163fcc1e 100644
      /// Whether a `half`'s NaN bits are left to the device's conversion where the module rounds
      /// through the conversion under the float controls ([`QuantizeForm::Controlled`]): a `half`
      /// texel takes the rounding's NaN (`narrow::round_texel`). Decided by [`finish`], on every
-@@ -841,6 +845,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
+@@ -844,6 +848,7 @@ pub fn finish(cx: &mut SelectCx<'_>) -> Result<(), Error> {
      cx.families.arith.wide = legal::holds_wide(cx.profile);
      cx.families.arith.quantize = narrow::quantize_form(cx.profile);
      cx.families.arith.native_half = narrow::native_rounding(cx.families.arith.quantize).is_some();
@@ -4190,7 +4190,7 @@ index 0889470d3..3163fcc1e 100644
      // Under the float controls a `half`'s NaN is the device's conversion's.
      cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled;
      cx.families.arith.controls = narrow::half_controls(cx.profile);
-@@ -1733,7 +1738,7 @@ fn select_cast(
+@@ -1736,7 +1741,7 @@ fn select_cast(
          CastOp::UIToFP => CastKind::UiToFp,
          CastOp::SIToFP => CastKind::SiToFp,
          CastOp::Bitcast if chunk.is_some() => {
@@ -4199,7 +4199,7 @@ index 0889470d3..3163fcc1e 100644
          }
          CastOp::Bitcast => {
              let plan = ops::bitcast_plan(from, to).ok_or_else(not_lowered)?;
-@@ -1744,7 +1749,7 @@ fn select_cast(
+@@ -1747,7 +1752,7 @@ fn select_cast(
              return Ok(ArithStrategy::Bitcast { plan, from, to });
          }
          CastOp::PtrToInt | CastOp::IntToPtr | CastOp::AddrSpaceCast => {
@@ -4208,7 +4208,7 @@ index 0889470d3..3163fcc1e 100644
          }
      };
      Ok(ArithStrategy::Cast { kind, from, to })
-@@ -1846,7 +1851,7 @@ fn air_math(f: MathFn) -> Result<Fun, Error> {
+@@ -1849,7 +1854,7 @@ fn air_math(f: MathFn) -> Result<Fun, Error> {
              return Err(Error::Internal(crate::error::InternalError::new(
                  crate::error::InternalKind::Invariant,
                  "a runtime routine's call survived canonicalization",
@@ -4409,7 +4409,7 @@ index 580cb7721..daaecb7c0 100644
                  (_, AddrSpace::Thread) => match roots {
                      [Root::Alloca(a)] => match typed.get(a) {
 diff --git a/crates/metal2vulkan/src/pipeline/compile.rs b/crates/metal2vulkan/src/pipeline/compile.rs
-index 9f51712b2..fb3b19eb8 100644
+index 949ad3f8e..34d173c5e 100644
 --- a/crates/metal2vulkan/src/pipeline/compile.rs
 +++ b/crates/metal2vulkan/src/pipeline/compile.rs
 @@ -478,7 +478,7 @@ pub(crate) fn dynamic_order<'a>(
@@ -4436,7 +4436,7 @@ index 9f51712b2..fb3b19eb8 100644
          && p.takes_driver_deviation(crate::error::DriverDeviation::MetalHalfConversion)
          && !crate::lower::arith::narrow::rounds_unmeasured(&module, m)?;
      // A `half` read from its bits by the device's widening, or encoded to them by its narrowing
-@@ -3310,7 +3314,7 @@ fn kept_reflection(
+@@ -3322,7 +3326,7 @@ fn kept_reflection(
              return Ok(KeptAnswers {
                  reflection: None,
                  slot_writes: reflection::entry_slot_writes(&spec.ep),
@@ -4696,7 +4696,7 @@ index 2c92a0344..88f409526 100644
 +    }
 +}
 diff --git a/docs/API.md b/docs/API.md
-index a88450c4b..82839999c 100644
+index 25ba3ec4d..0bd1d13c7 100644
 --- a/docs/API.md
 +++ b/docs/API.md
 @@ -123,8 +123,14 @@ compile does. `DevicePolicy::default()` is `DevicePolicy::UNTRUSTED`:
