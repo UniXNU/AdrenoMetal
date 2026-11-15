@@ -358,9 +358,9 @@ fn diagnostic_stamp() -> String {
 fn write_runtime_policy(device: &Device) {
     let Some(path) = POLICY_LOG.get() else { return; };
     let profile = device.compile_device();
-    let text = format!("{}\npolicy={:#?}\nprofile={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\n",
-        diagnostic_stamp(), profile.policy(), profile.profile(), device.submit_check_report(),
-        device.queue_switch_check_report(), device.in_place_check_report());
+    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\nprofile={:#?}\n",
+        diagnostic_stamp(), profile.policy(), device.submit_check_report(),
+        device.queue_switch_check_report(), device.in_place_check_report(), profile.profile());
     let text: String = text.chars().take(64 * 1024).collect();
     let _ = std::fs::write(path, text);
 }
