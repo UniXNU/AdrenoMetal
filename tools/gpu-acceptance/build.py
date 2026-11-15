@@ -210,7 +210,7 @@ def main():
     constants = ''.join(re.search(r'^const ' + name + r':[^\n]+', maths, re.M)[0]+'\n' for name in ['IN','OUT','COUNT','PAYLOAD_NAN'])
     stream_start = maths.index('struct Stream(')
     stream = maths[stream_start:maths.index('const PAYLOAD_NAN', stream_start)]
-    numerical = constants + stream + ''.join(item(maths, name).replace('fn '+name, 'pub fn '+name, 1) if name in ['operands','broken','metal_half','half_operands','half_within','half_within_sum'] else item(maths,name) for name in helpers)
+    numerical = constants + stream + ''.join(item(maths, name).replace('fn '+name, 'pub fn '+name, 1) if name in ['operands','broken','metal_half','half_operands','half_within','half_within_sum','half_ulp'] else item(maths,name) for name in helpers)
     (out/'numerical.rs').write_text(numerical)
     kernels = ['kernel','half_kernel','half_arithmetic_kernel']
     generator = constants + ''.join(item(maths, name) for name in kernels)
@@ -221,9 +221,10 @@ def main():
     (out/'kernels.rs').write_text(generator)
     run(['rustc','+1.98.0','--edition=2021','-A','dead_code',out/'kernels.rs','-o',out/'kernels'])
     run([out/'kernels',out])
+    (out/'native_half_division.ll').write_text((out/'native_half_rounding.ll').read_text().replace('%hs = fadd half', '%hs = fdiv half'))
     (out/'arith32.ll').write_text(arithmetic_air(False));(out/'arith16.ll').write_text(arithmetic_air(True))
     llvm = shutil.which('llvm-as') or '/opt/homebrew/opt/llvm/bin/llvm-as'
-    for name in ['native_maths','native_half_rounding','native_half_arithmetic','arith32','arith16']:
+    for name in ['native_maths','native_half_rounding','native_half_arithmetic','native_half_division','arith32','arith16']:
         run([llvm,out/(name+'.ll'),'-o',out/(name+'.air')])
     run([llvm,source/'crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll','-o',out/'runtime_examples.air'])
     for name,half,scale in [('arith32',False,False),('arith16',True,False),('scale',False,True)]:

@@ -18,6 +18,10 @@ const HALF: &[u8] = include_bytes!(concat!(
     env!("NMB_ACCEPTANCE_INPUTS"),
     "/native_half_rounding.air"
 ));
+const HALF_DIVISION: &[u8] = include_bytes!(concat!(
+    env!("NMB_ACCEPTANCE_INPUTS"),
+    "/native_half_division.air"
+));
 const EXAMPLES: &[u8] = include_bytes!(concat!(
     env!("NMB_ACCEPTANCE_INPUTS"),
     "/runtime_examples.air"
@@ -291,7 +295,47 @@ fn numeric(device: &Device, queue: &CommandQueue) -> Result<bool> {
     emit(
         json!({"event":"numeric","case":"native-half-rounding","words":4096*2,"failures":half_failures,"stamp":stamp()}),
     );
-    Ok(failures == 0 && half_failures == 0)
+    // These normal, exactly representable operands cover the native16 divisor limit.
+    // The large divisors need normalization before a half reciprocal can stay normal.
+    let cases = [
+        [65504.0f32, 65504.0],
+        [65504.0, 32768.0],
+        [32768.0, 65504.0],
+        [16384.0, 16384.0],
+        [16392.0, 16392.0],
+        [-65504.0, 65504.0],
+        [65504.0, -32768.0],
+        [1.0, 1.0],
+        [0.00006103515625, 0.00006103515625],
+    ];
+    let inputs: Vec<[f32; 2]> = (0..4096).map(|i| cases[i % cases.len()]).collect();
+    let bytes: Vec<u8> = inputs
+        .iter()
+        .flatten()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let input = buffer(device, &bytes)?;
+    let output = device
+        .new_buffer(4096 * 2 * 4, ResourceOptions::shared())
+        .map_err(err)?;
+    emit(json!({"event":"begin","case":"native-half-division-range","stamp":stamp()}));
+    let pipeline = state(device, HALF_DIVISION, "hr")?;
+    dispatch(device, queue, &pipeline, &[&input, &output], 4096)?;
+    let mut division_failures = 0;
+    let mut max_error_ulp = 0.0f64;
+    for (&[a, b], r) in inputs.iter().zip(floats(&output)?.as_chunks::<2>().0) {
+        let want = a as f64 / b as f64;
+        let error = (r[0] as f64 - want).abs() / numerical::half_ulp(want);
+        if !error.is_finite() || error > 2.5 {
+            division_failures += 1;
+        }
+        max_error_ulp = max_error_ulp.max(error);
+    }
+    emit(
+        json!({"event":"numeric","case":"native-half-division-range","words":4096,
+        "failures":division_failures,"max_error_half_ulp":max_error_ulp,"bound_half_ulp":2.5,"stamp":stamp()}),
+    );
+    Ok(failures == 0 && half_failures == 0 && division_failures == 0)
 }
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
