@@ -4094,19 +4094,6 @@ index f0a76a7d5..53440f31e 100644
          }
          _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
      }
-diff --git a/crates/metal2vulkan/src/lower/arith/fma.rs b/crates/metal2vulkan/src/lower/arith/fma.rs
-index 1f8929106..f967e1adc 100644
---- a/crates/metal2vulkan/src/lower/arith/fma.rs
-+++ b/crates/metal2vulkan/src/lower/arith/fma.rs
-@@ -171,7 +171,7 @@ pub fn emit(fb: &mut FunctionBuilder<'_>, fma: Fma, args: &[Value]) -> BResult<V
-         (Route::Native, Some(FloatFmt::F32)) => fb.glsl(GlslOp::Fma, &[a, b, c]),
-         (Route::Native, Some(FloatFmt::Half)) => {
-             let r = fb.glsl(GlslOp::Fma, &[a, b, c])?;
--            narrow::round(fb, fma.form, r)
-+            narrow::round_native(fb, fma.form, r)
-         }
-         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
-     }
 diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
 index 759be5b59..b3e6e673d 100644
 --- a/crates/metal2vulkan/src/lower/arith/math.rs
