@@ -401,6 +401,19 @@ static id deviceForPort(unsigned port) {
         // launchd throttled it and every app that draws an icon waited for it. Core Image reads CI_ENABLE_MPS at its first
         // blur, after this plugin has loaded (checked with osascript on the tablet). A value already in the environment wins.
         if (bootArgSet("ci-mps=0")) setenv("CI_ENABLE_MPS", "0", 0);
+        if (!strcmp(getprogname(), "iconservicesagent")) {
+            char args[1100] = {};
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "icon-cb=")) {
+                    unsigned first = 0, count = 0;
+                    if (sscanf(at + strlen("icon-cb="), "%u:%u", &first, &count) == 2 && first && count && count <= 32) {
+                        char range[32];snprintf(range, sizeof range, "%u:%u", first, count);
+                        setenv("NATIVE_METAL_DUMP_CB", range, 0);
+                        setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
+                    }
+                }
+        }
 #endif
 #if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface

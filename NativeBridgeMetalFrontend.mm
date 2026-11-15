@@ -18,6 +18,7 @@
 #include <deque>
 #include <condition_variable>
 #include <cmath>
+#include <cstdarg>
 #include <atomic>
 #include <optional>
 #include <mutex>
@@ -3094,6 +3095,24 @@ static unsigned dumpTexel(uint32_t format,const uint8_t *p,float c[4],unsigned *
   default: return 0;
  }
 }
+static void dumpWrite(const char *format,...) {
+ va_list args;va_start(args,format);char *text=nullptr;
+ const int length=vasprintf(&text,format,args);va_end(args);
+ if(length<0 || !text)return;
+ fwrite(text,1,(size_t)length,stderr);
+ static const bool unified=[]{const char *value=getenv("NATIVE_METAL_DUMP_LOG");return value && !strcmp(value,"1");}();
+ if(unified) {
+  static std::atomic<uint64_t> sequence;
+  const uint64_t entry=sequence.fetch_add(1)+1;
+  const size_t parts=((size_t)length+511)/512;
+  for(size_t part=0;part<parts;++part) {
+   const size_t at=part*512;
+   std::string chunk(text+at,std::min<size_t>(512,(size_t)length-at));
+   os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal CB dump %llu %zu/%zu: %{public}s",(unsigned long long)entry,part+1,parts,chunk.c_str());
+  }
+ }
+ free(text);
+}
 static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  NSDictionary *t=read[@"target"];NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
  NSString *encoder=t[@"encoder"];
@@ -3102,11 +3121,11 @@ static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
           [t[@"where"] UTF8String],encoder?" (":"",encoder?encoder.UTF8String:"",encoder?")":"",texture.label.length?texture.label.UTF8String:"-",
           (unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.format,
           (unsigned long)[t[@"level"] unsignedIntegerValue],(unsigned long)[t[@"slice"] unsignedIntegerValue]);
- if(read[@"skip"]){fprintf(stderr,"%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
+ if(read[@"skip"]){dumpWrite("%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
  const unsigned w=[read[@"w"] unsignedIntValue],rows=[read[@"rows"] unsignedIntValue],bpp=[read[@"bpp"] unsignedIntValue];
  const uint32_t format=[read[@"format"] unsignedIntValue];
  const uint8_t *bytes=(const uint8_t *)[(id<MTLBuffer>)read[@"buffer"] contents];
- if(!bytes){fprintf(stderr,"%s: no readback contents\n",head);return;}
+ if(!bytes){dumpWrite("%s: no readback contents\n",head);return;}
  double sum[4]={},lo[4]={INFINITY,INFINITY,INFINITY,INFINITY},hi[4]={-INFINITY,-INFINITY,-INFINITY,-INFINITY};
  uint64_t finite[4]={},nans=0,infs=0,black=0,texels=0;unsigned channels=1;
  double cell[8][32]={};uint32_t cellCount[8][32]={},cellNan[8][32]={},cellLit[8][32]={};
@@ -3132,21 +3151,21 @@ static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  }
  snprintf(part,sizeof part,"; nan %llu inf %llu black %.1f%% of %llu",(unsigned long long)nans,(unsigned long long)infs,
           texels?100.0*black/texels:0.0,(unsigned long long)texels);line+=part;
- fprintf(stderr,"%s\n",line.c_str());
+ dumpWrite("%s\n",line.c_str());
  for(unsigned gy=0;gy<8;gy++) {
   char grid[33]={};
   for(unsigned gx=0;gx<32;gx++) {
    const uint32_t n=cellCount[gy][gx];const double mean=n?cell[gy][gx]/n:0;
    grid[gx]=!n?' ':cellNan[gy][gx]?'!':!cellLit[gy][gx]?'.':mean>1?'+':mean<0?'-':(char)('0'+std::min(9,(int)(mean*10)));
   }
-  fprintf(stderr,"native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
+  dumpWrite("native-metal dump cb %llu:   |%s|\n",(unsigned long long)appIndex,grid);
  }
  // NATIVE_METAL_DUMP_IMAGE: the whole texture, its rows top down as the format stores them, in base64 lines of 6 KiB.
  if([read[@"image"] boolValue]) {
   NSString *text=[[NSData dataWithBytesNoCopy:(void *)bytes length:(NSUInteger)rows*w*bpp freeWhenDone:NO] base64EncodedStringWithOptions:0];
   const NSUInteger part=8192,parts=(text.length+part-1)/part;
   for(NSUInteger i=0;i<parts;i++)
-   fprintf(stderr,"native-metal dump image cb %llu: %s|%ux%u f%u bpp %u|%lu/%lu|%s\n",(unsigned long long)appIndex,[t[@"where"] UTF8String],w,rows,format,bpp,
+   dumpWrite("native-metal dump image cb %llu: %s|%ux%u f%u bpp %u|%lu/%lu|%s\n",(unsigned long long)appIndex,[t[@"where"] UTF8String],w,rows,format,bpp,
            (unsigned long)i+1,(unsigned long)parts,[text substringWithRange:NSMakeRange(i*part,std::min(part,text.length-i*part))].UTF8String);
  }
 }
@@ -3166,9 +3185,9 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
   return dumpImageWanted(t[@"where"]);
  }]];
- else fprintf(stderr,"native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
+ else dumpWrite("native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
               (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
- for(NSString *line in source.dumpLog)fprintf(stderr,"native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
+ for(NSString *line in source.dumpLog)dumpWrite("native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
  if(!targets.count)return;
  NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
  if(!readback)return;
@@ -3196,7 +3215,7 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
  }
  [blit endEncoding];
  [(id<MTLCommandBuffer>)readback addCompletedHandler:^(id<MTLCommandBuffer> done) {
-  if(done.error){fprintf(stderr,"native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
+  if(done.error){dumpWrite("native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
                          done.error.localizedDescription.UTF8String);return;}
   for(NSDictionary *read in reads)dumpPrint(appIndex,read);
  }];
