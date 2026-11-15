@@ -1196,6 +1196,20 @@ index 9c0da06da..2ca70d230 100644
  pub(crate) fn at_least_user_initiated() -> bool {
      true
  }
+diff --git a/crates/metal2vulkan-runtime/src/in_place.rs b/crates/metal2vulkan-runtime/src/in_place.rs
+index 339627aed..e7a5d3659 100644
+--- a/crates/metal2vulkan-runtime/src/in_place.rs
++++ b/crates/metal2vulkan-runtime/src/in_place.rs
+@@ -783,6 +783,9 @@ pub(crate) fn in_place(
+     if policy == HostPageTexturePolicy::Shadow {
+         return Err(ShadowCause::Exact);
+     }
++    if policy == HostPageTexturePolicy::InPlaceWrites {
++        return Ok(());
++    }
+     let written = Access::written(texel, padding);
+     if Access::Writes.takes(usage) && written.is_none() {
+         return Err(ShadowCause::StoreWidth(texel));
 diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
 index 645c0cdf1..47a81ba25 100644
 --- a/crates/metal2vulkan-runtime/src/lib.rs
@@ -1261,6 +1275,30 @@ index 5f2d4d06b..493809391 100644
      /// The function as a stage links it, with its constant values, under its specialized name
      /// where it was made with one, specialized where it was made with constant values or by
      /// [`Library::new_function_with_descriptor`], and precompiled where it was made compiled to a
+diff --git a/crates/metal2vulkan-runtime/src/linear_plan.rs b/crates/metal2vulkan-runtime/src/linear_plan.rs
+index a03971511..e3319e593 100644
+--- a/crates/metal2vulkan-runtime/src/linear_plan.rs
++++ b/crates/metal2vulkan-runtime/src/linear_plan.rs
+@@ -1430,6 +1430,19 @@ impl Between {
+     }
+ }
+ 
++
++/// Keep complete 16x4 tile stores inside each row pitch and the backing buffer.
++pub(super) fn tile_store_fits(layout: &BufferLayout, width: u64, buffer_length: u64) -> bool {
++    if layout.slices != 1 || width == 0 || !layout.row_bytes.is_multiple_of(width) {
++        return false;
++    }
++    let block_row = width.next_multiple_of(16) * (layout.row_bytes / width);
++    let last_row = layout.rows.next_multiple_of(4) - 1;
++    layout.row_pitch >= block_row
++        && layout.offset.saturating_add(layout.row_pitch.saturating_mul(last_row))
++            .saturating_add(block_row) <= buffer_length
++}
++
+ /// Whether an image over `layout`'s texels, for a texture of Metal `usage`, may hold them: where
+ /// its rows (and slices) lie one after another, or it has one row (one slice); else why not,
+ /// where consecutive rows share bytes (an IOSurface plane's on Metal's GPU, which no image holds
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
 index f298a4e34..bef8aa8b2 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
@@ -3236,7 +3274,7 @@ index 000000000..964ef7561
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index 899b85a14..cf9f78cee 100644
+index 899b85a14..2b06d75d4 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -208,7 +208,8 @@ mod ycbcr_image;
@@ -3249,7 +3287,26 @@ index 899b85a14..cf9f78cee 100644
  pub(crate) use ycbcr_planes::KeptTexels;
  
  pub(crate) use attached_reads::{
-@@ -2904,7 +2905,7 @@ impl Device {
+@@ -2893,6 +2894,18 @@ impl Device {
+                 self.host_shadowed(shadowed, (usage, &plan), descriptor, pending)?
+             }
+             Route::Device { holds } => {
++                let policy = self.compile_device().policy().host_page_textures;
++                let writes = usage.intersects(
++                    TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE | TextureUsage::SHADER_ATOMIC,
++                );
++                let holds = match holds {
++                    Err(_) if policy == HostPageTexturePolicy::InPlaceWrites
++                        && texels.layout.shared_bytes() == 0
++                        && (!writes || super::linear_plan::tile_store_fits(
++                            &texels.layout, u64::from(layout.extent[0]), texels.buffer.length(),
++                        )) => Ok(()),
++                    holds => holds,
++                };
+                 let over = (&*texels, &holds, usage);
+                 match self.alias_over_device(&plan, (descriptor, layout), over, &facts)? {
+                     Ok((image, count)) => {
+@@ -2904,7 +2917,7 @@ impl Device {
                      // The device's check of its pooled or exported memory makes no shadow:
                      // its round is not made, refused with why.
                      Err((why, _)) if in_place::checking() => {
@@ -3258,7 +3315,7 @@ index 899b85a14..cf9f78cee 100644
                      }
                      // Made before its class's verdict (the pooled memory's, for an image at
                      // Metal's pitch; the exported memory's, for any image there): the shadow
-@@ -3900,7 +3901,7 @@ impl Device {
+@@ -3900,7 +3913,7 @@ impl Device {
                       the runtime's"
                          .to_owned(),
                      None,
@@ -3267,7 +3324,7 @@ index 899b85a14..cf9f78cee 100644
              }
          }
          let between = match holds {
-@@ -3920,7 +3921,7 @@ impl Device {
+@@ -3920,7 +3933,7 @@ impl Device {
                      None => Err((format!("{linear}; and {}", cause.words()), Some(cause))),
                      Some(Err((why, cause))) => Err((format!("{linear}; and {why}"), Some(cause))),
                      Some(Ok(None)) => {
@@ -3276,7 +3333,7 @@ index 899b85a14..cf9f78cee 100644
                      }
                      Some(Ok(Some(made))) => {
                          Ok(self.exported_dma_buf_texture_image(made, plan, descriptor, texels))
-@@ -4547,6 +4548,15 @@ impl Device {
+@@ -4547,6 +4560,15 @@ impl Device {
          Ok((raw, placement))
      }
  
@@ -3292,7 +3349,7 @@ index 899b85a14..cf9f78cee 100644
      /// Destroy the parked images the recycler let go of, `gone`.
      fn let_go_parked(&self, gone: recycle::Gone<vk::Image>) {
          if gone.is_empty() {
-@@ -6028,6 +6038,7 @@ impl Texture {
+@@ -6028,6 +6050,7 @@ impl Texture {
      /// The buffer's bytes a texture buffer is, or `None` for a texture with an image.
      pub(super) fn texels(&self) -> Option<&Texels> {
          match self.stored() {
@@ -3300,7 +3357,7 @@ index 899b85a14..cf9f78cee 100644
              Stored::Made(Storage::Texels(texels)) => Some(texels),
              Stored::Made(Storage::Image(_) | Storage::Alias { .. } | Storage::Shadow { .. })
              | Stored::Unmade(_) => None,
-@@ -6706,7 +6717,7 @@ impl Texture {
+@@ -6706,7 +6729,7 @@ impl Texture {
              Stored::Made(Storage::Image(image) | Storage::Shadow { image, .. }) => image,
              // An aliasing image's uses are uses of the buffer's bytes it lies in.
              Stored::Made(Storage::Texels(texels) | Storage::Alias { texels, .. }) => {
@@ -3309,7 +3366,7 @@ index 899b85a14..cf9f78cee 100644
              }
              // A shadow left unmade: a use of the image it will be, its key taken as the texture
              // was made, in memory of its own (`texture/lazy_shadow.rs`).
-@@ -6722,7 +6733,7 @@ impl Texture {
+@@ -6722,7 +6745,7 @@ impl Texture {
                      },
                      read,
                      write,
@@ -3318,7 +3375,7 @@ index 899b85a14..cf9f78cee 100644
              }
          };
          let identity = image.identity;
-@@ -7038,6 +7049,30 @@ impl Texture {
+@@ -7038,6 +7061,30 @@ impl Texture {
          self.heap_place().map(|place| place.size)
      }
  
@@ -3349,7 +3406,7 @@ index 899b85a14..cf9f78cee 100644
      /// `makeAliasable`: a heap texture's bytes may be another resource's from now on. An
      /// automatic heap gives its range to the next resource it places; a placement heap's texture
      /// is aliasable from the start, so nothing changes. Using the texture after is the program's
-@@ -7606,13 +7641,13 @@ impl Texture {
+@@ -7606,13 +7653,13 @@ impl Texture {
              // (`Buffer::new_tiled_texture`).
              Stored::Made(Storage::Shadow { image, .. }) if self.level_in_image(level) => image,
              Stored::Made(Storage::Texels(texels) | Storage::Alias { texels, .. }) => {
@@ -3397,6 +3454,22 @@ index abbb510c1..d83d9b244 100644
          // Only a texture an image of binds into the heap's own memory is held to the heap's base,
          // and the routes decide that (`holds_heap_base`).
          check_heap_base(image.route, size_and_align.align)?;
+diff --git a/crates/metal2vulkan-runtime/src/texture/route.rs b/crates/metal2vulkan-runtime/src/texture/route.rs
+index 1212535a1..841c75007 100644
+--- a/crates/metal2vulkan-runtime/src/texture/route.rs
++++ b/crates/metal2vulkan-runtime/src/texture/route.rs
+@@ -231,8 +231,9 @@ impl Device {
+         }
+         let policy = self.compile_device().policy().host_page_textures;
+         let rows = texels.rows(self.shared().in_place.line());
+-        policy == HostPageTexturePolicy::InPlace
+-            && self.in_place_verdict(PagesClass::Pooled, Access::Renders, rows) == Verdict::Passed
++        policy == HostPageTexturePolicy::InPlaceWrites
++            || (policy == HostPageTexturePolicy::InPlace
++                && self.in_place_verdict(PagesClass::Pooled, Access::Renders, rows) == Verdict::Passed)
+     }
+ 
+     /// The route of a texture of Metal `usage` (as the image is planned for it) and `levels` over
 diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
 index 043811a44..2b1197db9 100644
 --- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
@@ -3985,10 +4058,18 @@ index 68b22d7d9..58bb0f000 100644
          DriverFact::ColorBlockDecodeIsMetals,
          DriverId::MESA_RADV,
 diff --git a/crates/metal2vulkan/src/device/policy.rs b/crates/metal2vulkan/src/device/policy.rs
-index 52d8a7d72..01aa6b215 100644
+index 52d8a7d72..0bfc81e9d 100644
 --- a/crates/metal2vulkan/src/device/policy.rs
 +++ b/crates/metal2vulkan/src/device/policy.rs
-@@ -461,8 +461,13 @@ pub enum HostPageTexturePolicy {
+@@ -456,13 +456,21 @@ pub enum HostPageTexturePolicy {
+     /// texels into before each use and merge back after each write, whose copies touch the
+     /// texels alone.
+     Shadow,
++    /// Render and write over host pages in place under the consumer's driver policy.
++    /// Image format, row pitch and tile-store bounds are checked when the image is made.
++    InPlaceWrites,
+ }
+ 
  /// How a chain of `half` additions, subtractions and products rounds on a device without
  /// `shaderFloat16`, where a module computes each in `float` on its operands held widened and
  /// rounds its result by the device's `OpQuantizeToF16` (`PrecisionNote::NativeHalfQuantize`):
@@ -4675,6 +4756,19 @@ index 2c92a0344..88f409526 100644
 +        assert_eq!(run_both(&module, &res).expect("table output"), want);
 +    }
 +}
+diff --git a/crates/metal2vulkan/src/tests/fast_paths.rs b/crates/metal2vulkan/src/tests/fast_paths.rs
+index a8f3fe22c..9647c5846 100644
+--- a/crates/metal2vulkan/src/tests/fast_paths.rs
++++ b/crates/metal2vulkan/src/tests/fast_paths.rs
+@@ -104,7 +104,7 @@ fn choices() -> Vec<Choice> {
+         choice!(p.completion: CompletionPolicy { Grouped, Exact }),
+         choice!(p.batch_order: BatchOrderPolicy { Ends, Exact }),
+         choice!(p.render_lowering: RenderLoweringPolicy { AtCall, Worker }),
+-        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow }),
++        choice!(p.host_page_textures: HostPageTexturePolicy { InPlace, Shadow, InPlaceWrites }),
+         choice!(p.half_chains: HalfChainPolicy { AtExits, EachOperation }),
+         choice!(p.ycbcr_in_place_reads: YCbCrInPlacePolicy { Model, Exact }),
+         choice!(p.pipeline_waits: PipelineWaitPolicy { Bounded, Exact }),
 diff --git a/docs/API.md b/docs/API.md
 index 25ba3ec4d..0bd1d13c7 100644
 --- a/docs/API.md

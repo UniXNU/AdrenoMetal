@@ -264,7 +264,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
         // Use the device's measured in-place image route for imported surfaces and padded buffers.
-        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlace;
+        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
+        options.policy.half_chains = metal2vulkan::device::HalfChainPolicy::EachOperation;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
         // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
         // finds fails the command buffer, naming the call. `metal-flow=` without bit 1 keeps the lowering at the call.
