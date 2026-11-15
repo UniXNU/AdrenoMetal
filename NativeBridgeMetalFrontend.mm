@@ -2138,6 +2138,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // NATIVE_METAL_DUMP_CB: the textures this command buffer wrote, met while it was encoded (dumpTargets), the render pass's attachments
 // waiting for their encoder (dumpPending), how many passes and kernels it encoded so far, and whether it is the plugin's own readback.
 @property(nonatomic,strong) NSMutableArray *dumpTargets,*dumpPending;
+@property(nonatomic,strong) NSMutableArray *dumpPassReads;
+@property(nonatomic) uint64_t dumpAppIndex;
 @property(nonatomic) uint32_t dumpPasses,dumpKernels;
 @property(nonatomic) BOOL dumpReadback;
 @property(nonatomic,strong) NBTexture *wallpaperOutput;
@@ -2199,6 +2201,11 @@ static bool dumpMaybe(NBCommandBuffer *commandBuffer) {
  const uint64_t next=gAppCommits.load()+1;
  return next+16>=range.first && next<(uint64_t)range.first+range.second;
 }
+static bool dumpAtPassEnd() {
+ static const bool enabled=getenv("NATIVE_METAL_DUMP_PASS")!=nullptr;
+ return enabled;
+}
+static void dumpPassSnapshot(NBCommandBuffer *commands,NSArray *targets);
 // A line of the command buffer's NATIVE_METAL_DUMP_CB log (its passes, first draws and their state), printed before its readback.
 // NATIVE_METAL_DUMP_ONLY=1: only the NATIVE_METAL_DUMP_IMAGE targets are read back and written, with no log, so a long range of
 // command buffers (a small texture over hundreds of frames) costs little.
@@ -2237,7 +2244,7 @@ static bool dumpMatched(NSString *pipeline) {
 }
 static void dumpNote(NBCommandBuffer *commandBuffer,NSMutableArray *into,id texture,NSUInteger level,NSUInteger slice,NSString *where) {
  if(!texture || ![texture isKindOfClass:[NBTexture class]])return;
- for(NSDictionary *seen in commandBuffer.dumpTargets)
+ if(!dumpAtPassEnd())for(NSDictionary *seen in commandBuffer.dumpTargets)
   if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
  for(NSDictionary *seen in commandBuffer.dumpPending)
   if(seen[@"texture"]==texture && [seen[@"level"] unsignedIntegerValue]==level && [seen[@"slice"] unsignedIntegerValue]==slice)return;
@@ -2703,6 +2710,7 @@ static uint64_t encodeCommandOf(id object) {
   _targetW=0;
  }
  [super endEncoding];
+ if(dumpAtPassEnd() && dumpMaybe(self.commandBuffer))dumpPassSnapshot(self.commandBuffer,self.dumpEntries);
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state {
  if(![(id)state isKindOfClass:[NBRenderPipeline class]]){[self.commandBuffer refuse:@"foreign render pipeline"];return;}
@@ -3117,8 +3125,9 @@ static void dumpPrint(uint64_t appIndex,NSDictionary *read) {
  NSDictionary *t=read[@"target"];NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
  NSString *encoder=t[@"encoder"];
  char head[400];
- snprintf(head,sizeof head,"native-metal dump cb %llu: %s%s%s%s texture %s %llux%llu f%llu L%lu S%lu",(unsigned long long)appIndex,
+ snprintf(head,sizeof head,"native-metal dump cb %llu: %s%s%s%s texture %s@%p %llux%llu f%llu L%lu S%lu",(unsigned long long)appIndex,
           [t[@"where"] UTF8String],encoder?" (":"",encoder?encoder.UTF8String:"",encoder?")":"",texture.label.length?texture.label.UTF8String:"-",
+          (__bridge void *)texture,
           (unsigned long long)d.width,(unsigned long long)d.height,(unsigned long long)d.format,
           (unsigned long)[t[@"level"] unsignedIntegerValue],(unsigned long)[t[@"slice"] unsignedIntegerValue]);
  if(read[@"skip"]){dumpWrite("%s: %s\n",head,[read[@"skip"] UTF8String]);return;}
@@ -3179,20 +3188,8 @@ static bool dumpImageWanted(NSString *where) {
  for(NSString *w in wanted)if(w.length && ([w isEqualToString:@"all"] || [where containsString:w]))return true;
  return false;
 }
-// The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
-static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
- NSArray *targets=[source.dumpTargets copy];
- if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
-  return dumpImageWanted(t[@"where"]);
- }]];
- else dumpWrite("native-metal dump cb %llu: %lu targets, %u passes, %u kernels\n",(unsigned long long)appIndex,
-              (unsigned long)targets.count,source.dumpPasses,source.dumpKernels);
- for(NSString *line in source.dumpLog)dumpWrite("native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
- if(!targets.count)return;
- NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
- if(!readback)return;
- readback.dumpReadback=YES;
- id<MTLBlitCommandEncoder> blit=[(id<MTLCommandBuffer>)readback blitCommandEncoder];
+static NSArray *dumpEncodeReads(NBCommandBuffer *commands,NSArray *targets) {
+ id<MTLBlitCommandEncoder> blit=[(id<MTLCommandBuffer>)commands blitCommandEncoder];
  NSMutableArray *reads=[NSMutableArray array];
  for(NSDictionary *t in targets) {
   NBTexture *texture=t[@"texture"];const NmbTextureDescriptor d=texture.descriptor;
@@ -3200,7 +3197,8 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
   float c[4];unsigned channels=0;const uint8_t zero[16]={};
   const unsigned bpp=texture.pvrtc?0:dumpTexel((uint32_t)d.format,zero,c,&channels);
   NSString *skip=!bpp?@"format not read back":d.samples>1?@"multisampled":d.type==MTLTextureType3D?@"3D":
-                 texture.storageMode==MTLStorageModeMemoryless?@"memoryless":nil;
+                 texture.storageMode==MTLStorageModeMemoryless?@"memoryless":
+                 dumpAtPassEnd() && t[@"store"] && [t[@"store"] unsignedIntegerValue]==MTLStoreActionDontCare?@"store action DontCare":nil;
   if(skip){[reads addObject:@{@"target":t,@"skip":skip}];continue;}
   const NSUInteger w=std::max<NSUInteger>(1,(NSUInteger)d.width>>level),h=std::max<NSUInteger>(1,(NSUInteger)d.height>>level);
   const bool image=dumpImageWanted(t[@"where"]);
@@ -3214,6 +3212,31 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
   [reads addObject:@{@"target":t,@"buffer":buffer,@"w":@(w),@"rows":@(rows),@"bpp":@(bpp),@"format":@((uint32_t)d.format),@"image":@(image)}];
  }
  [blit endEncoding];
+ return reads;
+}
+// Snapshot a stored attachment immediately after its encoder, before heap reuse or a later pass can overwrite it.
+static void dumpPassSnapshot(NBCommandBuffer *commands,NSArray *targets) {
+ if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
+  return dumpImageWanted(t[@"where"]);
+ }]];
+ if(!targets.count)return;
+ if(!commands.dumpPassReads)commands.dumpPassReads=[NSMutableArray array];
+ [commands.dumpPassReads addObjectsFromArray:dumpEncodeReads(commands,targets)];
+}
+// The readback of `source`'s targets, by a command buffer of the plugin's own committed after it on its queue.
+static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
+ NSArray *targets=[source.dumpTargets copy];
+ if(dumpOnly())targets=[targets filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSDictionary *t,NSDictionary *bindings){(void)bindings;
+  return dumpImageWanted(t[@"where"]);
+ }]];
+ else dumpWrite("native-metal dump cb %llu: %lu targets, %u passes, %u kernels%s\n",(unsigned long long)appIndex,
+              (unsigned long)targets.count,source.dumpPasses,source.dumpKernels,dumpAtPassEnd()?"; pass snapshots":"");
+ for(NSString *line in source.dumpLog)dumpWrite("native-metal dump cb %llu: %s\n",(unsigned long long)appIndex,line.UTF8String);
+ if(dumpAtPassEnd() || !targets.count)return;
+ NBCommandBuffer *readback=(NBCommandBuffer *)[(id<MTLCommandQueue>)source.queue commandBuffer];
+ if(!readback)return;
+ readback.dumpReadback=YES;
+ NSArray *reads=dumpEncodeReads(readback,targets);
  [(id<MTLCommandBuffer>)readback addCompletedHandler:^(id<MTLCommandBuffer> done) {
   if(done.error){dumpWrite("native-metal dump cb %llu: readback failed: %s\n",(unsigned long long)appIndex,
                          done.error.localizedDescription.UTF8String);return;}
@@ -3344,9 +3367,11 @@ static char kUserDictionaryKey;
   _dumpPending=[NSMutableArray array];
   for(unsigned i=0;i<8;i++) {
    MTLRenderPassColorAttachmentDescriptor *c=d.colorAttachments[i];
+   const NSUInteger before=_dumpPending.count;
    if(c.resolveTexture)dumpNote(self,_dumpPending,c.resolveTexture,c.resolveLevel,c.resolveSlice,
                                 [NSString stringWithFormat:@"pass %u resolve %u",_dumpPasses,i]);
    else dumpNote(self,_dumpPending,c.texture,c.level,c.slice,[NSString stringWithFormat:@"pass %u color %u",_dumpPasses,i]);
+   if(_dumpPending.count>before)_dumpPending.lastObject[@"store"]=@(c.storeAction);
   }
   dumpNote(self,_dumpPending,d.depthAttachment.texture,d.depthAttachment.level,d.depthAttachment.slice,
            [NSString stringWithFormat:@"pass %u depth",_dumpPasses]);
@@ -3507,6 +3532,11 @@ static char kUserDictionaryKey;
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
  frontStage(traceNumber,self.commitIndex,9,flushed,(uint32_t)_surfaces.count);
+ if(_dumpAppIndex) {
+  if(self.status==MTLCommandBufferStatusCompleted)for(NSDictionary *read in _dumpPassReads)dumpPrint(_dumpAppIndex,read);
+  else dumpWrite("native-metal dump cb %llu: pass snapshots failed: %s\n",(unsigned long long)_dumpAppIndex,self.error.localizedDescription.UTF8String?:"command refused");
+  _dumpPassReads=nil;
+ }
  if(freezeWallpaperOn() && !self.failedLocally && self.status==MTLCommandBufferStatusCompleted &&
     self.wallpaperOutput && encodedWork.draws) {
   std::lock_guard<std::recursive_mutex> guard(gWallpaperLock);
@@ -3608,13 +3638,15 @@ static char kUserDictionaryKey;
   // Completion owns this reference; the runtime orders the non-owning scheduled callback before it.
   void *context=(__bridge_retained void *)self;
   const uint64_t appIndex=self.dumpReadback?0:gAppCommits.fetch_add(1)+1;
+  const auto range=dumpRange();
+  const bool capture=appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second;
+  if(capture && dumpAtPassEnd()){self.dumpAppIndex=appIndex;dumpReadback(self,appIndex);}
   frontStage(traceNumber,self.commitIndex,6);
   if(nmb_command_buffer_on_completed(_handle,completed,context) &&
      nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
    frontStage(traceNumber,self.commitIndex,7);
-   const auto range=dumpRange();
    self.submitted=YES;
-   if(appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second)dumpReadback(self,appIndex);
+   if(capture && !dumpAtPassEnd())dumpReadback(self,appIndex);
    [self fireEarly];return;
   }
   (void)CFBridgingRelease(context);   // refused registration/commit cannot call the registered handlers
