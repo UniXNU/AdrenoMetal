@@ -2585,7 +2585,8 @@ static uint64_t encodeCommandOf(id object) {
 - (void)texture:(id<MTLTexture>)texture index:(NSUInteger)index stage:(uint32_t)stage {
  if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){[_commandBuffer refuse:@"foreign texture"];return;}
  if(gDrawStats)[self noteState:kDSTexture key:stage<<8|(uint32_t)index object:(__bridge const void *)texture value:0];
- const bool captureInput=stage==2 && getenv("NATIVE_METAL_DUMP_INPUTS")!=nullptr;
+ static const bool captureInputs=getenv("NATIVE_METAL_DUMP_INPUTS")!=nullptr;
+ const bool captureInput=stage==2 && captureInputs;
  if(texture && ((stage==0 && (texture.usage&MTLTextureUsageShaderWrite)) || captureInput) && dumpMaybe(_commandBuffer)) {
   if(!_dumpEntries)_dumpEntries=[NSMutableArray array];
   if(!_commandBuffer.dumpTargets)_commandBuffer.dumpTargets=[NSMutableArray array];
