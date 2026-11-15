@@ -1615,6 +1615,20 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @end
 @implementation NBFunctionAttribute
 @end
+static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) {
+ const uint8_t *file=(const uint8_t *)bytes;
+ library.bytes=file;library.length=length;
+ if(length<8 || memcmp(file,"\xca\xfe\xba\xbe",4))return;
+ auto word=[&](size_t at) {return ((uint32_t)file[at]<<24)|((uint32_t)file[at+1]<<16)|((uint32_t)file[at+2]<<8)|file[at+3];};
+ const uint32_t count=word(4);
+ for(uint32_t i=0;i<count && i<16;i++) {
+  const size_t at=8+20*(size_t)i;if(at>length || length-at<20)return;
+  if(word(at)!=0x01000017)continue;
+  const size_t offset=word(at+8),size=word(at+12);
+  if(offset>length || size>length-offset)return;
+  library.bytes=file+offset;library.length=size;return;
+ }
+}
 @implementation NBFunction
 - (NSArray *)stageInputAttributes {
  if(!_handle)return nil;
@@ -4575,7 +4589,7 @@ static void fillBaseLimits(id device);
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes,size,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;library.bytes=(const uint8_t *)bytes;library.length=size;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=mapped;libraryAirBytes(library,bytes,size);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 // A library file that cannot be read (macOS run36: QuartzCore's default.metallib failed with NSCocoaErrorDomain 260 on a fresh Data
@@ -4600,7 +4614,7 @@ static void reportUnreadableLibrary(NSString *path) {
  const uint64_t libraryBegan=nowUs();
  NmbLibrary *handle=nmb_library_new(gDevice,bytes.bytes,bytes.length,false);gTimeLibrary.add(libraryBegan);
  if(!handle)return failWith<id<MTLLibrary>>(error,@"library",nil);
- NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;library.bytes=(const uint8_t *)bytes.bytes;library.length=bytes.length;
+ NBLibrary *library=[NBLibrary new];library.handle=handle;library.storage=bytes;libraryAirBytes(library,bytes.bytes,bytes.length);
  if(error)*error=nil;return (id<MTLLibrary>)library;
 }
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(NSError **)error {

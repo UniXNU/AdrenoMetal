@@ -457,7 +457,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
 #else
     const unsigned scope = 2;
 #endif
-    appendLine(logPath, note + " boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
+    appendLine(logPath, note + " inputs=3 boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
     auto selected = [&](const std::string &path) {
 #if TARGET_OS_OSX
         return wholeSystem ? !libraryOfDriverBundle(path) : libraryOfLoadedBundle(path);
@@ -499,7 +499,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_compiling = 0;
     native_prime_pass_complete = eligible && finished == eligible && !native_prime_libraries_failed && !native_prime_inventory_failed ? 1 : 2;
     char line[512];
-    snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
+    snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s inputs=3 libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u complete=%u ms=%llu",
              boot.c_str(), scope, build.c_str(), libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
              native_prime_inventory_failed, foreign, native_prime_pass_complete, (unsigned long long)(nowMs() - began));
     appendLine(logPath, line);
