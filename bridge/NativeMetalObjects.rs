@@ -263,7 +263,7 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
         options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
         options.messages = Some(MessageSink::new(observe_message));
-        // Use the device's measured in-place image route for imported surfaces and padded buffers.
+        // Use the board's direct image route for imported surfaces and padded buffers.
         options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
         options.policy.half_chains = metal2vulkan::device::HalfChainPolicy::EachOperation;
         // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
