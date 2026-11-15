@@ -14,6 +14,8 @@ Texture creation, heap size queries and texture views preserve
 `allowGPUOptimizedContents`. A caller that requests an unoptimized layout keeps
 that layout through the frontend and runtime.
 
+Function lookup returns `MTLLibraryErrorFunctionNotFound` when the requested name is absent from the library.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno-metal). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Native half arithmetic
