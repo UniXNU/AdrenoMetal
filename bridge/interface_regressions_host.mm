@@ -53,6 +53,20 @@ int main(int argc,char **argv) {@autoreleasepool {
  td.storageMode=MTLStorageModePrivate;td.usage=MTLTextureUsageShaderRead|MTLTextureUsagePixelFormatView;
  auto ht=[heap newTextureWithDescriptor:td];CHECK(ht);used=heap.usedSize;
  [ht makeAliasable];CHECK(ht.isAliasable && heap.usedSize<used);
+ // Query and allocation must use the same layout policy, including texture views.
+ for(bool optimized:{false,true}) {
+  auto layout=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA16Float width:242 height:242 mipmapped:NO];
+  layout.storageMode=MTLStorageModePrivate;layout.usage=MTLTextureUsageShaderRead;
+  layout.allowGPUOptimizedContents=optimized;
+  auto footprint=[dev heapTextureSizeAndAlignWithDescriptor:layout];CHECK(footprint.size && footprint.align);
+  auto exact=[MTLHeapDescriptor new];exact.type=MTLHeapTypePlacement;exact.storageMode=layout.storageMode;exact.size=footprint.size;
+  auto storage=[dev newHeapWithDescriptor:exact];CHECK(storage);
+  auto placed=[storage newTextureWithDescriptor:layout offset:0];
+  CHECK(placed && placed.heap==storage && placed.allowGPUOptimizedContents==optimized);
+  CHECK(placed.allocatedSize<=storage.size);
+  auto alias=[placed newTextureViewWithPixelFormat:placed.pixelFormat];CHECK(alias && alias.allowGPUOptimizedContents==optimized);
+  auto overflow=[storage newTextureWithDescriptor:layout offset:footprint.align];CHECK(!overflow);
+ }
  // Zero is a real swizzle, not a marker for the identity.
  td.swizzle=MTLTextureSwizzleChannelsMake(MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleZero,MTLTextureSwizzleZero);
  auto zero=[dev newTextureWithDescriptor:td];CHECK(zero && zero.swizzle.red==MTLTextureSwizzleZero && zero.swizzle.alpha==MTLTextureSwizzleZero);
