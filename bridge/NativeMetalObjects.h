@@ -156,6 +156,7 @@ struct NmbTextureDescriptor {
     uint64_t type, format, width, height, depth, levels, samples, array_length, usage, options;
     uint64_t rotation, framebuffer_only, is_drawable;
     uint64_t swizzle; /* RGBA bytes, bit 32 marks an explicit value; zero means identity */
+    uint64_t allow_gpu_optimized_contents;
 };
 /* Heaps: type 0 automatic / 1 placement; offset UINT64_MAX asks an automatic heap to place the resource. */
 NmbHeap *nmb_heap_new(NmbDevice *, uint64_t type, uint64_t size, uint64_t options);

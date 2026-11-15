@@ -1507,6 +1507,7 @@ pub struct NmbTextureDescriptor {
     pub framebuffer_only: u64,
     pub is_drawable: u64,
     pub swizzle: u64,
+    pub allow_gpu_optimized_contents: u64,
 }
 
 // Bit 32 distinguishes an explicit all-zero swizzle from an omitted descriptor field.
@@ -1536,8 +1537,30 @@ fn texture_descriptor(d: *const NmbTextureDescriptor) -> Result<TextureDescripto
     out.rotation = d.rotation;
     out.framebuffer_only = d.framebuffer_only != 0;
     out.is_drawable = d.is_drawable != 0;
+    out.allow_gpu_optimized_contents = d.allow_gpu_optimized_contents != 0;
     if let Some(swizzle) = swizzle_of(d.swizzle)? { out.swizzle = swizzle; }
     Ok(out)
+}
+
+#[cfg(test)]
+mod texture_descriptor_tests {
+    use super::*;
+
+    #[test]
+    fn heap_layout_preserves_the_callers_optimization_policy() {
+        let mut descriptor = NmbTextureDescriptor {
+            kind: TextureType::Type2D.as_raw() as u64,
+            format: PixelFormat::RGBA16Float.as_raw() as u64,
+            width: 242, height: 242, depth: 1, levels: 1, samples: 1, array_length: 1,
+            usage: TextureUsage::SHADER_READ.as_raw() as u64,
+            options: ResourceOptions::private().raw(),
+            rotation: 0, framebuffer_only: 0, is_drawable: 0, swizzle: 0,
+            allow_gpu_optimized_contents: 0,
+        };
+        assert!(!texture_descriptor(&descriptor).unwrap().allow_gpu_optimized_contents);
+        descriptor.allow_gpu_optimized_contents = 1;
+        assert!(texture_descriptor(&descriptor).unwrap().allow_gpu_optimized_contents);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1711,6 +1734,7 @@ pub extern "C" fn nmb_texture_describe(texture: *const NmbTexture, out: *mut Nmb
             framebuffer_only: u64::from(t.framebuffer_only()),
             is_drawable: u64::from(t.is_drawable()),
             swizzle: swizzle_packed(t.swizzle()),
+            allow_gpu_optimized_contents: u64::from(t.allow_gpu_optimized_contents()),
         };
         Ok(())
     })

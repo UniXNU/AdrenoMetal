@@ -12,6 +12,10 @@ All clients use single-sample rendering by default. `NATIVE_METAL_SINGLE_SAMPLE=
 
 Function lookup returns `MTLLibraryErrorFunctionNotFound` when the requested name is absent from the library.
 
+Texture creation, heap size queries and texture views preserve
+`allowGPUOptimizedContents`. A caller that requests an unoptimized layout keeps
+that layout through the frontend and runtime.
+
 Build and interface details: [documentation](https://unixnu.com/drivers/adreno-metal). Component sources and dependencies: [catalog](https://unixnu.com/reference/components).
 
 ## Native half arithmetic

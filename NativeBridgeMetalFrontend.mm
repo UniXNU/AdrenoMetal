@@ -1352,7 +1352,7 @@ static uint64_t packedSwizzle(MTLTextureSwizzleChannels s) {
 static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out) {
  if(!d)return false;
  *out={(uint64_t)d.textureType,(uint64_t)d.pixelFormat,d.width,d.height,d.depth,d.mipmapLevelCount,d.sampleCount,d.arrayLength,(uint64_t)d.usage,(uint64_t)d.resourceOptions,
-       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle)};
+       textureRotation(d),textureFlag(d,"framebufferOnly"),textureFlag(d,"isDrawable"),packedSwizzle(d.swizzle),(uint64_t)d.allowGPUOptimizedContents};
  if(singleSample() && out->samples>1) {
   out->samples=1;
   if(out->type==MTLTextureType2DMultisample)out->type=MTLTextureType2D;
@@ -1401,6 +1401,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (MTLCPUCacheMode)cpuCacheMode {return (MTLCPUCacheMode)((_descriptor.options&MTLResourceCPUCacheModeMask)>>MTLResourceCPUCacheModeShift);}
 - (BOOL)isFramebufferOnly {return _descriptor.framebuffer_only!=0;}
 - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
+- (BOOL)allowGPUOptimizedContents {return _descriptor.allow_gpu_optimized_contents!=0;}
 - (IOSurfaceRef)iosurface {return _surface;}
 - (NSUInteger)iosurfacePlane {return 0;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
