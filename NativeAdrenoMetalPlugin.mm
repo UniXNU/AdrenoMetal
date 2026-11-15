@@ -395,6 +395,14 @@ static id deviceForPort(unsigned port) {
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
 #if TARGET_OS_OSX
+        // ci-mps=0 (macOS test images on sheng, 2026-11-15): Core Image renders its blurs with its own kernels instead of MPS.
+        // With the default half-float working format it hands MPSImageGaussianBlur a nil source on this device
+        // (MPSImageUnaryKernel.mm:335 "source may not be nil") and the process aborts; iconservicesagent did on every start,
+        // launchd throttled it and every app that draws an icon waited for it. Core Image reads CI_ENABLE_MPS at its first
+        // blur, after this plugin has loaded (checked with osascript on the tablet). A value already in the environment wins.
+        if (bootArgSet("ci-mps=0")) setenv("CI_ENABLE_MPS", "0", 0);
+#endif
+#if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
         // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
         // GPU's window does not have. The render server (WindowServer) takes the same path as backboardd on iPadOS below (display hand-off
