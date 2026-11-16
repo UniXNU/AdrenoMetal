@@ -61,8 +61,10 @@ fn guard<T>(fallback: T, body: impl FnOnce() -> Result<T, String>) -> T {
             set_error(why);
             fallback
         }
-        Err(_) => {
-            set_error("panic in the Metal runtime".into());
+        Err(payload) => {
+            let why = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied()).unwrap_or("unknown panic payload");
+            set_error(format!("panic in the Metal runtime: {why}"));
             fallback
         }
     }
