@@ -34,7 +34,7 @@ static void saveState(NSString *state, const std::string &library = {}, const st
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--stop"))) return 64;
-        if (geteuid() != 0 || systemcache::writerDirectory().empty()) return 77;
+        if (geteuid() != 0 || setuid(0) != 0 || systemcache::writerDirectory().empty()) return 77;
         umask(0022);
         if (!strcmp(argv[1], "--stop")) {
             if (!SCWorkerRunning()) return 0;
