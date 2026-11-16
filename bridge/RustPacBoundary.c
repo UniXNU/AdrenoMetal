@@ -113,3 +113,9 @@ void *nmb_pac_dlsym(void *handle, const char *name)
     }
     return symbol;
 }
+
+extern int __cxa_atexit(void (*function)(void *), void *argument, void *shared_object);
+int nmb_pac_cxa_atexit(void *function, void *argument, void *shared_object)
+{
+    return __cxa_atexit((void (*)(void *))NMB_SIGN(function), argument, shared_object);
+}
