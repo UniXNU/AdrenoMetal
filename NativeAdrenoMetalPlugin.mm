@@ -428,7 +428,7 @@ static id deviceForPort(unsigned port) {
                         setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
                         setenv("NATIVE_METAL_DUMP_FUNCTIONS", "filter_distance,alpha_effect,accumulator,stroke_lines,plane_color,primitive_image", 0);
                         setenv("NATIVE_METAL_WARNINGS", "1", 0);
-                        setenv("METAL2VULKAN_LOG_PASSES", "RG32Float:*", 0);
+                        setenv("METAL2VULKAN_LOG_PASSES", "RG16Float:*", 0);
                         setenv("METAL2VULKAN_LOG_SHADOWS", "1", 0);
                         if (fields == 5 && pass && skipFirst && skipLast >= skipFirst) {
                             char skip[48];snprintf(skip, sizeof skip, "%u:%u:%u", pass, skipFirst, skipLast);
