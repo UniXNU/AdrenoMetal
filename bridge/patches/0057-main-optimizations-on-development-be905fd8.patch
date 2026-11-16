@@ -2115,7 +2115,7 @@ index b5ea87cf7..b84247aa2 100644
          drop(file);
          fs::rename(&temporary, path)
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
-index 12b7b5f35..717e2f8bf 100644
+index 12b7b5f35..9d6d69f14 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 @@ -83,6 +83,7 @@ pub(crate) use creation::VariantStages;
@@ -2126,7 +2126,7 @@ index 12b7b5f35..717e2f8bf 100644
  pub(crate) mod warm_refusals;
  pub(super) mod worker;
  
-@@ -445,6 +446,102 @@ impl CacheSetup {
+@@ -445,6 +446,105 @@ impl CacheSetup {
      }
  }
  
@@ -2158,7 +2158,10 @@ index 12b7b5f35..717e2f8bf 100644
 +        let name =
 +            records.name(&records.key(Making::new("device-entry-point-priming").digest(&key)));
 +        PrimingCache {
-+            store: Store::new(self.directory.clone(), sink, None),
++            store: match &self.directory {
++                Ok(directory) => Store::new(directory.clone(), sink, None),
++                Err(_) => Store::without_directory(this_build(), sink),
++            },
 +            identity,
 +            name,
 +            loaded: None,
@@ -2230,7 +2233,7 @@ index 12b7b5f35..717e2f8bf 100644
  /// records, the `VkPipelineCache` it keeps for each record, and the cache thread.
  pub(super) struct ShaderCache {
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/store.rs b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
-index 9c0e80dc5..f4233e3d4 100644
+index 9c0e80dc5..bd2512df0 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/store.rs
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/store.rs
 @@ -87,30 +87,57 @@ pub(crate) struct Directory {
@@ -2480,28 +2483,28 @@ index 9c0e80dc5..f4233e3d4 100644
              None => count(&self.counters.queued_hits),
          }
      }
-@@ -667,7 +785,19 @@ impl Store {
-             return Found::Queued(bytes);
+@@ -668,6 +786,20 @@ impl Store {
          }
          count(&self.counters.entry_reads);
--        timed(&self.counters.read_nanos, || {
-+        timed(&self.counters.read_nanos, || match self.read_own(path) {
-+            // What this directory lacks or cannot give, the system layer may hold.
-+            found @ (Found::Absent | Found::Failed) => match self.system_read(path) {
-+                Some(bytes) => Found::System(bytes),
-+                None => found,
-+            },
-+            found => found,
+         timed(&self.counters.read_nanos, || {
++            match self.read_own(directory, path) {
++                // What this directory lacks or cannot give, the system layer may hold.
++                found @ (Found::Absent | Found::Failed) => match self.system_read(path) {
++                    Some(bytes) => Found::System(bytes),
++                    None => found,
++                },
++                found => found,
++            }
 +        })
 +    }
 +
 +    /// [`Store::read`] of this directory's own file at `path`.
-+    fn read_own(&self, path: &Path) -> Found {
++    fn read_own(&self, directory: &Directory, path: &Path) -> Found {
 +        {
              let file = match fs::File::open(path) {
                  Ok(file) => file,
                  Err(error) if error.kind() == io::ErrorKind::NotFound => return Found::Absent,
-@@ -698,7 +828,7 @@ impl Store {
+@@ -698,7 +830,7 @@ impl Store {
                  }
                  Err(_) => Found::Failed,
              }
@@ -2510,7 +2513,7 @@ index 9c0e80dc5..f4233e3d4 100644
      }
  
      /// Give `bytes` to the cache thread to write as the entry named `name` (`worker.rs`): the
-@@ -779,8 +909,10 @@ impl Store {
+@@ -779,8 +911,10 @@ impl Store {
              return Err(io::Error::other("the entry is larger than the cache takes"));
          }
          let written = match bytes.len() >= chunks::WHOLE && directory.is_record(path) {
@@ -2523,7 +2526,7 @@ index 9c0e80dc5..f4233e3d4 100644
          };
          if let Ok(bytes) = &written {
              self.used.fetch_add(*bytes, Ordering::Relaxed);
-@@ -942,12 +1074,12 @@ impl Store {
+@@ -942,12 +1076,12 @@ impl Store {
  
  /// Write `bytes` as the file at `path`, named `name`: a temporary file beside it, flushed and
  /// renamed over it. Their length, or the failure (the temporary file is removed).
@@ -2539,7 +2542,7 @@ index 9c0e80dc5..f4233e3d4 100644
          file.write_all(bytes)?;
          drop(file);
          fs::rename(&temporary, path)?;
-@@ -1046,8 +1178,10 @@ fn last_use(metadata: &fs::Metadata) -> SystemTime {
+@@ -1046,8 +1180,10 @@ fn last_use(metadata: &fs::Metadata) -> SystemTime {
  }
  
  /// Refresh `file`'s access time: a hit makes its entry the most recently used. Best effort.
@@ -3242,6 +3245,21 @@ index ac79ef23d..5025ac09b 100644
          // Only a texture an image of binds into the heap's own memory is held to the heap's base,
          // and the routes decide that (`holds_heap_base`).
          check_heap_base(image.route, size_and_align.align)?;
+diff --git a/crates/metal2vulkan-runtime/src/texture/surface_pairs.rs b/crates/metal2vulkan-runtime/src/texture/surface_pairs.rs
+index 5c72aea2d..faadddc07 100644
+--- a/crates/metal2vulkan-runtime/src/texture/surface_pairs.rs
++++ b/crates/metal2vulkan-runtime/src/texture/surface_pairs.rs
+@@ -357,6 +357,10 @@ impl Device {
+                 alias: texels.buffer.alias().map(|alias| alias.key),
+                 conversion: Conversion::Pairs(Box::new(conversion)),
+                 pixel_format: layout.pixel_format,
++                _alive: super::ImageAlive::of(match &image.owner {
++                    super::Owner::Runtime { placement, .. } => placement.size(),
++                    _ => 0,
++                }),
+             },
+             shadow_key: image.identity.key,
+             shadow_range: UseRange::Image {
 diff --git a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs b/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
 index 3bad8e425..02f7bb62b 100644
 --- a/crates/metal2vulkan-runtime/src/texture/surface_two_planes.rs
@@ -3315,7 +3333,7 @@ index 22152956a..6031cfbf5 100644
                  let (image, copies) = self.ycbcr_write_shadow(call)?;
                  UsageShadow {
 diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
-index 804638f02..ab1fa3e0e 100644
+index 804638f02..2e4be4613 100644
 --- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
 +++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
 @@ -21,6 +21,25 @@
@@ -3398,7 +3416,7 @@ index 804638f02..ab1fa3e0e 100644
 +pub(crate) struct ImageAlive(u64);
 +
 +impl ImageAlive {
-+    fn of(bytes: u64) -> ImageAlive {
++    pub(super) fn of(bytes: u64) -> ImageAlive {
 +        IMAGES_ALIVE.fetch_add(1, Ordering::Relaxed);
 +        IMAGE_BYTES_ALIVE.fetch_add(bytes, Ordering::Relaxed);
 +        ImageAlive(bytes)
