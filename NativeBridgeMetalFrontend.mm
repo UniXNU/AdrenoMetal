@@ -5720,7 +5720,7 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("FP group %llu/%llu pools %llu/%llu linear %llu/%llu evict %llu",(ull)fast[0],(ull)fast[1],(ull)fast[2],(ull)fast[3],
     (ull)fast[4],(ull)fast[5],(ull)fast[6]);
    if(fast[9]==UINT64_MAX)row("CM calls %llu total %lluus",(ull)fast[7],(ull)fast[8]);
-   elserow("CM calls %llu us %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)fast[7],(ull)fast[8],(ull)fast[9],(ull)fast[10],(ull)fast[11],
+   else row("CM calls %llu us %llu/%llu/%llu/%llu/%llu/%llu/%llu",(ull)fast[7],(ull)fast[8],(ull)fast[9],(ull)fast[10],(ull)fast[11],
     (ull)fast[12],(ull)fast[13],(ull)fast[14]);
   }
   // The warm pass (records warmed, failed, unread, KiB of driver data) and where work ran: scheduler passes and batches at commit, render
