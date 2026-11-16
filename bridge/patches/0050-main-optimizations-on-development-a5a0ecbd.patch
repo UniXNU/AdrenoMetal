@@ -667,7 +667,7 @@ index efd709070..cf70123f0 100644
      }
      // The driver diagnostics this thread's call is measured to report: the driver reports them
 diff --git a/crates/metal2vulkan-runtime/src/device/mod.rs b/crates/metal2vulkan-runtime/src/device/mod.rs
-index ceb4b014f..52f79bce1 100644
+index ceb4b014f..8bacbd0f3 100644
 --- a/crates/metal2vulkan-runtime/src/device/mod.rs
 +++ b/crates/metal2vulkan-runtime/src/device/mod.rs
 @@ -31,6 +31,10 @@ pub(super) mod prime;
@@ -819,7 +819,7 @@ index ceb4b014f..52f79bce1 100644
 +                // Raw disk/cache I/O only: starting the ordinary guarded cache or its
 +                // worker before priming would change the destructor ordering it protects.
 +                let priming_cache = cache.priming(
-+                    &unsafe { instance.raw.get_physical_device_properties(physical) },
++                    &instance.raw.get_physical_device_properties(physical),
 +                    compile.profile_fingerprint(),
 +                    instance.settings,
 +                    prime::cache_key(priming_has, queue_family),
@@ -2969,7 +2969,7 @@ index 000000000..3325dd04c
 +    }
 +}
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index fcbae65fe..468a2bd51 100644
+index fcbae65fe..6a044c1ad 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -91,7 +91,7 @@ use super::image_plan::{
@@ -3025,7 +3025,7 @@ index fcbae65fe..468a2bd51 100644
 +                                    texels.buffer.length(),
 +                                )) =>
 +                    {
-+                        Ok(())
++                        Ok(Between::Unobserved)
 +                    }
 +                    holds => holds,
 +                };
