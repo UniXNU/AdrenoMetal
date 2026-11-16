@@ -3851,42 +3851,10 @@ index f94247315..95503a976 100644
      }
  }
 diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
-index 22a0042ed..a68d65b25 100644
+index 22a0042ed..33ad6b832 100644
 --- a/crates/metal2vulkan/src/lower/arith/math.rs
 +++ b/crates/metal2vulkan/src/lower/arith/math.rs
-@@ -980,13 +980,11 @@ impl FloatFn {
-             F::Rsqrt
-             | F::FastRsqrt
-             | F::FastSqrt
--            | F::Exp
--            | F::FastExp
-+                | F::FastExp
-             | F::Exp2
-             | F::Exp10
-             | F::FastExp10
--            | F::Log
--            | F::FastLog
-+                | F::FastLog
-             | F::Log2
-             | F::FastLog2
-             | F::Log10
-@@ -1086,13 +1084,11 @@ impl FloatFn {
-                 | F::FastAcos
-                 | F::Atan
-                 | F::FastAtan
--                | F::Exp
--                | F::FastExp
-+                        | F::FastExp
-                 | F::Exp2
-                 | F::Exp10
-                 | F::FastExp10
--                | F::Log
--                | F::FastLog
-+                        | F::FastLog
-                 | F::Log2
-                 | F::FastLog2
-                 | F::Log10
-@@ -1308,6 +1304,15 @@ pub fn float_fn(
+@@ -1308,6 +1308,15 @@ pub fn float_fn(
          // Rounded per step below.
          F::Mix | F::MulAdd | F::Fract | F::FastFract => r,
          F::Dot => narrow::round(fb, f.scalar_form(), r)?,
@@ -3902,7 +3870,7 @@ index 22a0042ed..a68d65b25 100644
          _ => narrow::round(fb, f, r)?,
      };
      Ok(r)
-@@ -1416,9 +1421,9 @@ fn float_fn_core(
+@@ -1416,9 +1425,9 @@ fn float_fn_core(
          F::MulAdd => {
              // A narrow form takes the unfused choice, each step rounded once by the device.
              let p = bin(fb, BinOp::FMul, a, arg(args, 1)?)?;
