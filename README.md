@@ -2,7 +2,7 @@
 
 Metal frontend through metal2vulkan and Turnip.
 
-The runtime uses the complete metal2vulkan `development` tree at `555b13d57e09bff70996a88cff64f1275256d5cf`, with the recorded consumer patch. A740 uses native float operations and RelaxedPrecision for eligible half instructions; float controls and PrecisionNote retain the device's precision bounds. Turnip enables concurrent binning and built-in fast border colors. `tu-cb=0` and `tu-fbc=0` select their diagnostic controls.
+The runtime uses the complete metal2vulkan `development` tree at `842fd73b71f4c595810651bb61d8a0c48f486845`, with the recorded consumer patch. A740 uses native float operations and RelaxedPrecision for eligible half instructions; float controls and PrecisionNote retain the device's precision bounds. Turnip enables concurrent binning and built-in fast border colors. `tu-cb=0` and `tu-fbc=0` select their diagnostic controls.
 
 From the resolved UniXNU tree, `python3 drivers/AdrenoMetal/tools/audit-runtime-fast-paths.py --fetch-mesa --output build/runtime-fast-paths.json` reports the source policy fields, float controls, accuracy ledger and pinned Turnip option registry. `--runtime-policy <runtime-policy.log>` attaches a captured device profile and runtime checks. Math operations follow upstream `Math::float_stems()`, `BinOp::ALL` and `PrecisionNote`, with their existing validation.
 
