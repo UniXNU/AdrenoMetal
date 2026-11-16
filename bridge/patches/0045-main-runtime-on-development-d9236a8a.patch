@@ -2021,6 +2021,97 @@ index de2d44dd0..bd3c84848 100644
      for &call in exit_guard::HOST_STEP {
          exit_guard::called(call);
      }
+diff --git a/crates/metal2vulkan-runtime/src/shader_cache/chunks.rs b/crates/metal2vulkan-runtime/src/shader_cache/chunks.rs
+index b5ea87cf7..33e23affa 100644
+--- a/crates/metal2vulkan-runtime/src/shader_cache/chunks.rs
++++ b/crates/metal2vulkan-runtime/src/shader_cache/chunks.rs
+@@ -182,6 +182,7 @@ pub(crate) fn listed(bytes: &[u8]) -> Option<(u64, Listed)> {
+ /// The chunk directory of a cache root (the module docs).
+ pub(crate) struct Chunks {
+     dir: PathBuf,
++    public: bool,
+ }
+ 
+ impl Chunks {
+@@ -189,9 +190,16 @@ impl Chunks {
+     pub(crate) fn of(root: &Path) -> Chunks {
+         Chunks {
+             dir: root.join("chunks"),
++            public: false,
+         }
+     }
+ 
++    /// Whether chunks and their directories are readable by every system-layer reader.
++    pub(crate) fn readable_by_all(mut self, public: bool) -> Chunks {
++        self.public = public;
++        self
++    }
++
+     /// The path of the chunk of SHA-256 `digest`.
+     fn path(&self, digest: &Hash256) -> PathBuf {
+         let name = hex(digest);
+@@ -201,6 +209,9 @@ impl Chunks {
+     /// The lock file, opened (made where missing).
+     fn lock(&self) -> io::Result<fs::File> {
+         create_private_dir_all(&self.dir)?;
++        if self.public {
++            make_readable(&self.dir, true)?;
++        }
+         fs::OpenOptions::new()
+             .read(true)
+             .write(true)
+@@ -233,7 +244,7 @@ impl Chunks {
+             let digest: Hash256 = Sha256::digest(chunk).into();
+             let path = self.path(&digest);
+             if !holds(&path, &digest) {
+-                write_chunk(&path, chunk)?;
++                write_chunk(&path, chunk, self.public)?;
+                 written += chunk.len() as u64;
+             }
+             listed.push((digest, chunk.len() as u32));
+@@ -428,9 +439,12 @@ fn holds(path: &Path, digest: &Hash256) -> bool {
+ }
+ 
+ /// Write `chunk` at `path`: a temporary file beside it, renamed over it.
+-fn write_chunk(path: &Path, chunk: &[u8]) -> io::Result<()> {
++fn write_chunk(path: &Path, chunk: &[u8], public: bool) -> io::Result<()> {
+     let parent = path.parent().expect("a chunk has a group directory");
+     create_private_dir_all(parent)?;
++    if public {
++        make_readable(parent, true)?;
++    }
+     let name = path
+         .file_name()
+         .and_then(|name| name.to_str())
+@@ -438,6 +452,9 @@ fn write_chunk(path: &Path, chunk: &[u8]) -> io::Result<()> {
+     let temporary = parent.join(format!(".{name}.{}.tmp", unique()));
+     let written = (|| {
+         let mut file = new_private_file(&temporary)?;
++        if public {
++            make_readable(&temporary, false)?;
++        }
+         file.write_all(chunk)?;
+         drop(file);
+         fs::rename(&temporary, path)
+@@ -447,3 +464,18 @@ fn write_chunk(path: &Path, chunk: &[u8]) -> io::Result<()> {
+     }
+     written
+ }
++
++/// System-layer chunks use the same directory and entry modes as their manifests.
++fn make_readable(path: &Path, directory: bool) -> io::Result<()> {
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        fs::set_permissions(
++            path,
++            fs::Permissions::from_mode(if directory { 0o755 } else { 0o644 }),
++        )?;
++    }
++    #[cfg(not(unix))]
++    let _ = (path, directory);
++    Ok(())
++}
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs b/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
 index 8346a54be..d7142a28f 100644
 --- a/crates/metal2vulkan-runtime/src/shader_cache/mod.rs
