@@ -31,6 +31,16 @@ static void saveState(NSString *state, const std::string &library = {}, const st
     [value writeToFile:SCPath(@"shader-cache.plist") atomically:YES];
 }
 
+static void startState() {
+    NSDictionary *saved = [NSDictionary dictionaryWithContentsOfFile:SCPath(@"shader-cache.plist")];
+    if (![saved[@"build"] isEqual:SCInstalledBuild()]) {saveState(@"running"); return;}
+    NSMutableDictionary *state = saved.mutableCopy;
+    state[@"state"] = @"running";
+    state[@"updated"] = NSDate.date;
+    state[@"error"] = @"";
+    [state writeToFile:SCPath(@"shader-cache.plist") atomically:YES];
+}
+
 int main(int argc, const char **argv) {
     @autoreleasepool {
         if (argc != 2 || (strcmp(argv[1], "--run") && strcmp(argv[1], "--stop"))) return 64;
@@ -47,7 +57,7 @@ int main(int argc, const char **argv) {
         unlink(SCPath(@"shader-cache.stop").fileSystemRepresentation);
         signal(SIGTERM, interruptWorker);
         signal(SIGINT, interruptWorker);
-        saveState(@"running");
+        startState();
         setpriority(PRIO_PROCESS, 0, 10);
         setenv("NATIVE_METAL_PRIMER", "1", 1);
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
