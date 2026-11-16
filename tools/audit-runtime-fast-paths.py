@@ -138,8 +138,13 @@ def main():
     ):
         text = read(args.translator, path)
         for name in names:
-            contents, offset = body(text, r'\bfn ' + name + r'\b')
-            gates.append(dict(file=path, symbol=name, line=text.count('\n', 0, offset) + 1, expression=contents.strip()))
+            pattern = r'\bfn ' + name + r'\b'
+            if name == 'half_controls' and not re.search(pattern, mask(text)):
+                gates.append(dict(file=path, symbol=name, available=False))
+                continue
+            contents, offset = body(text, pattern)
+            gates.append(dict(file=path, symbol=name, available=True,
+                              line=text.count('\n', 0, offset) + 1, expression=contents.strip()))
     mesa_text = {}
     for name in MESA_FILES:
         mesa_text[name] = read(mesa, name)
