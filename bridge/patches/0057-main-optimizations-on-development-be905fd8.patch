@@ -3824,7 +3824,7 @@ index b8b21c2ec..aee5670af 100644
      pub(super) fn source(&self) -> (YCbCrPlanes, Range<u64>) {
          (self.source.0, self.source.1.clone())
 diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
-index f9a1577b4..797f8357a 100644
+index f9a1577b4..bb1ea988e 100644
 --- a/crates/metal2vulkan/src/cache/mod.rs
 +++ b/crates/metal2vulkan/src/cache/mod.rs
 @@ -61,7 +61,7 @@ mod tests;
@@ -3832,7 +3832,7 @@ index f9a1577b4..797f8357a 100644
  /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
  /// history.
 -pub const SEMANTICS_VERSION: u32 = 2137;
-+pub const SEMANTICS_VERSION: u32 = 0x8000_0000 | 2137;
++pub const SEMANTICS_VERSION: u32 = 0xa000_0000 | 2137;
  
  /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
  /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
@@ -4008,6 +4008,19 @@ index 7b68b48dd..138a267f0 100644
  fn fallback_view(p: &DeviceProfile, window: Window) -> ViewKind {
      let limits = &p.fields().limits;
      let bytes = uniform_bytes(window, limits).unwrap_or(limits.max_uniform_buffer_range & !15);
+diff --git a/crates/metal2vulkan/src/lower/arith/chunk.rs b/crates/metal2vulkan/src/lower/arith/chunk.rs
+index 4acf87af8..8fe5fc220 100644
+--- a/crates/metal2vulkan/src/lower/arith/chunk.rs
++++ b/crates/metal2vulkan/src/lower/arith/chunk.rs
+@@ -429,7 +429,7 @@ pub fn dot(
+         });
+     }
+     let sum = sum.ok_or_else(operand_error)?;
+-    narrow::round(fb, elem, sum)
++    narrow::round_native(fb, elem, sum)
+ }
+ 
+ /// The words of [`dot`] on `lanes` lanes of `elem`.
 diff --git a/crates/metal2vulkan/src/lower/arith/divide.rs b/crates/metal2vulkan/src/lower/arith/divide.rs
 index f0a76a7d5..1be006b1d 100644
 --- a/crates/metal2vulkan/src/lower/arith/divide.rs
@@ -4035,27 +4048,48 @@ index f0a76a7d5..1be006b1d 100644
          Some(FloatFmt::F32) => scaled(fb, f, x, y),
          Some(FloatFmt::Half) => {
              let q = scaled(fb, f, x, y)?;
+diff --git a/crates/metal2vulkan/src/lower/arith/fma.rs b/crates/metal2vulkan/src/lower/arith/fma.rs
+index 1f8929106..f967e1adc 100644
+--- a/crates/metal2vulkan/src/lower/arith/fma.rs
++++ b/crates/metal2vulkan/src/lower/arith/fma.rs
+@@ -171,7 +171,7 @@ pub fn emit(fb: &mut FunctionBuilder<'_>, fma: Fma, args: &[Value]) -> BResult<V
+         (Route::Native, Some(FloatFmt::F32)) => fb.glsl(GlslOp::Fma, &[a, b, c]),
+         (Route::Native, Some(FloatFmt::Half)) => {
+             let r = fb.glsl(GlslOp::Fma, &[a, b, c])?;
+-            narrow::round(fb, fma.form, r)
++            narrow::round_native(fb, fma.form, r)
+         }
+         _ => Err(BuildError::Type(TypeRule::FunctionSignature)),
+     }
 diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
-index 759be5b59..a8609c6f0 100644
+index 759be5b59..b3e6e673d 100644
 --- a/crates/metal2vulkan/src/lower/arith/math.rs
 +++ b/crates/metal2vulkan/src/lower/arith/math.rs
-@@ -1316,6 +1316,15 @@ pub fn float_fn(
+@@ -1312,10 +1312,21 @@ pub fn float_fn(
+     let r = match op {
+         _ if op.closed_on_narrow() => r,
+         // A `half` `mix`, the device's `FMix` in `float`, rounds once.
+-        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round(fb, f, r)?,
++        F::Mix if f.float_fmt() == Some(FloatFmt::Half) => narrow::round_native(fb, f, r)?,
          // Rounded per step below.
          F::Mix | F::MulAdd | F::Fract | F::FastFract => r,
-         F::Dot => narrow::round(fb, f.scalar_form(), r)?,
+-        F::Dot => narrow::round(fb, f.scalar_form(), r)?,
++        F::Dot => narrow::round_native(fb, f.scalar_form(), r)?,
 +        // One device instruction on the operands: the device's own at its 16-bit precision
 +        // where the module leaves `half` results to it.
 +        F::Sqrt
 +        | F::FastSqrt
 +        | F::Rsqrt
 +        | F::FastRsqrt
++        | F::Exp
 +        | F::Exp2
++        | F::Log
 +        | F::Log2
 +        | F::FastLog2 => narrow::round_native(fb, f, r)?,
          _ => narrow::round(fb, f, r)?,
      };
      Ok(r)
-@@ -1438,9 +1447,9 @@ fn float_fn_core(
+@@ -1438,9 +1449,9 @@ fn float_fn_core(
          F::MulAdd => {
              // A narrow form takes the unfused choice, each step rounded once by the device.
              let p = bin(fb, BinOp::FMul, a, arg(args, 1)?)?;
@@ -4091,7 +4125,7 @@ index 86e8ff9aa..4b88fc411 100644
      cx.families.arith.native_half_nans = cx.families.arith.quantize == QuantizeForm::Controlled;
      cx.families.arith.controls = narrow::half_controls(cx.profile);
 diff --git a/crates/metal2vulkan/src/lower/arith/narrow.rs b/crates/metal2vulkan/src/lower/arith/narrow.rs
-index b82de9a78..36eab84a5 100644
+index b82de9a78..623b05d5d 100644
 --- a/crates/metal2vulkan/src/lower/arith/narrow.rs
 +++ b/crates/metal2vulkan/src/lower/arith/narrow.rs
 @@ -140,6 +140,48 @@ pub fn round(fb: &mut FunctionBuilder<'_>, f: Form, x: Value) -> BResult<Value>
@@ -4120,7 +4154,7 @@ index b82de9a78..36eab84a5 100644
 +}
 +
 +/// [`round`] of `x`, the result of ONE device instruction on `half` operands held widened (a
-+/// `half` `+ - * /` or a function the device has an instruction for).
++/// `half` `+ - * /`, `fma`, `dot`, `mix`, or a function the device has an instruction for).
 +/// Where the module leaves such results to the device (`ModuleBuilder::relaxed_half`,
 +/// [`relaxes`]) the result is `x` itself, recorded for the serializer to decorate
 +/// `RelaxedPrecision`: the device computes the instruction at its 16-bit precision, on its
