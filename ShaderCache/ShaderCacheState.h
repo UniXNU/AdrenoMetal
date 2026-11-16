@@ -7,7 +7,7 @@
 
 static NSString *const SCStorage = @"/private/var/tmp/NativeAdrenoMetal.cache";
 static NSString *const SCPlugin = @"/Library/GPUBundles/NativeAdrenoMetal.bundle";
-static NSString *const SCApplication = @"/Library/GPUBundles/Shader Cache.app";
+static NSString *const SCApplication = @"/Applications/Shader Cache.app";
 
 static NSString *SCPath(NSString *name) {return [SCStorage stringByAppendingPathComponent:name];}
 static NSString *SCInstalledBuild() {

@@ -62,7 +62,7 @@ Each process keeps its pipeline cache in the first directory its sandbox lets it
 
 System cache readers reconstruct chunked records through the same owner, permissions and link checks used for whole records. Chunk files retain the shared cache directory permissions.
 
-On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON.
+On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The macOS addon installs the app at `/Applications/Shader Cache.app`. A login agent registers it with LaunchServices for each Aqua session so it appears in Launchpad. Registration does not start shader compilation. Its `--status` argument prints the current state as JSON.
 
 On iPadOS, the render server compiles the inventory while idle. The build embeds the OS library inventory, and `prime.log` records the build, scope and completion result.
 
