@@ -4393,10 +4393,10 @@ index 2c92a0344..88f409526 100644
 +    }
 +}
 diff --git a/crates/metal2vulkan/src/tests/engine_native_half.rs b/crates/metal2vulkan/src/tests/engine_native_half.rs
-index 4e6b1b0ed..32656a942 100644
+index 4e6b1b0ed..8be501e81 100644
 --- a/crates/metal2vulkan/src/tests/engine_native_half.rs
 +++ b/crates/metal2vulkan/src/tests/engine_native_half.rs
-@@ -1188,6 +1188,63 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
+@@ -1188,6 +1188,65 @@ fn a_half_read_from_memory_is_the_devices_widening_on_every_profile() {
      assert_eq!(forms.len(), 3, "a profile of each form: {forms:?}");
  }
  
@@ -4457,6 +4457,8 @@ index 4e6b1b0ed..32656a942 100644
 +        let a = compile(&bc, "half_sum", &p).expect(stem);
 +        assert_eq!(relaxed_decorations(&a.module.words), 0, "{stem}");
 +    }
++}
++
  /// Kernels of one `half` `+ - *` each on the two `float`s narrowed: under fast math (`contract` and
  /// `reassoc`, left to the device's compiler), under `contract` alone and with no flag (kept
  /// apart).
