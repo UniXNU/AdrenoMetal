@@ -33,7 +33,9 @@
 #include "NativeGpuTrace.h"
 #include "NativeMetalBridgePhase.h"
 #include "CacheExport.h"
+#if !TARGET_OS_OSX
 #include "PrimeShaders.h"
+#endif
 #include "ExceptionDiag.h"
 
 #if TARGET_OS_OSX
@@ -224,6 +226,14 @@ static id clientDevice(unsigned port) {
     }
     // IOSurfaces this GPU reads or writes must be plain rows, as in the render server.
     CFPreferencesSetAppValue(CFSTR("CAEnableIOSurfaceCompression"), kCFBooleanFalse, kCFPreferencesCurrentApplication);
+#if TARGET_OS_OSX
+    if (geteuid() == 0 && getenv("NATIVE_METAL_PRIMER")) {
+        const std::string root = systemcache::writerDirectory();
+        if (root.empty()) return nil;
+        native_bridge_metal_system_cache(nullptr, nullptr, 0, true);
+        return native_bridge_metal_open(turnip, root.c_str(), registryID, nullptr);
+    }
+#endif
     char candidates[3][512] = {};
     if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
     if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[1], sizeof candidates[1] - 16)) candidates[1][0] = 0;
@@ -357,7 +367,9 @@ static id deviceForPort(unsigned port) {
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
         if (getenv("SHENG_DIAG")) {
-            setenv("NATIVE_METAL_BOOT_SESSION", prime::bootSession().c_str(), 1);
+            char boot[64] = {};
+            size_t size = sizeof boot - 1;
+            if (!sysctlbyname("kern.bootsessionuuid", boot, &size, nullptr, 0)) setenv("NATIVE_METAL_BOOT_SESSION", boot, 1);
             setenv("METAL2VULKAN_ENCODER_TIMES", "8ms", 1);
             setenv("METAL2VULKAN_QUEUE_TIMES", "1", 1);
         }
@@ -642,9 +654,8 @@ static id deviceForPort(unsigned port) {
                 return nullptr;
             }, gpu);
         }
-        // Every Metal library of the OS through the runtime, 90 s after the render server opened the device (PrimeShaders.h); the boots that froze
-        // or crashed before three minutes never primed anything. Progress is kept in the Data cache directory, so later boots resume.
-        // The translator recurses deeply on large functions: give it the stack of a main thread.
+#if !TARGET_OS_OSX
+        // The iPadOS primer uses an 8 MiB stack for large translated functions.
         pthread_attr_setstacksize(&attributes, 8u << 20);
         pthread_t primer;
         if (!bootArgSet("gpu-prime=0")) pthread_create(&primer, &attributes, [](void *) -> void * {
@@ -655,6 +666,7 @@ static id deviceForPort(unsigned port) {
                            gFillsSystemCache);
                 return nullptr;
             }, nullptr);
+#endif
         pthread_attr_destroy(&attributes);
         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
         // kernel's GPU trace as a problem record (event 65).

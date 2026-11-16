@@ -624,6 +624,7 @@ static void logTexture(const char *kind,MTLTextureDescriptor *d,IOSurfaceRef sur
 // planes, requested plane, plane offset, plane row bytes and allocation, and the descriptor's size and pixel format.
 struct SurfaceRefusal {uint32_t step,format,planes,plane,pixelFormat;uint64_t offset,row,allocation,width,height,surfaceWidth,surfaceHeight,rotation;bool framebufferOnly;};
 static SurfaceRefusal gSurfaceLastRefusal;
+#if !TARGET_OS_OSX
 // Shader priming's progress (PrimeShaders.h, in the plugin), for the PR row. Weak here: the plugin's own definition wins, and a host
 // binary that links the frontend without the plugin (every check-*-host.py test) has zeroes instead of an undefined symbol.
 extern "C" {
@@ -642,6 +643,7 @@ __attribute__((weak)) volatile uint32_t native_prime_functions_skipped;
 __attribute__((weak)) volatile uint32_t native_prime_inventory_failed;
 __attribute__((weak)) volatile uint32_t native_prime_scope;              // 0 no pass yet, 1 loaded bundles only, 2 the whole system
 }
+#endif
 static void refuseSurface(uint32_t step,IOSurfaceRef surface,MTLTextureDescriptor *d,NSUInteger plane,uint64_t offset,uint64_t row) {
  gSurfaceRefusals++;
  SurfaceRefusal r={step,surface?IOSurfaceGetPixelFormat(surface):0,surface?(uint32_t)IOSurfaceGetPlaneCount(surface):0,(uint32_t)plane,
@@ -5697,9 +5699,11 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
    row("SCc drv truncated %llu mismatched %llu",(ull)sc[21],(ull)sc[22]);
   }
  }
+#if !TARGET_OS_OSX
  row("PR compiling=%u libs=%u/%u made=%u rate=%u resumed=%u",native_prime_compiling,native_prime_libraries_done,native_prime_libraries_total,native_prime_made,native_prime_rate,native_prime_functions_resumed);
  row("PRc state=%u failed=%u refused=%u bad=%u missing=%u",native_prime_pass_complete,native_prime_libraries_failed,
   native_prime_functions_refused,native_prime_functions_skipped,native_prime_inventory_failed);
+#endif
  // Priming's reach and the system shader cache. PRb: the pass's scope (1 the bundles loaded here, 2 the whole system), the libraries
  // it compiled itself, those it leaves out (other GPUs' driver bundles, or not loaded here), the system cache's state here (0 not
  // named, 1 read, 2 filled by this process, 3 refused) and what this process published: the entries and KiB its cache directory
@@ -5709,8 +5713,12 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   uint64_t sc[24]={},sy[4]={};
   if(gDevice)(void)nmb_device_shader_cache_detail(gDevice,sc);
   (void)nmb_system_cache_counts(sy);
+#if !TARGET_OS_OSX
   row("PRb scope=%u primed=%u left=%u | system %d pub %llu/%lluK",native_prime_scope,native_prime_libraries_primed,
    native_prime_libraries_skipped,gSystemCacheState,(ull)(gSystemCacheState==2?sc[11]+sc[12]:0),(ull)(gSystemCacheState==2?sc[13]>>10:0));
+#else
+  row("SY system %d pub %llu/%lluK",gSystemCacheState,(ull)(gSystemCacheState==2?sc[11]+sc[12]:0),(ull)(gSystemCacheState==2?sc[13]>>10:0));
+#endif
   if(gSystemCacheState==1 || gSystemCacheState==3)
    row("SY read %llu/%lluK rej %llu refused %llu replies %llu",(ull)sy[0],(ull)(sy[3]>>10),(ull)sy[1],(ull)sy[2],(ull)gCompileSystem.load());
  }

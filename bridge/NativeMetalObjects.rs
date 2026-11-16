@@ -239,13 +239,14 @@ impl PipelineRecords {
     }
 }
 
-/// The work placement the bridge asks of the runtime, as bits: 1 render encoder calls lowered on the device's lowering thread,
-/// 2 a command buffer submitted at its commit (`commit_and_submit`), 4 the warm pass over the pipeline records of earlier
-/// processes. All three by default; `NATIVE_METAL_FLOW=<number>` (the boot argument `metal-flow=<number>`) states the bits, 0 none.
+/// Work placement: bit 1 lowers on the device's worker, bit 2 submits at commit.
+/// iPadOS also supports bit 4 for warming earlier pipeline records. Defaults are
+/// 3 on macOS and 7 on iPadOS; `NATIVE_METAL_FLOW` selects the bits.
 fn flow_bits() -> u32 {
     static BITS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *BITS.get_or_init(|| {
-        std::env::var("NATIVE_METAL_FLOW").ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(7)
+        let bits = std::env::var("NATIVE_METAL_FLOW").ok().and_then(|value| value.trim().parse::<u32>().ok()).unwrap_or(7);
+        if cfg!(target_os = "macos") { bits & 3 } else { bits }
     })
 }
 

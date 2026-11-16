@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: MIT
-// The render server primes the OS inventory on a background thread while the desktop is idle. Kernel entry points
-// use default function constants; vertex entry points use a matching fragment function with BGRA8 and RGBA16Float targets.
-// prime-done records fully compiled libraries. prime-fn2 and prime-refused2 record successful and refused entry points
-// for the current runtime build; prime-current identifies an interrupted compile and prime-bad records that entry point.
-// The next process resumes successful work and retains refusal counts. PRc and prime.log report the pass's completion.
+// Inventory compilation shared by Shader Cache on macOS and the iPadOS render server.
 #pragma once
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -23,6 +19,7 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <functional>
 
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 
@@ -44,6 +41,12 @@ volatile uint32_t native_prime_pass_complete, native_prime_libraries_failed, nat
 
 extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
+static std::function<void(const std::string &, const std::string &)> progress;
+static std::function<bool()> cancelled;
+static bool stopping() {return cancelled && cancelled();}
+static void report(const std::string &library = {}, const std::string &function = {}) {
+    if (progress) progress(library, function);
+}
 #if TARGET_OS_OSX
 // macOS: the system apps are in /System/Applications; the OS cryptex is reached through /System/Cryptexes/OS as on iPadOS.
 static const char *const kRoots[] = {"/System/Library", "/System/Applications", "/Applications", "/System/Cryptexes/OS/System/Library"};
@@ -148,12 +151,13 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
 // a quarter of a run's two-second windows, and a desktop in use ran at 18 to 20 submissions a second, under the bar above, so priming
 // compiled through it (in four runs' process samples the priming thread was compiling or writing its progress in 88 to 94 % of the
 // samples, in two of them beside the encoding thread's draws). There any command buffer in the window is the render server at work.
-#if TARGET_OS_OSX
-static constexpr unsigned kQuietCommits = 0;
-#else
+#if !TARGET_OS_OSX
 static constexpr unsigned kQuietCommits = 8;
 #endif
 static uint64_t waitForQuiet() {
+#if TARGET_OS_OSX
+    return 0;
+#else
     const uint64_t began = nowMs();
     uint64_t quietSince = 0;
     bool busy = false;
@@ -170,6 +174,7 @@ static uint64_t waitForQuiet() {
         else if (now - quietSince >= 2000) return now - began;
         usleep(100000);
     }
+#endif
 }
 
 #if TARGET_OS_OSX
@@ -347,6 +352,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                            const std::string &build, bool &complete) {
     complete = false;
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
+    const unsigned earlierRefusals = native_prime_functions_refused;
     uint64_t waited = 0;
     std::string firstRefusal;   // the first refused function and why, so the log tells translator gaps from unspecialized constants
     const uint64_t began = nowMs();
@@ -362,6 +368,9 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         NSArray<NSString *> *entries = [lib respondsToSelector:@selector(nb_primeFunctionNames)] ? [(NSObject *)lib nb_primeFunctionNames] : names;
         for (NSString *name in entries) {
             @autoreleasepool {
+                if (stopping()) break;
+                native_prime_functions_refused = earlierRefusals + refused;
+                report(path, name.UTF8String);
                 const std::string key = path + "\t" + name.UTF8String;
                 const std::string doneKey = key + "\t" + build;
                 native_prime_compiling = 3;
@@ -370,7 +379,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 if (refusedDone.count(attemptKey)) {++refused; continue;}
                 if (functionsDone.count(doneKey)) {++made; native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
                 id<MTLFunction> function = defaultFunction(lib, name, zeroed);
-                if (!function) {++refused; appendLine(refusedPath, attemptKey); continue;}
+                if (!function) {++refused; native_prime_functions_refused = earlierRefusals + refused; appendLine(refusedPath, attemptKey); report(path, name.UTF8String); continue;}
                 const MTLFunctionType type = function.functionType;
                 if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
                 waited += waitForQuiet();
@@ -414,6 +423,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                             d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
                             NSError *half = nil;
                             if ([device newRenderPipelineStateWithDescriptor:d error:&half]) ++halfMade;
+                            else {ok = false; error = half;}
                         }
                     }
                 } @catch (NSException *exception) {
@@ -429,6 +439,8 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     if (firstRefusal.size() > 220) firstRefusal.resize(220);
                     for (char &c : firstRefusal) if (c == '\n' || c == '\t') c = ' ';
                 }
+                native_prime_functions_refused = earlierRefusals + refused;
+                report(path, name.UTF8String);
                 error = nil;
                 // Low priority already; a short pause between pipelines keeps the render server's own work ahead.
                 usleep(20000);
@@ -436,7 +448,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         }
     }
     unlink(current.c_str());
-    native_prime_functions_refused = native_prime_functions_refused + refused;
+    native_prime_functions_refused = earlierRefusals + refused;
     native_prime_functions_skipped = native_prime_functions_skipped + skipped;
     complete = refused == 0 && skipped == 0;
     char line[200];
@@ -455,17 +467,27 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     const std::string donePath = root + "/prime-done", badPath = root + "/prime-bad", current = root + "/prime-current",
                       logPath = root + "/prime.log";
+#if !TARGET_OS_OSX
     const std::string resume = root + "/prime-resume";
     const bool planned = access(resume.c_str(), F_OK) == 0;
     if (planned) unlink(resume.c_str());
     else for (const std::string &line : readLines(current)) appendLine(badPath, line);
+#endif
     unlink(current.c_str());
     sleep(delaySeconds);
+#if TARGET_OS_OSX
+    const std::set<std::string> bad;
+#else
     const std::set<std::string> bad = readLines(badPath);
+#endif
     std::set<std::string> done = readLines(donePath);
     const std::string functionsPath = root + "/prime-fn2", refusedPath = root + "/prime-refused2";
     const std::set<std::string> functionsDone = readLines(functionsPath);
+#if TARGET_OS_OSX
+    const std::set<std::string> refusedDone;
+#else
     const std::set<std::string> refusedDone = readLines(refusedPath);
+#endif
     const uint64_t began = nowMs();
     unsigned libs = 0, finished = 0, foreign = 0;
     std::string note;
@@ -498,9 +520,12 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     for (const std::string &path : paths) if (selected(path)) ++eligible;
     native_prime_libraries_total = eligible;
     native_prime_scope = scope;
+    report();
     for (const std::string &path : paths) {
+        if (stopping()) break;
         ++libs;
         native_prime_libraries_done = finished;
+        report(path);
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) {native_prime_libraries_failed = native_prime_libraries_failed + 1; continue;}
         if (!selected(path)) {
@@ -513,6 +538,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         if (done.count(id)) {++finished; continue;}
         bool complete = false;
         appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, refusedPath, refusedDone, build, complete));
+        if (stopping()) break;
         native_prime_libraries_primed = native_prime_libraries_primed + 1;
         if (complete) {
             appendLine(donePath, id);
@@ -525,6 +551,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     native_prime_libraries_done = finished;
     native_prime_compiling = 0;
     native_prime_pass_complete = eligible && finished == eligible && !native_prime_libraries_failed && !native_prime_inventory_failed ? 1 : 2;
+    report();
     char line[512];
     snprintf(line, sizeof line, "pass boot=%s scope=%u build=%s inputs=3 libraries=%u eligible=%u finished=%u failed=%u refused=%u bad=%u missing=%u excluded=%u binary=%zu complete=%u ms=%llu",
              boot.c_str(), scope, build.c_str(), libs, eligible, finished, native_prime_libraries_failed, native_prime_functions_refused, native_prime_functions_skipped,
