@@ -41,9 +41,9 @@ size_t nmb_device_name(const NmbDevice *, char *out, size_t size);
 uint64_t nmb_device_max_buffer_length(const NmbDevice *);
 // Pipeline makings (count, total us, longest us, waited us, failed), sink messages (info, warning+), shader cache hits/misses/writes.
 bool nmb_device_work_stats(const NmbDevice *, uint64_t out[10]);
-/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, compute pipeline hits and misses, render pipeline hits and misses,
+/* The shader cache's full counts in 24 words: hits, misses, function hits and misses, driver data found and unchanged, render pipeline hits and misses,
  * rejected, read failures, writes, writes queued, writes on a calling thread, bytes written, queued hits, write failures, evictions, driver cache loads,
- * driver pipeline hits, driver pipeline misses, driver saves, then three spare zeros. */
+ * driver pipeline hits, driver pipeline misses, driver saves, truncated driver data, mismatched driver data, then one spare zero. */
 bool nmb_device_shader_cache_detail(const NmbDevice *, uint64_t out[24]);
 /* The read-only system cache layer of the device opened after this call: the directory at root, read only where it, every directory
  * on the way to an entry and the entry are owned by one of the count user ids and not writable by group or others, never through a
@@ -67,13 +67,16 @@ bool nmb_device_texture_counts(const NmbDevice *, uint64_t out[8]);
 // Records warmed, failed and unread, driver bytes the warm pass added; scheduler passes and batches submitted on the committing thread;
 // render log waits, and encoder ends the lowering thread lowered.
 bool nmb_device_flow_counts(const NmbDevice *, uint64_t out[8]);
+// Grouped submissions/batches, command pools made/reused, linear passes in place/through copies, region pipelines evicted;
+// commit calls and microseconds in total/lowering/recording/pipeline wait/lock wait/scheduler pass/submission.
+bool nmb_device_fast_path_counts(const NmbDevice *, uint64_t out[15]);
 // Passes begun as instances, split inline; instance splits for a barrier, tile memory, a memoryless write, a pending pipeline; stand-ins
 // made and their bytes; stand-in copies made and those made at draws.
 bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
-// Live blocks of the runtime's own device memory (bridge patch 0031): seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
+// Live blocks of the runtime's own device memory: seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
 // larger) of pooled blocks with a placement [0], pooled blocks kept empty [7], spare image blocks [14], dedicated blocks of an image
 // [21] and of a buffer [28]; bytes of the spare blocks [35] and of the dedicated blocks of images [36] and buffers [37]; lazily
 // allocated blocks with a placement [38] and kept without one [42], each as blocks, bytes, blocks the driver committed, bytes it
@@ -200,6 +203,8 @@ NmbTexture *nmb_texture_new_view_swizzle(NmbTexture *, uint64_t format, uint64_t
 uint32_t nmb_function_constant_count(const NmbFunction *);
 size_t nmb_function_constant_name_size(const NmbFunction *, uint32_t at);
 bool nmb_function_constant_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t *index, uint64_t *data_type, bool *required);
+int32_t nmb_function_attribute_count(const NmbFunction *);
+size_t nmb_function_attribute_at(const NmbFunction *, uint32_t at, char *name, size_t capacity, uint64_t facts[5]);
 bool nmb_render_set_viewports(NmbEncoder *, const double *values, size_t count);
 bool nmb_render_set_scissors(NmbEncoder *, const uint64_t *values, size_t count);
 void nmb_texture_release(NmbTexture *);

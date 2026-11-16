@@ -348,14 +348,19 @@ static id deviceForPort(unsigned port) {
         // draws on a small part of its target otherwise pays for whole. The colour order of GMEM loads and stores is the image's own
         // swap on the memory side (patches/mesa/turnip-gmem-memory-side-swap.patch). The RM row of the memory log counts both kinds;
         // tu-debug= (for instance gmem,nocb: every pass in tile memory, no concurrent binning) overrides this.
-        // Concurrent binning is a Turnip option that is off unless asked for (tu_allow_concurrent_binning, read from the environment
-        // by Mesa's option parser): with it the BV thread bins a pass while BR still renders the one before. tu-cb=1 turns it on.
-        // It stays at Mesa's default, off: what it gains here was never measured.
-        if (bootArgSet("tu-cb=1")) setenv("tu_allow_concurrent_binning", "true", 0);
+        // A7xx bins on BV while BR renders; Turnip retains its per-pass LRZ, query and hardware-binning checks.
+        setenv("tu_allow_concurrent_binning", bootArgSet("tu-cb=0") ? "false" : "true", 1);
+        // A740 has the sampler's built-in border constants; custom colors retain Turnip's table route.
+        setenv("tu_enable_fast_border_color_for_undefined_formats", bootArgSet("tu-fbc=0") ? "false" : "true", 1);
         // diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
         if (bootArgSet("diag=1") || bootArgSet("gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
         else unsetenv("SHENG_DIAG");
+        if (getenv("SHENG_DIAG")) {
+            setenv("NATIVE_METAL_BOOT_SESSION", prime::bootSession().c_str(), 1);
+            setenv("METAL2VULKAN_ENCODER_TIMES", "8ms", 1);
+            setenv("METAL2VULKAN_QUEUE_TIMES", "1", 1);
+        }
         if (bootArgSet("gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
         else unsetenv("SHENG_GPU_TRACE");
         // The bridge's work placement (metal-flow=<bits>, read below). Any value logs the FL counts
@@ -389,6 +394,35 @@ static id deviceForPort(unsigned port) {
         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
         else unsetenv("SHENG_LOG_GPU");
+#if TARGET_OS_OSX
+        // ci-mps=0 selects Core Image's own blur kernels. Core Image reads this at its first blur;
+        // an explicit environment value takes precedence.
+        if (bootArgSet("ci-mps=0")) setenv("CI_ENABLE_MPS", "0", 0);
+        if (!strcmp(getprogname(), "iconservicesagent")) {
+            char args[1100] = {};
+            size_t size = sizeof args - 1;
+            if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0)
+                if (const char *at = bootArgToken(args, "icon-cb=")) {
+                    unsigned first = 0, count = 0, pass = 0, skipFirst = 0, skipLast = 0;
+                    const int fields = sscanf(at + strlen("icon-cb="), "%u:%u:%u:%u:%u", &first, &count, &pass, &skipFirst, &skipLast);
+                    if ((fields == 2 || fields == 5) && first && count && count <= 32) {
+                        char range[32];snprintf(range, sizeof range, "%u:%u", first, count);
+                        setenv("NATIVE_METAL_DUMP_CB", range, 0);
+                        setenv("NATIVE_METAL_DUMP_LOG", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_FILE", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_PASS", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_INPUTS", "1", 0);
+                        setenv("NATIVE_METAL_DUMP_DRAWS", "1:64", 0);
+                        setenv("NATIVE_METAL_DUMP_WORDS", "32", 0);
+                        setenv("NATIVE_METAL_DUMP_FUNCTIONS", "alpha_effect,accumulator_color,stroke_lines,plane_color,primitive_image", 0);
+                        if (fields == 5 && pass && skipFirst && skipLast >= skipFirst) {
+                            char skip[48];snprintf(skip, sizeof skip, "%u:%u:%u", pass, skipFirst, skipLast);
+                            setenv("NATIVE_METAL_SKIP_DRAWS", skip, 0);
+                        }
+                    }
+                }
+        }
+#endif
 #if TARGET_OS_OSX
         // macOS: Turnip opens the accelerator by class (AGXAccelerator here); the display takes plain rows (no Apple framebuffer or IOSurface
         // compression). The runtime keeps its default block size: the virtual-machine board shrank it for a 512 MiB GPU pool, which this
