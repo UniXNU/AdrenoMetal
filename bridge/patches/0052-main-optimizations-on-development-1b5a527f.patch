@@ -3322,7 +3322,7 @@ index 22152956a..6031cfbf5 100644
                  let (image, copies) = self.ycbcr_write_shadow(call)?;
                  UsageShadow {
 diff --git a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
-index 0d1f77e3e..829beda09 100644
+index 0d1f77e3e..af29aefc5 100644
 --- a/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
 +++ b/crates/metal2vulkan-runtime/src/texture/ycbcr_image.rs
 @@ -21,6 +21,25 @@
@@ -3615,7 +3615,7 @@ index 0d1f77e3e..829beda09 100644
 +                "an image made later for a texture made with its image",
 +            ));
 +        };
-+        let storage = self.device().converted_storage(
++        let storage = self.generation().converted_storage(
 +            call,
 +            Arc::clone(texels),
 +            &later.descriptor,
@@ -3632,6 +3632,15 @@ index 0d1f77e3e..829beda09 100644
      /// The uniform texel buffer view of the texture's planes read in place (the module docs), made
      /// at its first bind and kept with the texels. Internal for a texture whose planes are not.
      pub(crate) fn planes_view(&self) -> Result<vk::BufferView, Error> {
+@@ -430,7 +604,7 @@ impl Texture {
+     /// texture whose planes take no such image.
+     pub(crate) fn planes_image_view(&self) -> Result<vk::ImageView, Error> {
+         match self
+-            .0
++            .s()
+             .planes_in_place
+             .as_ref()
+             .and_then(|p| p.image.as_ref())
 diff --git a/crates/metal2vulkan-runtime/src/used_resources.rs b/crates/metal2vulkan-runtime/src/used_resources.rs
 index 00af12151..3bcfe3d4a 100644
 --- a/crates/metal2vulkan-runtime/src/used_resources.rs
