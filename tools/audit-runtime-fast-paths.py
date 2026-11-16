@@ -51,16 +51,18 @@ def body(text, pattern):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--core', type=Path, default=CORE, help='UniXNU checkout owning the pinned Mesa inputs')
     parser.add_argument('--translator', type=Path, default=CORE / '.cache/gpu-reference/metal2vulkan')
     parser.add_argument('--mesa-source', type=Path, default=CORE / '.cache/mesa-work')
     parser.add_argument('--fetch-mesa', action='store_true', help='Cache only the pinned Mesa source texts this report reads')
     parser.add_argument('--runtime-policy', type=Path)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    mesa_pin = json.loads((CORE / 'scripts/data/adreno-compiler-inputs.json').read_text())['mesa']
+    core = args.core.resolve()
+    mesa_pin = json.loads((core / 'scripts/data/adreno-compiler-inputs.json').read_text())['mesa']
     mesa = args.mesa_source
     if args.fetch_mesa:
-        mesa = CORE / '.cache/runtime-fast-path-audit' / mesa_pin['commit']
+        mesa = core / '.cache/runtime-fast-path-audit' / mesa_pin['commit']
         for name in MESA_FILES:
             path = mesa / name
             if path.is_file():
