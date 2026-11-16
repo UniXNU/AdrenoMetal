@@ -22,7 +22,7 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], t
 base = ['xcrun', 'clang++', '-target', args.arch + '-apple-macos27.0', '-isysroot', sdk,
         '-std=c++17', '-fobjc-arc', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-deprecated-declarations', '-Wno-unused-function']
 hashes = {}
-for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal'))]:
+for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal', 'IOKit'))]:
     source = 'ShaderCacheApp.mm' if name == 'ShaderCache' else name + '.mm'
     subprocess.run([*base, SOURCE / 'ShaderCache' / source,
                     *[part for framework in frameworks for part in ('-framework', framework)], '-o', code / name], check=True)
