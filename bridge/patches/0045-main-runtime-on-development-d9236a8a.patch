@@ -972,10 +972,10 @@ index 051f84bca..39793ea7b 100644
              let specialization = specialization();
 diff --git a/crates/metal2vulkan-runtime/src/device/room.rs b/crates/metal2vulkan-runtime/src/device/room.rs
 new file mode 100644
-index 000000000..531abcf9e
+index 000000000..96955b8b8
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/device/room.rs
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,121 @@
 +//! The device's room keeper: one thread of the device's that keeps room in the pools its encodings
 +//! and commits place their own resources in (`memory::keep_room`), so the creation call that asks
 +//! for room returns at once.
@@ -1069,46 +1069,29 @@ index 000000000..531abcf9e
 +    let Some(_busy) = exit_guard::enter() else {
 +        return;
 +    };
-+    device.age_parked();
-+    let shared = device.shared();
-+    crate::memory::age_spares(&shared.memory, shared.vk());
 +    device.keep_room_now();
 +}
 +
 +/// The thread's loop: a pass for each time room was asked since the last, until stopped.
 +fn run(shared: &Shared, weak: &WeakDevice) {
 +    loop {
-+        let requested = {
++        {
 +            let mut state = lock(&shared.state);
 +            while !state.asked && !state.stopping {
-+                let (next, timeout) = shared
++                state = shared
 +                    .work
-+                    .wait_timeout(state, std::time::Duration::from_millis(250))
++                    .wait(state)
 +                    .unwrap_or_else(PoisonError::into_inner);
-+                state = next;
-+                if timeout.timed_out() {
-+                    break;
-+                }
 +            }
 +            if state.stopping {
 +                return;
 +            }
-+            let requested = state.asked;
 +            state.asked = false;
-+            requested
-+        };
++        }
 +        let Some(device) = weak.upgrade() else {
 +            return;
 +        };
-+        if requested {
-+            keep(&device);
-+        } else if let Some(_busy) = exit_guard::enter() {
-+            // In a section of the exit guard, as every Vulkan call of a thread of the runtime's is:
-+            // a parked image or buffer, a kept empty block and a spare whose time is up go here.
-+            device.age_parked();
-+            let parts = device.shared();
-+            crate::memory::age_spares(&parts.memory, parts.vk());
-+        }
++        keep(&device);
 +        // Outside the state's lock: it may be the device's last handle, whose teardown stops
 +        // this thread.
 +        drop(device);
