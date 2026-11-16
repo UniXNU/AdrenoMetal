@@ -7,13 +7,14 @@
 
 static NSString *const SCStorage = @"/private/var/tmp/NativeAdrenoMetal.cache";
 static NSString *const SCPlugin = @"/Library/GPUBundles/NativeAdrenoMetal.bundle";
-static NSString *const SCApplication = @"/Library/UniXNU/Shader Cache.app";
+static NSString *const SCApplication = @"/Library/GPUBundles/Shader Cache.app";
 
 static NSString *SCPath(NSString *name) {return [SCStorage stringByAppendingPathComponent:name];}
 static NSString *SCInstalledBuild() {
     NSData *data = [NSData dataWithContentsOfFile:[SCPlugin stringByAppendingPathComponent:@"Contents/Resources/gpu-build.json"]];
     if (!data) return @"";
     NSDictionary *build = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if ([build[@"cache_build"] isKindOfClass:NSString.class]) return build[@"cache_build"];
     return [build[@"metal_source_sha256"] isKindOfClass:NSString.class] ? build[@"metal_source_sha256"] : @"";
 }
 

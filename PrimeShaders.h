@@ -377,7 +377,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 if (bad.count(doneKey)) {++skipped; continue;}
                 const std::string attemptKey = doneKey + "-inputs3";
                 if (refusedDone.count(attemptKey)) {++refused; continue;}
-                if (functionsDone.count(doneKey)) {++made; native_prime_functions_resumed = native_prime_functions_resumed + 1; continue;}
+                if (functionsDone.count(doneKey)) {++made; continue;}
                 id<MTLFunction> function = defaultFunction(lib, name, zeroed);
                 if (!function) {++refused; native_prime_functions_refused = earlierRefusals + refused; appendLine(refusedPath, attemptKey); report(path, name.UTF8String); continue;}
                 const MTLFunctionType type = function.functionType;
@@ -517,7 +517,22 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
 #endif
     };
     unsigned eligible = 0;
-    for (const std::string &path : paths) if (selected(path)) ++eligible;
+    std::set<std::string> eligiblePaths;
+    for (const std::string &path : paths) if (selected(path)) {
+        ++eligible;
+        eligiblePaths.insert(path);
+        struct stat st = {};
+        if (stat(path.c_str(), &st) != 0) continue;
+        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
+        if (done.count(id)) ++finished;
+    }
+    const std::string suffix = "\t" + build;
+    unsigned resumed = 0;
+    for (const std::string &key : functionsDone)
+        if (key.size() >= suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+            eligiblePaths.count(key.substr(0, key.find('\t')))) ++resumed;
+    native_prime_functions_resumed = resumed;
+    native_prime_libraries_done = finished;
     native_prime_libraries_total = eligible;
     native_prime_scope = scope;
     report();
@@ -535,7 +550,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         }
         // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
         const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
-        if (done.count(id)) {++finished; continue;}
+        if (done.count(id)) continue;
         bool complete = false;
         appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, refusedPath, refusedDone, build, complete));
         if (stopping()) break;
