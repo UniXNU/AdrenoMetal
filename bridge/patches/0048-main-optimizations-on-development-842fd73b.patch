@@ -1260,7 +1260,7 @@ index 4d12059ac..82b3574cb 100644
  /// the first texel of their slice, `array_pitch` apart, holds no byte but the texture's texels:
  /// the texels lie with no byte between them ([`holding`]), and its last subresource ends at their
 diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
-index ddf3938f1..3495257d2 100644
+index ddf3938f1..16309724a 100644
 --- a/crates/metal2vulkan-runtime/src/memory.rs
 +++ b/crates/metal2vulkan-runtime/src/memory.rs
 @@ -264,6 +264,57 @@ const DEDICATED_SLACK: u64 = 4;
@@ -1513,13 +1513,12 @@ index ddf3938f1..3495257d2 100644
      /// Whether one of the memory types `allowed` names is of `class`.
      pub(super) fn has_type(&self, allowed: u32, class: MemoryClass) -> bool {
          self.class_types(allowed, class) != 0
-@@ -3208,6 +3388,13 @@ impl Memory {
+@@ -3208,6 +3388,12 @@ impl Memory {
          pool.add_as(size, dedicated, block, used, zeroed)
      }
  
 +    /// The bytes of the next pooled block made for `pool`: as many as its pooled blocks have (the
-+    /// pool doubles), at least [`FIRST_BLOCK_BYTES`], at most [`Memory::block_bytes`], and a block
-+    /// of images' [`Memory::image_block_bytes`] ([`Memory::next_block_bytes`]).
++    /// pool doubles), at least [`FIRST_BLOCK_BYTES`], at most [`Memory::block_bytes`] ([`Memory::next_block_bytes`]).
 +    fn pooled_bytes(&self, pool: (Holds, u32)) -> u64 {
 +        self.next_block_bytes(pool, 1)
 +    }
@@ -1527,7 +1526,7 @@ index ddf3938f1..3495257d2 100644
      /// The bytes of each live pooled block that holds `holds`, of every memory type, for the
      /// crate's device tests.
      #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
-@@ -3267,6 +3454,21 @@ impl Memory {
+@@ -3267,6 +3453,18 @@ impl Memory {
              .collect()
      }
  
@@ -1537,10 +1536,7 @@ index ddf3938f1..3495257d2 100644
 +    /// allocation).
 +    fn next_block_bytes(&self, pool: (Holds, u32), size: u64) -> u64 {
 +        let have = self.pool_ref(pool.0, pool.1).pooled_bytes();
-+        let most = match pool.0 {
-+            Holds::Images => self.image_block_bytes.min(self.block_bytes(pool.1)),
-+            _ => self.block_bytes(pool.1),
-+        };
++        let most = self.block_bytes(pool.1);
 +        (have.max(FIRST_BLOCK_BYTES).max(size.next_power_of_two()))
 +            .min(most)
 +            .max(size)
@@ -1549,7 +1545,7 @@ index ddf3938f1..3495257d2 100644
      /// What making a block takes, copied out so that the block is made with the memory's lock
      /// released ([`place`], [`keep_room`]).
      fn maker(&self) -> BlockMaker {
-@@ -3470,7 +3672,9 @@ impl Memory {
+@@ -3470,7 +3668,9 @@ impl Memory {
          let spare = self
              .kept_budget(heap)
              .saturating_sub(self.kept_in_heap(heap));
@@ -1560,7 +1556,7 @@ index ddf3938f1..3495257d2 100644
          let reusable = |block: &Block| block.reusable() && block.size > half;
          let pool = self.pool(holds, type_index);
          let freed = pool.release(block, (offset, size), now, spare, reusable);
-@@ -3558,6 +3762,21 @@ impl Memory {
+@@ -3558,6 +3758,21 @@ impl Memory {
          count
      }
  
@@ -1582,7 +1578,7 @@ index ddf3938f1..3495257d2 100644
      /// Over every pool: the block slots the room queries have walked and the free ranges they
      /// have visited ([`Pool::room_work`]), then what one query of each pool would walk and visit
      /// where it derived per call ([`Pool::room_per_call`]).
-@@ -3631,10 +3850,18 @@ impl Memory {
+@@ -3631,10 +3846,18 @@ impl Memory {
          };
          let (heap, size) = (self.heap_of(block.type_index), block.size);
          let Some(parking) = &self.parking else {
@@ -1601,7 +1597,7 @@ index ddf3938f1..3495257d2 100644
                  return after;
              };
              let Block {
-@@ -3651,6 +3878,9 @@ impl Memory {
+@@ -3651,6 +3874,9 @@ impl Memory {
                  size,
              };
              // SAFETY: the caller's.
@@ -1611,7 +1607,7 @@ index ddf3938f1..3495257d2 100644
              return unsafe { frees.post_or_free(posted, device) };
          };
          self.say_block(
-@@ -4837,7 +5067,7 @@ pub(super) fn allocate_image_while_queued(
+@@ -4837,7 +5063,7 @@ pub(super) fn allocate_image_while_queued(
  fn binds_wait(driver: Option<DriverId>) -> bool {
      !matches!(
          driver,
@@ -1620,7 +1616,7 @@ index ddf3938f1..3495257d2 100644
      )
  }
  
-@@ -4994,13 +5224,19 @@ fn place(
+@@ -4994,13 +5220,19 @@ fn place(
          let dedicated = fit == Fit::Apart || size > pooled / 2;
          let block_size = match dedicated {
              true => size,
@@ -1641,7 +1637,7 @@ index ddf3938f1..3495257d2 100644
                  ready_after_placing(&mut guard, pool, size);
                  return Ok(guard.mark_overflowed(placement, overflowing));
              }
-@@ -5043,6 +5279,10 @@ fn place(
+@@ -5043,6 +5275,10 @@ fn place(
          };
          match made {
              Ok(block) => {
@@ -1652,7 +1648,7 @@ index ddf3938f1..3495257d2 100644
                  let mut memory = lock(memory);
                  if !dedicated && memory.makes_ahead(pool) {
                      memory.ahead.made_in_place(holds);
-@@ -5061,8 +5301,16 @@ fn place(
+@@ -5061,8 +5297,16 @@ fn place(
                  memory.say_placement("placed", &placement, Some(class));
                  return Ok(memory.mark_overflowed(placement, overflowing));
              }
@@ -1671,7 +1667,7 @@ index ddf3938f1..3495257d2 100644
          }
      }
      Err(failure)
-@@ -5083,6 +5331,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
+@@ -5083,6 +5327,12 @@ fn make_room(memory: &Mutex<Memory>, device: &ash::Device, type_index: u32) -> b
      released > 0 || waited
  }
  
@@ -1684,7 +1680,7 @@ index ddf3938f1..3495257d2 100644
  /// Let `memory` keep no block from now on ([`Memory::keep_none`]): those it keeps empty freed, and
  /// those still being made ahead stopped, each waited for with the lock released (its making
  /// reads its pages), and freed.
-@@ -5170,7 +5424,7 @@ pub(super) fn keep_room(
+@@ -5170,7 +5420,7 @@ pub(super) fn keep_room(
              continue;
          }
          let addressed = pool.0.buffers().then_some(&**counts);
