@@ -1956,14 +1956,28 @@ fn constant_bytes(raw: u32) -> usize {
     (raw - first + 1) as usize * scalar
 }
 
-/// The library's function `name` with every function constant it declares set to zero (false for a bool), for shader priming: a
-/// function whose code uses a constant's value is otherwise refused (`NeedsInput(FunctionConstant)`), and this variant still takes its
-/// module through decoding, translation and the driver. Null when a constant's type takes no value.
+/// Specialize every declared constant to zero for shader priming.
 ///
 /// # Safety
 /// `name` is a C string.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_function_new_zero_constants(library: *mut NmbLibrary, name: *const c_char) -> *mut NmbFunction {
+    // SAFETY: The caller supplies the C string.
+    unsafe { specialize_prime_function(library, name, false, u32::MAX) }
+}
+
+/// Specialize required constants and leave optional values undefined.
+/// `one_index` is `u32::MAX` for all-zero specialization.
+///
+/// # Safety
+/// `name` is a C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_function_new_required_constants(library: *mut NmbLibrary, name: *const c_char, one_index: u32) -> *mut NmbFunction {
+    // SAFETY: The caller supplies the C string.
+    unsafe { specialize_prime_function(library, name, true, one_index) }
+}
+
+unsafe fn specialize_prime_function(library: *mut NmbLibrary, name: *const c_char, required_only: bool, one_index: u32) -> *mut NmbFunction {
     guard(std::ptr::null_mut(), || {
         if name.is_null() {
             return Err("null function name".into());
@@ -1973,13 +1987,29 @@ pub unsafe extern "C" fn nmb_function_new_zero_constants(library: *mut NmbLibrar
         let library = &get(library)?.0;
         let generic = library.new_function_with_name(name).map_err(e("function"))?;
         let mut values = FunctionConstantValues::defaults();
+        let mut selected = one_index == u32::MAX;
         for (key, constant) in generic.function_constants_dictionary().map_err(e("function constants"))? {
+            if required_only && !constant.is_required() {
+                continue;
+            }
             let ty = constant.data_type();
             let bytes = constant_bytes(ty.as_raw());
             if bytes == 0 {
                 return Err(format!("function constant {key} of type {}", ty.as_raw()));
             }
-            values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, vec![0; bytes]));
+            let mut value = vec![0; bytes];
+            if one_index != u32::MAX && constant.index() == one_index {
+                if !required_only || !constant.is_required() ||
+                    !matches!(ty.as_raw(), 29 | 33 | 37 | 41 | 45 | 49 | 81 | 85) {
+                    return Err("priming may set one only for a required scalar integer".into());
+                }
+                value[0] = 1;
+                selected = true;
+            }
+            values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, value));
+        }
+        if !selected {
+            return Err("priming constant index was not found".into());
         }
         let function = library.new_function_with_name_constant_values(name, &values).map_err(e("zero-specialized function"))?;
         Ok(boxed(NmbFunction(function)))

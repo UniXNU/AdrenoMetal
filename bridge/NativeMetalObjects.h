@@ -226,6 +226,8 @@ struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; u
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 // The library's function with every function constant it declares set to zero (shader priming), or null.
 NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+// Specialize required constants only. Set the selected scalar integer to one, or keep all zero with UINT32_MAX.
+NmbFunction *nmb_function_new_required_constants(NmbLibrary *, const char *name, uint32_t one_index);
 /* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
 NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);

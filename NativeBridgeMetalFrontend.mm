@@ -1857,12 +1857,17 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
  function.library=self;return (id<MTLFunction>)function;
 }
 // Shader priming (PrimeShaders.h): the function with each of its function constants set to zero, or nil.
-- (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
- NmbFunction *handle=name?nmb_function_new_zero_constants(_handle,name.UTF8String):nullptr;
+- (id<MTLFunction>)nb_newFunctionForPriming:(NSString *)name requiredOnly:(BOOL)requiredOnly oneIndex:(uint32_t)index {
+ if(!name)return nil;
+ NmbFunction *handle=requiredOnly?nmb_function_new_required_constants(_handle,name.UTF8String,index):
+                                  nmb_function_new_zero_constants(_handle,name.UTF8String);
  if(!handle)return nil;
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
  function.library=self;
  return (id<MTLFunction>)function;
+}
+- (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name {
+ return [self nb_newFunctionForPriming:name requiredOnly:NO oneIndex:UINT32_MAX];
 }
 @end
 // A function's wrapped bitcode in its library's metallib: the function list's entry NAMEd as the function, MDSZ bytes at OFFT's bitcode
