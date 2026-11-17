@@ -37,6 +37,7 @@
 #include <mach-o/loader.h>
 #include <execinfo.h>
 #include <mach/mach.h>
+#include <mach/thread_policy.h>
 #include <thread>
 #include <fcntl.h>
 #include <unistd.h>
@@ -61,6 +62,39 @@ static std::string gLoaderPath;   // the Turnip library the runtime loaded (its 
 static id gDeviceObject;
 static bool (*gFrameTransport)(uint32_t,const void *,uint32_t);
 static std::atomic<uint64_t> gFrameNumber{0};
+
+struct TurnipHooks {
+ void (*setHostImportPermissions)(uint32_t);
+ void (*beginScopedSubmit)(const void *const *,const uint32_t *,uint32_t);
+ void (*endScopedSubmit)(void);
+};
+static TurnipHooks resolveTurnipHooks() {
+ static std::mutex lock;
+ static TurnipHooks cached{};
+ static bool resolved=false;
+ if(__atomic_load_n(&resolved,__ATOMIC_ACQUIRE))return cached;
+ std::lock_guard<std::mutex> guard(lock);
+ if(resolved)return cached;
+ void *library=nullptr;
+ if(!gLoaderPath.empty())library=dlopen(gLoaderPath.c_str(),RTLD_NOW|RTLD_NOLOAD);
+ if(!library) {
+  for(uint32_t i=0,n=_dyld_image_count();i<n;++i) {
+   const char *name=_dyld_get_image_name(i);
+   if(name && strstr(name,"libvulkan_freedreno.dylib")) {
+    library=dlopen(name,RTLD_LAZY|RTLD_NOLOAD);
+    if(library)break;
+   }
+  }
+ }
+ if(!library)library=RTLD_DEFAULT;
+ TurnipHooks found{};
+ found.setHostImportPermissions=(void (*)(uint32_t))dlsym(library,"tu_darwin_set_host_import_permissions");
+ found.beginScopedSubmit=(void (*)(const void *const *,const uint32_t *,uint32_t))dlsym(library,"tu_darwin_begin_scoped_submit");
+ found.endScopedSubmit=(void (*)(void))dlsym(library,"tu_darwin_end_scoped_submit");
+ cached=found;
+ if(library!=RTLD_DEFAULT || found.beginScopedSubmit)__atomic_store_n(&resolved,true,__ATOMIC_RELEASE);
+ return cached;
+}
 // The kernel trace (gpu-trace=1) takes only the identities of the render, encode and completion threads, which the kernel's
 // CPU sampler follows. Everything else of this process goes to the frame trace file.
 static bool gpuTraceOn(){static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;return on;}
@@ -1071,6 +1105,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NSUInteger heapOffset;
 // A surface import's own surface object, which the runtime buffer retains until it is freed (surfaceBuffer); nullptr otherwise.
 @property(nonatomic) IOSurfaceRef importedSurface;
+@property(nonatomic) uint32_t importPermissions;
 @end
 @interface NBTexture : NBObject
 @property(nonatomic) NmbTexture *handle;
@@ -1230,20 +1265,48 @@ static void holdImport(uint64_t identity,uint64_t address,uint64_t bytes,NBBuffe
  pruneHeldImports(false,gone);
  gHeldImports[{identity,address,bytes}]={buffer,buffer.importedSurface};
 }
-static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes) {
+static bool rwImportsForced() {
+ static const bool forced=[]{const char *v=getenv("NATIVE_METAL_RW_IMPORTS");return v && !strcmp(v,"1");}();
+ return forced;
+}
+static NBBuffer *surfaceBuffer(IOSurfaceRef surface,void *base,size_t bytes,bool writable) {
  struct Key {uint64_t identity,address,bytes;};
  const Key value={IOSurfaceGetID(surface),(uintptr_t)base,bytes};
  NSValue *key=value.identity?[NSValue valueWithBytes:&value objCType:@encode(Key)]:nil;
  watchImportPressure();
  std::vector<NBBuffer *> gone;   // declared before the lock: released after it
- std::lock_guard<std::mutex> lock(gSurfaceImportLock);
+ std::unique_lock<std::mutex> lock(gSurfaceImportLock);
  if(!gSurfaceImports)gSurfaceImports=[NSMapTable strongToWeakObjectsMapTable];
+ retry:
  NBBuffer *buffer=key?[gSurfaceImports objectForKey:key]:nil;
- if(buffer){if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);return buffer;}
+ if(buffer) {
+  if(!writable || buffer.importPermissions==3u) {
+   if(key)holdImport(value.identity,value.address,value.bytes,buffer,gone);
+   return buffer;
+  }
+  // An earlier read-only IO-coherent import exists while a writable view is now requested: release our cached hold before creating a writable one.
+  if(key) {
+   [gSurfaceImports removeObjectForKey:key];
+   const auto tupleKey=std::make_tuple(value.identity,value.address,value.bytes);
+   auto it=gHeldImports.find(tupleKey);
+   if(it!=gHeldImports.end()){gone.push_back(it->second.buffer);gHeldImports.erase(it);}
+  }
+  gone.push_back(buffer);
+  buffer=nil;
+  lock.unlock();
+  gone.clear();
+  lock.lock();
+  goto retry;
+ }
  // The surface keeps its CPU mapping (the imported pages) until the import is freed.
+ const TurnipHooks hooks=resolveTurnipHooks();
+ const bool useReadOnly=!writable && hooks.setHostImportPermissions!=nullptr;
+ if(useReadOnly)hooks.setHostImportPermissions(1u);
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,base,bytes,MTLResourceStorageModeShared,releaseSurface,(void *)CFRetain(surface));
+ if(useReadOnly)hooks.setHostImportPermissions(3u);
  if(!handle){CFRelease(surface);NBLOG(@"native-metal: surface import refused: %@",lastError());return nil;}
- gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;buffer.importedSurface=surface;
+ gSurfaceImportsMade++;buffer=[NBBuffer new];buffer.handle=handle;buffer.options=MTLResourceStorageModeShared;
+ buffer.importedSurface=surface;buffer.importPermissions=useReadOnly?1u:3u;
  if(key) {
   // Associations whose import is gone are pruned whenever the table has doubled since the last pruning; a live one is never evicted.
   if(gSurfaceImports.count>=gSurfaceImportsPruned) {
@@ -2115,6 +2178,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
+ std::unordered_map<uintptr_t,uint32_t> hostAccess;
+ bool unscopedHostAccess;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -2147,6 +2212,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NBTexture *wallpaperOutput;
 @property(nonatomic,strong) NSMutableArray<NSString *> *dumpLog;   // its passes and first draws, as encoded (NBEncoder dumpDraw:)
 - (void)refuse:(NSString *)what;
+- (void)noteHostAddress:(const void *)pointer mode:(uint32_t)mode;
 @end
 // Diagnostic isolation: a completed wallpaper output remains visible while later
 // commands stay committed but unscheduled. PosterBoard is the manager, not a renderer.
@@ -2300,6 +2366,19 @@ public:
   new(slot) Header{[](void *closure){Closure &call=*static_cast<Closure *>(closure);call();call.~Closure();},need};
   new(slot+rounded(sizeof(Header))) Closure(std::forward<F>(work));
  }
+ const uint8_t *copyBytes(const void *src,size_t len) {
+  if(!src || !len)return nullptr;
+  const size_t need=rounded(len);
+  while(at<chunks.size() && chunks[at].used+need>chunks[at].capacity)at++;
+  if(at==chunks.size()) {
+   Chunk chunk;chunk.capacity=std::max(kChunk,need);chunk.bytes.reset(new uint8_t[chunk.capacity]);
+   chunks.push_back(std::move(chunk));
+  }
+  Chunk &chunk=chunks[at];
+  uint8_t *dst=chunk.bytes.get()+chunk.used;chunk.used+=need;
+  memcpy(dst,src,len);
+  return dst;
+ }
  // Each call in the order added, each destroyed once it ran; the batch is empty after.
  void run() {
   for(Chunk &chunk:chunks) {
@@ -2328,15 +2407,29 @@ static thread_local EncodeBatch *tBatch;
 // samples during encoding calls of 30 ms or more were on a run queue. The first CoreAnimation thread that makes a command buffer is the
 // reference; a timeshare reference leaves the encoding thread as it is.
 static std::atomic<pthread_t> gEncodeReference{nullptr};
-static void encodeAdoptReference() {
- static bool adopted=false;
- if(adopted)return;
+static void adoptRenderServerThreadPolicy() {
+ static thread_local pthread_t tAdoptedRef=nullptr;
  const pthread_t reference=gEncodeReference.load(std::memory_order_acquire);
- if(!reference)return;
- adopted=true;
+ if(!reference || tAdoptedRef==reference)return;
+ tAdoptedRef=reference;
  int policy=SCHED_OTHER;sched_param param{};
- if(pthread_getschedparam(reference,&policy,&param) || policy==SCHED_OTHER)return;
- (void)pthread_setschedparam(pthread_self(),policy,&param);
+ if(!pthread_getschedparam(reference,&policy,&param) && policy!=SCHED_OTHER)
+  (void)pthread_setschedparam(pthread_self(),policy,&param);
+ const thread_t refPort=pthread_mach_thread_np(reference);
+ const thread_t selfPort=pthread_mach_thread_np(pthread_self());
+ if(refPort!=MACH_PORT_NULL && selfPort!=MACH_PORT_NULL) {
+  thread_extended_policy_data_t ext{};
+  mach_msg_type_number_t extCount=THREAD_EXTENDED_POLICY_COUNT;
+  boolean_t extDefault=FALSE;
+  if(thread_policy_get(refPort,THREAD_EXTENDED_POLICY,(thread_policy_t)&ext,&extCount,&extDefault)==KERN_SUCCESS && !ext.timeshare) {
+   (void)thread_policy_set(selfPort,THREAD_EXTENDED_POLICY,(thread_policy_t)&ext,THREAD_EXTENDED_POLICY_COUNT);
+   thread_precedence_policy_data_t prec{};
+   mach_msg_type_number_t precCount=THREAD_PRECEDENCE_POLICY_COUNT;
+   boolean_t precDefault=FALSE;
+   if(thread_policy_get(refPort,THREAD_PRECEDENCE_POLICY,(thread_policy_t)&prec,&precCount,&precDefault)==KERN_SUCCESS)
+    (void)thread_policy_set(selfPort,THREAD_PRECEDENCE_POLICY,(thread_policy_t)&prec,THREAD_PRECEDENCE_POLICY_COUNT);
+  }
+ }
 }
 static EncodeThread &encodeThread() {
  static EncodeThread *thread=[]{
@@ -2352,7 +2445,7 @@ static EncodeThread &encodeThread() {
     EncodeBatch *batch=t.batches.front();t.batches.pop_front();
     const uint32_t depth=(uint32_t)t.batches.size(),tasks=(uint32_t)batch->count;
     lock.unlock();tEncodeBatchId=batch->serial;
-    encodeAdoptReference();
+    adoptRenderServerThreadPolicy();
     batchStage(batch->serial,2,batch->enqueuedUs,tasks,depth);
     const uint64_t cpuBefore=diagOn()?threadCpuUs():0;
     @autoreleasepool {batch->run();}
@@ -2367,6 +2460,14 @@ static EncodeThread &encodeThread() {
  return *thread;
 }
 static bool onEncodeQueue() {return tOnEncodeThread;}
+static EncodeBatch *currentEncodeBatch() {
+ if(!tBatch) {
+  EncodeThread &t=encodeThread();
+  {std::lock_guard<std::mutex> lock(t.lock);if(!t.spare.empty()){tBatch=t.spare.back();t.spare.pop_back();}}
+  if(!tBatch)tBatch=new EncodeBatch;
+ }
+ return tBatch;
+}
 static void encodeFlush() {
  if(!tBatch || !tBatch->count)return;
  EncodeThread &t=encodeThread();
@@ -2600,7 +2701,11 @@ static uint64_t encodeCommandOf(id object) {
  }
  if(texture){[_commandBuffer own:texture];}
  [self dumpBind:texture index:index stage:stage+4];
- if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
+ if(texture && [(NBTexture *)texture surface]) {
+  [_commandBuffer.surfaces addObject:texture];
+  const uint32_t mode=(stage==0 || (texture.usage&MTLTextureUsageShaderWrite))?3u:1u;
+  [_commandBuffer noteHostAddress:IOSurfaceGetBaseAddress([(NBTexture *)texture surface]) mode:mode];
+ }
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
  ENCODE([self check:nmb_encoder_set_texture(self->_handle,stage,texture?[(NBTexture *)texture handle]:nullptr,(uint32_t)index) what:"setTexture"]);
 }
@@ -2619,9 +2724,9 @@ static uint64_t encodeCommandOf(id object) {
 - (void)bytes:(const void *)bytes length:(NSUInteger)length index:(NSUInteger)index stage:(uint32_t)stage {
  if(dumpMaybe(_commandBuffer))[self dumpBind:[NSData dataWithBytes:bytes length:length] index:index stage:stage];
  if(gDrawStats)[self noteState:kDSBytes key:stage<<8|(uint32_t)index object:nullptr value:hashBytes(bytes,length)];
- if(!gEncodeThread){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
- const std::vector<uint8_t> copy((const uint8_t *)bytes,(const uint8_t *)bytes+(bytes?length:0));   // the caller's bytes are its own again
- ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy.empty()?nullptr:copy.data(),length,(uint32_t)index) what:"setBytes"]);
+ if(!gEncodeThread || onEncodeQueue()){[self check:nmb_encoder_set_bytes(_handle,stage,bytes,length,(uint32_t)index) what:"setBytes"];return;}
+ const uint8_t *copy=currentEncodeBatch()->copyBytes(bytes,length);
+ ENCODE([self check:nmb_encoder_set_bytes(self->_handle,stage,copy,length,(uint32_t)index) what:"setBytes"]);
 }
 - (void)fence:(id<MTLFence>)fence stages:(uint64_t)stages update:(bool)update {
  if(![(id)fence isKindOfClass:[NBFence class]]){[_commandBuffer refuse:@"foreign fence"];return;}
@@ -2972,12 +3077,16 @@ static uint64_t encodeCommandOf(id object) {
  for(size_t i=0;i<count;i++)[self.commandBuffer own:objects[i]];
  return true;
 }
-- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count {
+- (bool)textures:(__unsafe_unretained id *)objects count:(size_t)count writable:(bool)writable {
  for(size_t i=0;i<count;i++) {
   id o=objects[i];
   if(![o isKindOfClass:[NBTexture class]]){[self.commandBuffer refuse:@"missing or foreign blit texture"];return false;}
   [self.commandBuffer own:o];
-  if([(NBTexture *)o surface])[self.commandBuffer.surfaces addObject:o];
+  NBTexture *tex=(NBTexture *)o;
+  if(tex.surface) {
+   [self.commandBuffer.surfaces addObject:o];
+   [self.commandBuffer noteHostAddress:IOSurfaceGetBaseAddress(tex.surface) mode:writable?3u:1u];
+  }
  }
  return true;
 }
@@ -2991,14 +3100,14 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
- if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(![self textures:NB_OBJECTS(s) count:1 writable:false] || ![self textures:NB_OBJECTS(d) count:1 writable:true])return;
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)d
  destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)ns levelCount:(NSUInteger)nl {
- if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(![self textures:NB_OBJECTS(s) count:1 writable:false] || ![self textures:NB_OBJECTS(d) count:1 writable:true])return;
  auto slices=[](id<MTLTexture> t)->NSUInteger {return t.arrayLength*((t.textureType==MTLTextureTypeCube || t.textureType==MTLTextureTypeCubeArray)?6:1);};
  if(sl>s.mipmapLevelCount || nl>s.mipmapLevelCount-sl || dl>d.mipmapLevelCount || nl>d.mipmapLevelCount-dl ||
     ss>slices(s) || ns>slices(s)-ss || ds>slices(d) || ns>slices(d)-ds) {[self.commandBuffer refuse:@"texture copy range out of bounds"];return;}
@@ -3010,7 +3119,7 @@ static uint64_t encodeCommandOf(id object) {
  }
 }
 - (void)copyFromTexture:(id<MTLTexture>)s toTexture:(id<MTLTexture>)d {
- if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ if(![self textures:NB_OBJECTS(s) count:1 writable:false] || ![self textures:NB_OBJECTS(d) count:1 writable:true])return;
  const NSUInteger levels=MIN(s.mipmapLevelCount,d.mipmapLevelCount),slices=MIN(s.arrayLength,d.arrayLength);
  for(NSUInteger slice=0;slice<slices;slice++)for(NSUInteger level=0;level<levels;level++) {
   MTLSize size=MTLSizeMake(MAX(s.width>>level,(NSUInteger)1),MAX(s.height>>level,(NSUInteger)1),MAX(s.depth>>level,(NSUInteger)1));
@@ -3021,7 +3130,7 @@ static uint64_t encodeCommandOf(id object) {
 - (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)o sourceBytesPerRow:(NSUInteger)row sourceBytesPerImage:(NSUInteger)image
             sourceSize:(MTLSize)z toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level
      destinationOrigin:(MTLOrigin)dO {
- if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1])return;
+ if(![self buffers:NB_OBJECTS(s) count:1] || ![self textures:NB_OBJECTS(d) count:1 writable:true])return;
  if(gLogTextures && textureLogTurn()) {
   const NmbTextureDescriptor t=[(NBTexture *)d descriptor];
   GLOG(@"native-metal: texture-log %llu bufferToTexture size %lux%lu origin %lu,%lu level %lu slice %lu | rows %lu image %lu offset %lu "
@@ -3044,13 +3153,13 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
                toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)o destinationBytesPerRow:(NSUInteger)row destinationBytesPerImage:(NSUInteger)image {
- if(![self textures:NB_OBJECTS(s) count:1] || ![self buffers:NB_OBJECTS(d) count:1])return;
+ if(![self textures:NB_OBJECTS(s) count:1 writable:false] || ![self buffers:NB_OBJECTS(d) count:1])return;
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth};
  ENCODE([self check:nmb_blit_texture_to_buffer(self.handle,[(NBTexture *)s handle],slice,level,a.data(),size.data(),[(NBBuffer *)d handle],o,row,image)
                 what:"copyFromTexture:toBuffer:"]);
 }
 - (void)generateMipmapsForTexture:(id<MTLTexture>)t {
- if(![self textures:NB_OBJECTS(t) count:1])return;
+ if(![self textures:NB_OBJECTS(t) count:1 writable:true])return;
  // A refusal names the texture's pixel format, type and levels: what decides whether the runtime can filter it.
  const std::string what=[NSString stringWithFormat:@"generateMipmapsForTexture: (pixel format %lu, type %lu, %lu levels)",
                          (unsigned long)t.pixelFormat,(unsigned long)t.textureType,(unsigned long)t.mipmapLevelCount].UTF8String;
@@ -3066,9 +3175,18 @@ static void scheduled(void *context);
 // instead; the swap offered by them is held back by the scanout client until the GPU finished everything committed before the offer
 // (NBWaitInFlight), and waitUntilCompleted, the resource waits and the real completion work (surface flushes, release) are unchanged.
 static bool earlyOn() {return false;}   // reverted: with the handlers early the blur passes read frames that were not finished (i343, i344)
+static bool threadFixedPriority(thread_t thread) {
+ if(thread==MACH_PORT_NULL)return false;
+ thread_extended_policy_data_t ext{};
+ mach_msg_type_number_t count=THREAD_EXTENDED_POLICY_COUNT;
+ boolean_t getDefault=FALSE;
+ return thread_policy_get(thread,THREAD_EXTENDED_POLICY,(thread_policy_t)&ext,&count,&getDefault)==KERN_SUCCESS && !ext.timeshare;
+}
 static bool onRenderServerThread() {
- char name[32]={};pthread_getname_np(pthread_self(),name,sizeof name);
- return !strncmp(name,"com.apple.coreanimation",23);
+ char name[64]={};pthread_getname_np(pthread_self(),name,sizeof name);
+ if(!strncmp(name,"com.apple.coreanimation",23) || !strcmp(name,"ws_main_thread") ||
+    !strncmp(name,"ca.display.",11) || strstr(name,"RenderServer")!=nullptr)return true;
+ return nativeIsRenderServer() && threadFixedPriority(pthread_mach_thread_np(pthread_self()));
 }
 extern "C" void NBWaitInFlight(uint64_t beforeUs);
 // ---- NATIVE_METAL_DUMP_CB ----
@@ -3317,10 +3435,25 @@ static char kUserDictionaryKey;
  return self;
 }
 - (void)dealloc {DetailSpan timing(17,(uintptr_t)_handle);[self disown];nmb_command_buffer_release(_handle);}
+- (void)noteHostAddress:(const void *)pointer mode:(uint32_t)mode {
+ if(!pointer || self->unscopedHostAccess)return;
+ const uintptr_t key=(uintptr_t)pointer;
+ auto it=self->hostAccess.find(key);
+ if(it!=self->hostAccess.end()){it->second|=mode;return;}
+ if(self->hostAccess.size()>=64){self->unscopedHostAccess=true;return;}
+ self->hostAccess.emplace(key,mode);
+}
 - (void)own:(id)resource {
  const NSUInteger before=_resourceOwners.count;
  [_resourceOwners addObject:resource];
  if(_resourceOwners.count!=before && [(NBObject *)resource purgeHold:YES])noteLateUse();
+ if([resource isKindOfClass:[NBBuffer class]]) {
+  NBBuffer *buffer=(NBBuffer *)resource;
+  if(buffer.wrapped)[self noteHostAddress:buffer.wrapped mode:3u];
+ } else if([resource isKindOfClass:[NBTexture class]]) {
+  NBTexture *texture=(NBTexture *)resource;
+  if(!texture.surface && texture.buffer.wrapped)[self noteHostAddress:texture.buffer.wrapped mode:3u];
+ }
 }
 // The resources go: the command buffer completed, was refused, or was released without a commit.
 - (void)disown {
@@ -3460,14 +3593,18 @@ static char kUserDictionaryKey;
   const unsigned attachmentIndex=traceAttachment++;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
-  NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
+  NBTexture *texture=(NBTexture *)a.texture;
   [self own:texture];
   const size_t copiesBefore=resolveCopies.size();
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [self own:resolve];
+   if(resolve.surface) {
+    [_surfaces addObject:resolve];
+    [self noteHostAddress:IOSurfaceGetBaseAddress(resolve.surface) mode:3u];
+   }
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
@@ -3488,6 +3625,11 @@ static char kUserDictionaryKey;
     out.resolve_texture=resolve.handle;out.resolve_level=a.resolveLevel;
     out.resolve_slice=a.resolveSlice;out.resolve_depth_plane=a.resolveDepthPlane;
    }
+  }
+  if(texture.surface) {
+   [_surfaces addObject:texture];
+   const uint32_t mode=(out.texture==texture.handle && out.store!=MTLStoreActionDontCare)?3u:1u;
+   [self noteHostAddress:IOSurfaceGetBaseAddress(texture.surface) mode:mode];
   }
   if(diagOn()) {
    TraceRec rec{};rec.type=16;rec.t0=nowUs();rec.t1=traceNumber;rec.t2=(uintptr_t)out.texture;rec.t3=(uintptr_t)out.resolve_texture;
@@ -3562,6 +3704,7 @@ static char kUserDictionaryKey;
 - (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {[self event:event value:value signal:false];}
 // The runtime has submitted the work. Deliver scheduling without waiting for GPU completion.
 - (void)didSchedule {
+ if(isRenderServer())adoptRenderServerThreadPolicy();
  {
   const uint64_t took=nowUs()-self.committedUs;
   std::lock_guard<std::mutex> lock(gCommitLock);
@@ -3583,6 +3726,7 @@ static char kUserDictionaryKey;
 // After completion (or a refusal): invalidate the CPU's view of imported surfaces, then completed handlers, once.
 - (void)finish {
  DetailCommandScope commandScope(traceNumber);
+ if(isRenderServer())adoptRenderServerThreadPolicy();
  traceThread(3);
  frontStage(traceNumber,self.commitIndex,8);
  const uint64_t flushed=flushSurfaces(_surfaces);
@@ -3605,6 +3749,7 @@ static char kUserDictionaryKey;
  // release point. A retained completed command must not pin every old frame.
  frontStage(traceNumber,self.commitIndex,10);
  [_surfaces removeAllObjects];[self disown];
+ self->hostAccess.clear();self->unscopedHostAccess=false;
  self.wallpaperOutput=nil;
  @synchronized(gInFlight){[gInFlight removeObject:self];}
  // Surfaces this command buffer kept alive may now have no other owner: their held imports go.
@@ -3697,8 +3842,27 @@ static char kUserDictionaryKey;
   const bool capture=appIndex && range.first && appIndex>=range.first && appIndex<(uint64_t)range.first+range.second;
   if(capture && dumpAtPassEnd()){self.dumpAppIndex=appIndex;dumpReadback(self,appIndex);}
   frontStage(traceNumber,self.commitIndex,6);
-  if(nmb_command_buffer_on_completed(_handle,completed,context) &&
-     nmb_command_buffer_on_scheduled(_handle,scheduled,context) && nmb_command_buffer_commit(_handle)) {
+  const TurnipHooks hooks=resolveTurnipHooks();
+  bool scopedActive=false;
+  std::vector<const void *> scopedPtrs;
+  std::vector<uint32_t> scopedModes;
+  if(!self->unscopedHostAccess && hooks.beginScopedSubmit && hooks.endScopedSubmit) {
+   scopedPtrs.reserve(self->hostAccess.size());
+   scopedModes.reserve(self->hostAccess.size());
+   for(const auto &kv:self->hostAccess) {
+    scopedPtrs.push_back((const void *)kv.first);
+    scopedModes.push_back(kv.second);
+   }
+   hooks.beginScopedSubmit(scopedPtrs.empty()?nullptr:scopedPtrs.data(),
+                           scopedModes.empty()?nullptr:scopedModes.data(),
+                           (uint32_t)scopedPtrs.size());
+   scopedActive=true;
+  }
+  const bool committed=nmb_command_buffer_on_completed(_handle,completed,context) &&
+                       nmb_command_buffer_on_scheduled(_handle,scheduled,context) &&
+                       nmb_command_buffer_commit(_handle);
+  if(scopedActive)hooks.endScopedSubmit();
+  if(committed) {
    frontStage(traceNumber,self.commitIndex,7);
    self.submitted=YES;
    if(capture && !dumpAtPassEnd())dumpReadback(self,appIndex);
@@ -4720,7 +4884,8 @@ static void fillBaseLimits(id device);
  if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  const size_t bytes=(allocation+page-1)&~(page-1);
- NBBuffer *buffer=surfaceBuffer(surface,base,bytes);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+ const bool writable=!isRenderServer() || rwImportsForced() || d.usage!=MTLTextureUsageShaderRead;
+ NBBuffer *buffer=surfaceBuffer(surface,base,bytes,writable);if(!buffer){refuseSurface(4,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
@@ -5303,6 +5468,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
   }
  }
+ if(gEncodeThread && nativeIsRenderServer())setenv("NATIVE_METAL_FLOW","2",0);
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(diagOn() && loader) {
