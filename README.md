@@ -60,6 +60,8 @@ Function reflection exposes vertex and stage-input attributes with their indices
 
 Each process keeps its pipeline cache in the first directory its sandbox lets it write: the same-user shared directory, then Metal's own cache directory. Compiler replies for source and stitched libraries are kept beside it. A cache entry's access time is refreshed on a hit until the platform refuses the change once.
 
+System cache readers reconstruct chunked records through the same owner, permissions and link checks used for whole records. Chunk files retain the shared cache directory permissions.
+
 On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON.
 
 On iPadOS, the render server compiles the inventory while idle. The build embeds the OS library inventory, and `prime.log` records the build, scope and completion result.
