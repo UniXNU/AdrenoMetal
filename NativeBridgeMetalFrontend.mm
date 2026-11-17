@@ -5294,10 +5294,12 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
- if(diagOn() && getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent") && !gCacheRoot.empty()) {
-  const int fd=open((gCacheRoot+"/runtime-stderr.log").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC|O_NOFOLLOW,0600);
+ const bool renderStderr=diagOn() && nativeIsRenderServer();
+ if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
+  const std::string path=gCacheRoot+"/runtime-stderr.log";
+  const int fd=open(path.c_str(),O_WRONLY|O_CREAT|(renderStderr?O_APPEND:O_TRUNC)|O_CLOEXEC|O_NOFOLLOW,0600);
   if(fd>=0) {
-   dprintf(fd,"native-metal runtime stderr boot=%s\n",getenv("NATIVE_METAL_BOOT_SESSION")?:"unknown");
+   dprintf(fd,"native-metal runtime stderr boot=%s pid=%d\n",getenv("NATIVE_METAL_BOOT_SESSION")?:"unknown",getpid());
    if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
   }
  }
