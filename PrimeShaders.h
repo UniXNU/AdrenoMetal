@@ -409,6 +409,24 @@ static MTLVertexDescriptor *vertexInputs(id<MTLFunction> function) {
     return descriptor;
 }
 
+#if TARGET_OS_OSX
+static bool needsSystemTreatments(const std::string &path, MTLRenderPipelineDescriptor *descriptor, NSError *error) {
+    return (path == "/System/Library/ExtensionKit/Extensions/DynamicBackgroundPosterExtension.appex/Contents/Resources/default.metallib" ||
+            path == "/System/Library/PrivateFrameworks/CinematicCommunication.framework/Versions/A/Resources/default.metallib") &&
+           [descriptor.fragmentFunction.name hasPrefix:@"vfx_custom_shader_"] &&
+           [error.localizedDescription containsString:@"NeedsInput(LinkedFunction { symbol: \"vfx::api::applySystemTreatments\" })"];
+}
+
+static id<MTLFunction> systemTreatments(id<MTLDevice> device) {
+    // These system fragment shaders import the native macOS VFX library's visible export.
+    NSURL *url = [NSURL fileURLWithPath:@"/System/Library/PrivateFrameworks/VFX.framework/Versions/A/Resources/default.metallib"];
+    id<MTLLibrary> library = [device newLibraryWithURL:url error:nil];
+    unsigned specialized = 0;
+    id<MTLFunction> function = defaultFunction(library, @"vfx::api::applySystemTreatments", specialized);
+    return function.functionType == MTLFunctionTypeVisible ? function : nil;
+}
+#endif
+
 // One library: every function it names, in its order; returns the log line.
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
                            const std::string &functionsPath, const std::set<std::string> &functionsDone,
@@ -428,6 +446,10 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
         native_prime_compiling = 0;
         if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
+#if TARGET_OS_OSX
+        id<MTLFunction> vfx = nil;
+        bool lookedUpVfx = false;
+#endif
         NSArray<NSString *> *names = lib.functionNames;
         NSArray<NSString *> *entries = [lib respondsToSelector:@selector(nb_primeFunctionNames)] ? [(NSObject *)lib nb_primeFunctionNames] : names;
         for (NSString *name in entries) {
@@ -481,6 +503,22 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                             error = nil;
                             ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
                         }
+#if TARGET_OS_OSX
+                        if (!ok && needsSystemTreatments(path, d, error)) {
+                            if (!lookedUpVfx) {
+                                vfx = systemTreatments(device);
+                                lookedUpVfx = true;
+                            }
+                            if (vfx) {
+                                MTLLinkedFunctions *linked = [MTLLinkedFunctions linkedFunctions];
+                                linked.functions = @[vfx];
+                                d.fragmentLinkedFunctions = linked;
+                                error = nil;
+                                ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                                if (ok) ++linkedMade;
+                            }
+                        }
+#endif
                         // The render server's framebuffer is half-float (RGhA) on this board: its pipelines draw into RGBA16Float, a state
                         // of its own to Turnip, so the same pair is made for it too.
                         if (ok) {

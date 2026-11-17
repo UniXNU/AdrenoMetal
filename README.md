@@ -76,6 +76,8 @@ On iPadOS, the render server compiles the inventory while idle. The build embeds
 
 The macOS worker prevents automatic display and system sleep while compiling and releases both assertions when the task completes, stops or fails. Closing the app leaves protection with the running worker.
 
+On macOS, priming links the installed VFX framework's visible treatment function when the system dynamic wallpaper or CinematicCommunication shader reports that specific missing symbol.
+
 ### System shader cache (macOS)
 
 The kernel creates `/private/var/tmp/NativeAdrenoMetal.cache` for `_windowserver`, with mode 0755, and exposes it read-only at `/Library/GPUBundles/NativeAdrenoMetal.cache`. The authorized Shader Cache worker and the render server publish readable, versioned entries there. Other clients consult this layer after their own caches.
