@@ -336,7 +336,6 @@ fn note_shadow(text: &str) {
 // NATIVE_METAL_WARNINGS=1: each kind of message (its id and the text's first 48 characters) the first time it comes, in full and
 // with its severity, to standard error, for the first 400 kinds. The telemetry keeps only the last warning, and a degradation that
 // draws nothing is otherwise silent.
-static COMMIT_TIMINGS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 const TIMING_LOG_LIMIT: usize = 512 * 1024;
 struct TimingLog { file: std::fs::File, bytes: usize }
 static TIMING_LOG: std::sync::OnceLock<std::sync::Mutex<TimingLog>> = std::sync::OnceLock::new();
@@ -552,12 +551,12 @@ pub extern "C" fn nmb_device_fast_path_counts(device: *const NmbDevice, out: *mu
             write_runtime_policy(device);
         }
         let w = device.work_counts();
-        out.fill(u64::MAX);
-        out[..6].copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made,
-                                  w.spare_command_pools_taken, w.linear_passes_in_place, w.linear_passes_through_copies]);
-        out[6] = 0;
-        out[7] = COMMIT_TIMINGS[0].load(std::sync::atomic::Ordering::Relaxed);
-        out[8] = COMMIT_TIMINGS[1].load(std::sync::atomic::Ordering::Relaxed) / 1000;
+        out.copy_from_slice(&[w.grouped_submissions, w.batches_grouped, w.command_pools_made,
+                              w.spare_command_pools_taken, w.linear_passes_in_place, w.linear_passes_through_copies,
+                              w.region_pipelines_evicted, w.commit_calls, w.commit_nanos / 1000,
+                              w.commit_lowering_nanos / 1000, w.commit_recording_nanos / 1000,
+                              w.commit_pipeline_wait_nanos / 1000, w.commit_lock_wait_nanos / 1000,
+                              w.commit_pass_nanos / 1000, w.commit_submit_nanos / 1000]);
         Ok(true)
     })
 }
@@ -2845,8 +2844,6 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
     });
     if let Some(began) = began {
         let nanos = began.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        COMMIT_TIMINGS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        COMMIT_TIMINGS[1].fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
         if nanos >= 8_000_000 {
             note_encoder_timing(&format!("command_buffer={command_buffer:p} commit_us={} accepted={result}", nanos / 1000));
         }
