@@ -284,6 +284,10 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
         open_runtime_diagnostics(cache.to_string_lossy().as_ref());
         let device = Device::system_default_with(&options).map_err(e("device"))?;
+        if std::env::var("NATIVE_METAL_TILING_CHECK").as_deref() == Ok("1") {
+            let settled = device.settle_tiling_cost_check(std::time::Duration::from_secs(3));
+            eprintln!("native-metal tiling-check settled={settled}: {}", device.tiling_cost_check_report());
+        }
         write_runtime_policy(&device);
         // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
         // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
@@ -362,9 +366,10 @@ fn diagnostic_stamp() -> String {
 fn write_runtime_policy(device: &Device) {
     let Some(path) = POLICY_LOG.get() else { return; };
     let profile = device.compile_device();
-    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\nprofile={:#?}\n",
+    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\ntiling-cost={}\nprofile={:#?}\n",
         diagnostic_stamp(), profile.policy(), device.submit_check_report(),
-        device.queue_switch_check_report(), device.in_place_check_report(), profile.profile());
+        device.queue_switch_check_report(), device.in_place_check_report(),
+        device.tiling_cost_check_report(), profile.profile());
     let text: String = text.chars().take(64 * 1024).collect();
     let _ = std::fs::write(path, text);
 }
