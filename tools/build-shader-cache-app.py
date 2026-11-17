@@ -22,7 +22,8 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], t
 base = ['xcrun', 'clang++', '-target', args.arch + '-apple-macos27.0', '-isysroot', sdk,
         '-std=c++17', '-fobjc-arc', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-deprecated-declarations', '-Wno-unused-function']
 hashes = {}
-for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal'))]:
+for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal')),
+                         ('ShaderCacheRegister', ('Foundation', 'CoreServices'))]:
     source = 'ShaderCacheApp.mm' if name == 'ShaderCache' else name + '.mm'
     subprocess.run([*base, SOURCE / 'ShaderCache' / source,
                     *[part for framework in frameworks for part in ('-framework', framework)], '-o', code / name], check=True)
@@ -42,7 +43,7 @@ for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheW
 # The outer seal retains the executable's existing entitlements.
 subprocess.run(['codesign', '--force', '--sign', '-', '--timestamp=none', '--pagesize', '4096',
                 '--preserve-metadata=entitlements', app], check=True)
-for path in (app, code / 'ShaderCacheWorker'):
+for path in (app, code / 'ShaderCacheWorker', code / 'ShaderCacheRegister'):
     subprocess.run(['codesign', '--verify', '--strict', path], check=True)
 detail = subprocess.run(['codesign', '-d', '--verbose=4', app], capture_output=True, text=True, check=True).stderr
 hashes['ShaderCache'] = re.search(r'^CDHash=([0-9a-f]{40})$', detail, re.M)[1]
