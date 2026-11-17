@@ -62,9 +62,13 @@ Each process keeps its pipeline cache in the first directory its sandbox lets it
 
 System cache readers reconstruct chunked records through the same owner, permissions and link checks used for whole records. Chunk files retain the shared cache directory permissions.
 
-On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON. The worker prevents automatic display and system sleep while compiling and releases both assertions when the task completes, stops or fails. Closing the app leaves protection with the running worker.
+On macOS, Shader Cache displays library progress, compiled functions, failures and missing inputs. Start requests compilation through an administrator-authorized worker; Stop finishes the current compilation and saves progress. Starting again retains successful checkpoints and retries failed entries. The app is installed at `/Library/GPUBundles/Shader Cache.app`, with an Applications entry in the sheng lab. Its `--status` argument prints the current state as JSON.
 
 On iPadOS, the render server compiles the inventory while idle. The build embeds the OS library inventory, and `prime.log` records the build, scope and completion result.
+
+### Compilation power assertions
+
+The macOS worker prevents automatic display and system sleep while compiling and releases both assertions when the task completes, stops or fails. Closing the app leaves protection with the running worker.
 
 ### System shader cache (macOS)
 

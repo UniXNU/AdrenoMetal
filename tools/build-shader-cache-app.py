@@ -22,10 +22,11 @@ sdk = subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], t
 base = ['xcrun', 'clang++', '-target', args.arch + '-apple-macos27.0', '-isysroot', sdk,
         '-std=c++17', '-fobjc-arc', '-O2', '-Wall', '-Wextra', '-Werror', '-Wno-deprecated-declarations', '-Wno-unused-function']
 hashes = {}
-for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal', 'IOKit'))]:
+for name, frameworks in [('ShaderCache', ('AppKit', 'Security')), ('ShaderCacheWorker', ('Foundation', 'Metal'))]:
     source = 'ShaderCacheApp.mm' if name == 'ShaderCache' else name + '.mm'
     subprocess.run([*base, SOURCE / 'ShaderCache' / source,
-                    *[part for framework in frameworks for part in ('-framework', framework)], '-o', code / name], check=True)
+                    *[part for framework in frameworks for part in ('-framework', framework)],
+                    *(['-framework', 'IOKit'] if name == 'ShaderCacheWorker' else []), '-o', code / name], check=True)
     entitlements = args.output / (name + '-entitlements.plist')
     grants = {'com.apple.security.iokit-user-client-class': ['AGXDeviceUserClient'],
               'com.apple.private.security.no-container': True} if name == 'ShaderCacheWorker' and args.arch == 'arm64e' else {}
