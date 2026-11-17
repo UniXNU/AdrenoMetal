@@ -2557,10 +2557,10 @@ index 9c0e80dc5..bd2512df0 100644
  /// A name no other writer uses: this process's id, a per-process sequence number, and the time.
 diff --git a/crates/metal2vulkan-runtime/src/shader_cache/system.rs b/crates/metal2vulkan-runtime/src/shader_cache/system.rs
 new file mode 100644
-index 000000000..c6e5cd185
+index 000000000..76fab0471
 --- /dev/null
 +++ b/crates/metal2vulkan-runtime/src/shader_cache/system.rs
-@@ -0,0 +1,268 @@
+@@ -0,0 +1,291 @@
 +//! The system layer: a second cache directory, read only, that one trusted writer fills for every
 +//! process of the machine (the consumer's render server primes the OS's Metal libraries into it).
 +//!
@@ -2797,6 +2797,29 @@ index 000000000..c6e5cd185
 +    /// refused, longer or unreadable. The caller's decoder judges the contents and reports the
 +    /// verdict ([`accepted`](Self::accepted), [`rejected`](Self::rejected)).
 +    pub fn read(&self, relative: &Path, limit: u64) -> Option<Vec<u8>> {
++        let manifest = self.read_whole(relative, limit)?;
++        if !manifest.starts_with(&super::chunks::MAGIC) {
++            return Some(manifest);
++        }
++        let (length, listed) = super::chunks::listed(&manifest)?;
++        if length > limit {
++            return None;
++        }
++        let mut bytes = Vec::with_capacity(usize::try_from(length).ok()?);
++        for (digest, size) in listed {
++            let name = super::store::hex(&digest);
++            let path = Path::new("chunks").join(&name[..2]).join(&name);
++            let chunk = self.read_whole(&path, u64::from(size))?;
++            if chunk.len() != size as usize {
++                return None;
++            }
++            bytes.extend_from_slice(&chunk);
++        }
++        Some(bytes)
++    }
++
++    /// Read one file through the layer's owner, mode and link checks.
++    fn read_whole(&self, relative: &Path, limit: u64) -> Option<Vec<u8>> {
 +        let (file, length) = self.entry(relative)?;
 +        if length > limit {
 +            return None;
