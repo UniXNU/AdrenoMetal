@@ -1,0 +1,201 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+index 7d66471..d303f93 100644
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -173,6 +173,16 @@
+ //!   textures bound to its bytes and the images in place over the buffer are made again over the
+ //!   copy: in fresh pages the runtime imported where an image in place rides on it, made as over
+ //!   the caller's pages; else linear images of its memory that start `PREINITIALIZED`.
++//! - **Pages that go.** On macOS a copy whose pages the process cannot read now is not compared at
++//!   a commit, takes no base there, and is not merged at a completion while the process cannot
++//!   write them (read them, where the GPU's writes are dropped): the copy keeps its bytes, and is
++//!   compared again once the pages are mapped (`host_memory::reachable_now`, one
++//!   `mach_vm_region` call for each region of the pages, at each comparison). A program there
++//!   frees or remaps memory under a no-copy buffer it still holds, and a command buffer that may
++//!   reach every copy compares that buffer's too. Pages freed between the kernel's answer and the
++//!   comparison's last load still fault; so do pages a second mapping replaced, which are read as
++//!   they are. Counted with the copies no command reached (`copied_copy_ins_unused`) and the
++//!   merges skipped (`copied_merges_skipped`).
+ //! - **What is not copied.** On macOS, memory whose GPU writes Metal's private option bit 24 drops
+ //!   imports a read-only view of its pages (`read_only_view.rs`).
+ //! - **Textures over a copy.** A texture made over a copied buffer is a linear image over the copy,
+@@ -191,7 +201,7 @@
+ 
+ use crate::device::lock;
+ use crate::dirty_pages::{new_writer, DirtySource, DirtyTally, PagesLog};
+-use crate::host_memory::{mapped_readable, mapped_writable};
++use crate::host_memory::{mapped_readable, mapped_writable, reachable_now};
+ use crate::key_hash::KeyMap;
+ use crate::memory_log::{copied_line, MemoryLog};
+ use crate::resource::ResourceKey;
+@@ -1383,6 +1393,12 @@ impl CopiedBuffers {
+                 unused += 1;
+                 continue;
+             }
++            // Nor is a copy whose pages the process cannot read now (the module docs, "Pages
++            // that go").
++            if !pages_reachable(entry.pages, entry.length, false) {
++                unused += 1;
++                continue;
++            }
+             copies += 1;
+             let plan = match &entry.log {
+                 Some(_) => (plans.binary_search_by_key(&entry.id, |(id, _)| *id).ok())
+@@ -1526,6 +1542,12 @@ impl CopiedBuffers {
+                 skipped += 1;
+                 continue;
+             }
++            // Nothing is merged into pages the process cannot write now, nor read of pages it
++            // cannot read where the GPU's writes are dropped ("Pages that go").
++            if !pages_reachable(entry.pages, entry.length, !entry.drops_writes) {
++                skipped += 1;
++                continue;
++            }
+             compared += 1;
+             let Base {
+                 tags,
+@@ -1788,6 +1810,13 @@ fn blocks(mut bytes: Vec<Range<u64>>, length: u64) -> Vec<Range<u64>> {
+     bytes
+ }
+ 
++/// Whether a comparison may read the caller's `length` bytes at `pages` now, and write them where
++/// `writes` ([`reachable_now`]; the module docs, "Pages that go").
++fn pages_reachable(pages: NonNull<u8>, length: usize, writes: bool) -> bool {
++    let start = pages.as_ptr() as u64;
++    reachable_now(start, start.saturating_add(length as u64), writes)
++}
++
+ /// The bytes a copy with no base compares of its pages and itself at once ([`copy_in_untagged`]),
+ /// and the unit a merge back reports its writes to a log in: a host page.
+ pub(crate) const SYNC_BLOCK: usize = 4096;
+diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
+index 9d93ab0..7d52695 100644
+--- a/crates/metal2vulkan-runtime/src/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
+@@ -914,11 +914,36 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+     mappings_permitted(start, end, Access::Write, &mut 0) == Some(true)
+ }
+ 
+-/// [`mapped_writable`] on macOS: the regions of this task over `[start, end)`, without a gap,
+-/// each with write protection now (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`); `false` where the
+-/// kernel answers no region.
++/// [`mapped_writable`] on macOS ([`mapped_with`]).
+ #[cfg(target_os = "macos")]
+ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
++    mapped_with(start, end, libc::VM_PROT_WRITE)
++}
++/// Whether a copied host buffer's comparison may read the pages of `[start, end)` now, and write
++/// them where `writes` (`copied.rs`, "Pages that go"). On macOS, whether this task maps every one
++/// with that protection, asked of the kernel at each comparison ([`mapped_with`]): a program
++/// there frees or remaps memory under a no-copy buffer it still holds (Core Animation's render
++/// server, whose buffers outlive their memory in its caches), which Metal keeps no address of
++/// after it wired the pages.
++#[cfg(target_os = "macos")]
++pub(super) fn reachable_now(start: u64, end: u64, writes: bool) -> bool {
++    let needs = match writes {
++        true => libc::VM_PROT_READ | libc::VM_PROT_WRITE,
++        false => libc::VM_PROT_READ,
++    };
++    mapped_with(start, end, needs)
++}
++/// [`reachable_now`] off macOS: the pages stay mapped until their release runs
++/// (`HostMemory::new`), and no comparison asks.
++#[cfg(not(target_os = "macos"))]
++pub(super) fn reachable_now(_start: u64, _end: u64, _writes: bool) -> bool {
++    true
++}
++/// Whether the regions of this task over `[start, end)` cover it without a gap, each with all of
++/// the protection `needs` now (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`); `false` where the
++/// kernel answers no region.
++#[cfg(target_os = "macos")]
++fn mapped_with(start: u64, end: u64, needs: libc::vm_prot_t) -> bool {
+     unsafe extern "C" {
+         /// `<mach/mach_init.h>`: the port of this process's task.
+         static mach_task_self_: libc::mach_port_t;
+@@ -959,7 +984,7 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+         if answer != libc::KERN_SUCCESS || address > covered || size == 0 {
+             return false;
+         }
+-        if info[0] & libc::VM_PROT_WRITE == 0 {
++        if info[0] & needs != needs {
+             return false;
+         }
+         covered = address.saturating_add(size);
+diff --git a/crates/metal2vulkan-runtime/src/tests/copied.rs b/crates/metal2vulkan-runtime/src/tests/copied.rs
+index 99c72c0..7816c9d 100644
+--- a/crates/metal2vulkan-runtime/src/tests/copied.rs
++++ b/crates/metal2vulkan-runtime/src/tests/copied.rs
+@@ -1472,3 +1472,73 @@ fn a_copy_in_with_no_base_splits_across_threads_and_answers_as_one_thread_does()
+     );
+     drop(copied);
+ }
++
++/// On macOS a commit compares no copy whose pages the process cannot read now, and a completion
++/// merges into none it cannot write: Core Animation's render server frees memory under no-copy
++/// buffers that still live in its caches, and a commit that may reach every copy would read the
++/// freed pages (a fault in the render server's commit). Such a copy keeps its bytes and takes no
++/// base, and is compared again once its pages are mapped. The pages here lose their protection
++/// rather than their mapping, so that nothing else of the process is mapped where they were.
++#[cfg(target_os = "macos")]
++#[test]
++fn a_commit_leaves_a_copy_alone_while_its_pages_cannot_be_read() {
++    // SAFETY: the system's page size.
++    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
++    let length = 4 * page;
++    // SAFETY: an anonymous mapping of the test's own, of `length` bytes.
++    let mapped = unsafe {
++        libc::mmap(
++            std::ptr::null_mut(),
++            length,
++            libc::PROT_READ | libc::PROT_WRITE,
++            libc::MAP_PRIVATE | libc::MAP_ANON,
++            -1,
++            0,
++        )
++    };
++    assert_ne!(mapped, libc::MAP_FAILED, "mapped");
++    let pages = NonNull::new(mapped.cast::<u8>()).unwrap();
++    // SAFETY: the mapping's bytes.
++    unsafe { std::ptr::write_bytes(pages.as_ptr(), 7, length) };
++    let buffers = Arc::new(CopiedBuffers::default());
++    let counts = Counters::default();
++    let all = CopiesReached::all();
++    let mut copy = vec![0_u8; length];
++    // SAFETY: the copy and the pages are the test's, of `length` bytes, live past the answer.
++    let copied = unsafe { add_reading(&buffers, pages, at(&mut copy), length, plain, false) };
++    let copied = copied.unwrap();
++    // SAFETY: a byte of the mapping.
++    unsafe { pages.as_ptr().add(100).write(0xAA) };
++    commit_reading(&buffers, &counts);
++    assert_eq!(copy[100], 0xAA, "copied in while the pages are mapped");
++    // The CPU writes a page that stays readable; the last two pages can no longer be read.
++    // SAFETY: a byte of the mapping, then the protection of its last two pages.
++    let protected = unsafe {
++        pages.as_ptr().add(200).write(0xBB);
++        libc::mprotect(mapped.byte_add(2 * page), 2 * page, libc::PROT_NONE)
++    };
++    assert_eq!(protected, 0, "protected");
++    commit_reading(&buffers, &counts);
++    assert_eq!(copy[200], 7, "not compared: no byte of the pages was read");
++    // A command buffer that may write every copy gives this one no base, and its completion
++    // merges nothing into pages it cannot write.
++    commit_writing(&buffers, &counts);
++    assert_eq!(counts.copied_tallies().bases_made, 0, "no base");
++    copy[300] = 0xCC;
++    buffers.merge_back(&counts, &all);
++    // Readable again: the next commit takes the write made meanwhile.
++    // SAFETY: the protection of the mapping's last two pages.
++    let restored = unsafe {
++        libc::mprotect(
++            mapped.byte_add(2 * page),
++            2 * page,
++            libc::PROT_READ | libc::PROT_WRITE,
++        )
++    };
++    assert_eq!(restored, 0, "readable again");
++    commit_reading(&buffers, &counts);
++    assert_eq!(copy[200], 0xBB, "compared again");
++    drop(copied);
++    // SAFETY: the test's mapping, which nothing reads any more.
++    unsafe { libc::munmap(mapped, length) };
++}
