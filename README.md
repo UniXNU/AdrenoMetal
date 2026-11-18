@@ -30,6 +30,8 @@ Eligible half arithmetic and math functions use the device's 16-bit precision th
 
 Unused owned image backing is reused by pooled and dedicated images. Extra spares have no byte limit, expire after ten seconds, and go sooner under memory pressure or when a new block cannot be made. Blocks are freed off the releasing thread on the runtime's free thread, and on the releasing thread once its queue is full. An allocation failure releases kept spares and waits for posted frees before retrying. Imported memory and owner callbacks keep their release ordering. Released images and buffers the runtime parks for reuse, and kept empty pooled blocks beyond one a pool, go when their time is up even in a process that makes and releases nothing more.
 
+On macOS, the runtime checks caller page access before comparing or writing back copied no-copy buffers. When the pages are unavailable, it retains the copy.
+
 ## Purgeable memory
 
 `setPurgeableState:` follows Metal's contract: a resource whose state is Volatile or Empty may lose its contents, and the call answers Empty for contents that were discarded. The bridge discards by releasing the runtime resource and makes it again from the same description, so a batch in flight keeps what it uses and the frontend handle stays valid.
