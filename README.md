@@ -82,6 +82,8 @@ Readers accept root or `_windowserver` ownership, reject group- or world-writabl
 
 Priming covers default compute and vertex pipeline variants. Successful functions are recorded in `prime-fn2`, refused functions in `prime-refused2`, and a fully compiled library in `prime-done`. Checkpoints include the runtime build. `prime-current` identifies an interrupted compile and `prime-bad` retains that function for the same build.
 
+For compute pipelines that report overlapping argument slots, priming first leaves optional constants undefined, then tries at most 16 required scalar integer constants with a value of one. The pipeline compiler verifies the bindings after each specialization.
+
 On macOS, `shader-cache.plist` records the App's progress and result. On iPadOS, `PR` and `PRc` report the primer's counters. Run UniXNU's `scripts/analyze-metal-prime.py` against a captured cache directory to summarize its checkpoints.
 
 `FP` reports submission grouping, command-pool reuse, in-place linear passes and region pipeline eviction. `CM` records cumulative commit time in microseconds, separated into lowering, recording, pipeline wait, lock wait, scheduler pass and submission.

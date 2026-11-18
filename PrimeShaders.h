@@ -25,6 +25,7 @@ extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 
 @interface NSObject (NBPrimeZeroConstants)
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
+- (id<MTLFunction>)nb_newFunctionForPriming:(NSString *)name requiredOnly:(BOOL)requiredOnly oneIndex:(uint32_t)index;
 - (NSArray<NSString *> *)nb_primeFunctionNames;
 @end
 
@@ -302,6 +303,69 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
     return false;
 }
 
+static bool hasOverlappingBindings(NSError *error) {
+    return [error.localizedDescription containsString:@"InvalidDescriptor(OverlappingArgument"];
+}
+
+// A zero may be a zero-sized batch, making the next texture start at slot 0.
+// Try a single positive required integer at a time. The compiler still checks the full
+// specialized interface. Keep this search bounded and out of application pipeline creation.
+static bool primeCompute(id<MTLDevice> device, id<MTLLibrary> library, NSString *name,
+                         id<MTLFunction> __strong &function, unsigned &zeroed, NSError **error) {
+    if ([device newComputePipelineStateWithFunction:function error:error]) return true;
+    if (!hasOverlappingBindings(*error) ||
+        ![library respondsToSelector:@selector(nb_newFunctionForPriming:requiredOnly:oneIndex:)]) return false;
+    NSDictionary<NSString *, MTLFunctionConstant *> *constants =
+        [library newFunctionWithName:name].functionConstantsDictionary;
+    if (!constants.count) return false;
+
+    id<MTLFunction> variant = [(NSObject *)library nb_newFunctionForPriming:name
+                                                                      requiredOnly:YES oneIndex:UINT32_MAX];
+    if (variant) {
+        ++zeroed;
+        function = variant;
+        *error = nil;
+        if ([device newComputePipelineStateWithFunction:function error:error]) return true;
+        if (!hasOverlappingBindings(*error)) return false;
+    }
+
+    std::set<uint32_t> candidates;
+    for (MTLFunctionConstant *constant in constants.allValues) {
+        if (!constant.required || constant.index >= UINT32_MAX) continue;
+        switch (constant.type) {
+            case MTLDataTypeChar: case MTLDataTypeUChar:
+            case MTLDataTypeShort: case MTLDataTypeUShort:
+            case MTLDataTypeInt: case MTLDataTypeUInt:
+            case MTLDataTypeLong: case MTLDataTypeULong:
+                candidates.insert((uint32_t)constant.index);
+                break;
+            default: break;
+        }
+    }
+    unsigned attempts = 0;
+    NSError *linkError = nil;
+    id<MTLFunction> linkFunction = nil;
+    for (uint32_t index : candidates) {
+        if (attempts++ == 16 || stopping()) break;
+        @autoreleasepool {
+            variant = [(NSObject *)library nb_newFunctionForPriming:name requiredOnly:YES oneIndex:index];
+            if (!variant) continue;
+            ++zeroed;
+            NSError *failure = nil;
+            if ([device newComputePipelineStateWithFunction:variant error:&failure]) return true;
+            if (!linkError && [failure.localizedDescription containsString:@"NeedsInput(LinkedFunction"]) {
+                linkError = failure;
+                linkFunction = variant;
+            }
+        }
+    }
+    if (linkError) {
+        *error = linkError;
+        function = linkFunction;
+    }
+    return false;
+}
+
 static id<MTLFunction> defaultFunction(id<MTLLibrary> lib, NSString *name, unsigned &zeroed) {
     id<MTLFunction> function = [lib newFunctionWithName:name];
     if (function.functionConstantsDictionary.count && [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
@@ -375,7 +439,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 const std::string doneKey = key + "\t" + build;
                 native_prime_compiling = 3;
                 if (bad.count(doneKey)) {++skipped; continue;}
-                const std::string attemptKey = doneKey + "-inputs3";
+                const std::string attemptKey = doneKey + "-inputs4";
                 if (refusedDone.count(attemptKey)) {++refused; continue;}
                 if (functionsDone.count(doneKey)) {++made; continue;}
                 id<MTLFunction> function = defaultFunction(lib, name, zeroed);
@@ -389,7 +453,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 @try {
                     if (type == MTLFunctionTypeKernel) {
                         ++kernels;
-                        ok = [device newComputePipelineStateWithFunction:function error:&error] != nil;
+                        ok = primeCompute(device, lib, name, function, zeroed, &error);
                         if (!ok && [error.localizedDescription containsString:@"LinkedFunction"]) {
                             ok = linkedKernel(device, lib, function, &error);
                             if (ok) ++linkedMade;
@@ -499,7 +563,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
 #else
     const unsigned scope = 2;
 #endif
-    appendLine(logPath, note + " inputs=3 boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
+    appendLine(logPath, note + " inputs=4 boot=" + boot + " scope=" + std::to_string(scope) + " build=" + build);
     std::set<std::string> binaryArchives;
 #if TARGET_OS_OSX
     if (wholeSystem) for (const std::string &path : paths) if (appleGpuArchive(path)) {
