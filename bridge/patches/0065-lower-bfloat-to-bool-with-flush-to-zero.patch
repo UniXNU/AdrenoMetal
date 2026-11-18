@@ -1,0 +1,73 @@
+diff --git a/crates/metal2vulkan/src/cache/mod.rs b/crates/metal2vulkan/src/cache/mod.rs
+index a8cb6b5..7b959c5 100644
+--- a/crates/metal2vulkan/src/cache/mod.rs
++++ b/crates/metal2vulkan/src/cache/mod.rs
+@@ -61,7 +61,7 @@ mod tests;
+ /// unchanged version, and its bless records the version. Independent of the crate's version and of
+ /// [`ARTIFACT_FORMAT_VERSION`]. The commit that bumps it says what changed; this comment keeps no
+ /// history.
+-pub const SEMANTICS_VERSION: u32 = 0x8000_0000 | 2142;
++pub const SEMANTICS_VERSION: u32 = 0xC000_0000 | 2142;
+
+ /// The byte-layout version of encoded artifacts (`CompiledFunction::to_bytes` and the
+ /// [`PipelineArtifact`] encodings). Every encoded artifact carries it, and a decode under another
+diff --git a/crates/metal2vulkan/src/lower/arith/math.rs b/crates/metal2vulkan/src/lower/arith/math.rs
+index a8609c6..5652661 100644
+--- a/crates/metal2vulkan/src/lower/arith/math.rs
++++ b/crates/metal2vulkan/src/lower/arith/math.rs
+@@ -2429,7 +2429,8 @@ pub enum ConvertKind {
+     /// NaN is true. Metal's reading (A1 cases 099ba79b and 9a824047, with and without fast math) is
+     /// C++'s `x != 0` with `float` denormals flushed; the exponent field of the `f32` container
+     /// decides it, whatever the device's denormal mode (a `half` is held widened, so its denormals
+-    /// are normal `f32` values and true, as Metal answers).
++    /// are normal `f32` values and true, as Metal answers). Also used for `bfloat` when the
++    /// AIR module allows flushing denormals, since its exponent is identical after widening.
+     ToBool,
+     /// An integer to `bool`: C++'s `x != 0`. MSL's `bool`-vector conversion of an integer vector is
+     /// what the front end emits as this `air.convert`; a scalar conversion is the front end's own
+diff --git a/crates/metal2vulkan/src/lower/arith/mod.rs b/crates/metal2vulkan/src/lower/arith/mod.rs
+index 4b88fc4..99d1eb4 100644
+--- a/crates/metal2vulkan/src/lower/arith/mod.rs
++++ b/crates/metal2vulkan/src/lower/arith/mod.rs
+@@ -2853,11 +2853,15 @@ fn select_convert(
+             to,
+         });
+     }
+-    // A `float` or `half` to `bool` is Metal's measured reading. No reading exists of a `bfloat`
+-    // (whose denormals are `f32` denormals) or `double` source.
+     if to.is_bool() {
+-        let measured = matches!(from.float_fmt(), Some(FloatFmt::F32 | FloatFmt::Half));
+-        if c.src_kind != NumKind::Float || !measured || from.lanes != to.lanes {
++        let supported = match from.float_fmt() {
++            Some(FloatFmt::F32 | FloatFmt::Half) => true,
++            // This container holds bfloat exactly in f32. Both formats have the same
++            // exponent range. Flush subnormals only when the AIR module permits it.
++            Some(FloatFmt::BFloat) => cx.entry.compile.denorms_disable,
++            _ => false,
++        };
++        if c.src_kind != NumKind::Float || !supported || from.lanes != to.lanes {
+             return Err(not_lowered());
+         }
+         return Ok(ArithStrategy::Convert {
+diff --git a/crates/metal2vulkan/src/lower/arith/tests.rs b/crates/metal2vulkan/src/lower/arith/tests.rs
+index 733cae4..31f55fd 100644
+--- a/crates/metal2vulkan/src/lower/arith/tests.rs
++++ b/crates/metal2vulkan/src/lower/arith/tests.rs
+@@ -4258,7 +4258,17 @@ fn float_to_bool_convert_is_metals_reading() {
+     // Metal: zeros and `float` denormals are false.
+     let f32_true = |b: u64| b & 0x7F80_0000 != 0;
+     let half_true = |b: u64| b & 0x7FFF != 0;
++    let bfloat_true = |b: u64| b & 0x7F80 != 0;
+     for (from, vals, truth) in [
++        (
++            bfloat(),
++            [
++                0x0000, 0x8000, 0x0001, 0x8001, 0x007F, 0x807F, 0x0080, 0x8080,
++                0x3F00, 0xBF00, 0x3F80, 0xBF80, 0x7F7F, 0xFF7F, 0x7F80, 0xFF80,
++                0x7FC0, 0xFFC0, 0x7F81, 0xFF81,
++            ].into_iter().collect(),
++            &bfloat_true as &dyn Fn(u64) -> bool,
++        ),
+         (
+             float(32),
+             floats.iter().map(|b| u64::from(*b)).collect::<Vec<_>>(),
