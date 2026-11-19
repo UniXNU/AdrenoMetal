@@ -1,0 +1,48 @@
+diff --git a/crates/metal2vulkan-runtime/src/copied.rs b/crates/metal2vulkan-runtime/src/copied.rs
+index d303f93..c250c0a 100644
+--- a/crates/metal2vulkan-runtime/src/copied.rs
++++ b/crates/metal2vulkan-runtime/src/copied.rs
+@@ -2669,8 +2669,8 @@ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+     true
+ }
+ 
+-/// [`read_pages`] on macOS.
+-#[cfg(target_os = "macos")]
++/// [`read_pages`] on macOS and iOS.
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(crate) fn read_pages(pages: NonNull<u8>, into: &mut [u8]) -> bool {
+     unsafe extern "C" {
+         /// `<mach/mach_init.h>`: the port of this process's task.
+diff --git a/crates/metal2vulkan-runtime/src/host_memory.rs b/crates/metal2vulkan-runtime/src/host_memory.rs
+index 7d52695..20edba6 100644
+--- a/crates/metal2vulkan-runtime/src/host_memory.rs
++++ b/crates/metal2vulkan-runtime/src/host_memory.rs
+@@ -914,8 +914,8 @@ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+     mappings_permitted(start, end, Access::Write, &mut 0) == Some(true)
+ }
+ 
+-/// [`mapped_writable`] on macOS ([`mapped_with`]).
+-#[cfg(target_os = "macos")]
++/// [`mapped_writable`] on macOS and iOS ([`mapped_with`]).
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ pub(super) fn mapped_writable(start: u64, end: u64) -> bool {
+     mapped_with(start, end, libc::VM_PROT_WRITE)
+ }
+@@ -942,7 +942,7 @@ pub(super) fn reachable_now(_start: u64, _end: u64, _writes: bool) -> bool {
+ /// Whether the regions of this task over `[start, end)` cover it without a gap, each with all of
+ /// the protection `needs` now (`mach_vm_region`, `VM_REGION_BASIC_INFO_64`); `false` where the
+ /// kernel answers no region.
+-#[cfg(target_os = "macos")]
++#[cfg(any(target_os = "macos", target_os = "ios"))]
+ fn mapped_with(start: u64, end: u64, needs: libc::vm_prot_t) -> bool {
+     unsafe extern "C" {
+         /// `<mach/mach_init.h>`: the port of this process's task.
+@@ -1067,7 +1067,7 @@ pub(super) fn section_pages(start: u64, end: u64) -> bool {
+ 
+ /// [`mapped_writable`] where the runtime does not ask the system for its mappings: `false` (and no
+ /// copy is made here: the runtime reads no caller's page, [`mapped_readable`]).
+-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
++#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
+ pub(super) fn mapped_writable(_start: u64, _end: u64) -> bool {
+     false
+ }
