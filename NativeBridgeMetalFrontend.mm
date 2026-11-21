@@ -1784,8 +1784,12 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
   journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
  }
  if(!handle){
-  noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
-  if(error)*error=functionLookupError(self,name,[NSString stringWithFormat:@"specialized function: %@",lastError()]);
+  NSError *failure=functionLookupError(self,name,[NSString stringWithFormat:@"specialized function: %@",lastError()]);
+  // A missing kernel in one library is an expected Core Image probe.
+  // Preserve compile failures for functions that this library declares.
+  if(![failure.domain isEqualToString:MTLLibraryErrorDomain] || failure.code!=MTLLibraryErrorFunctionNotFound)
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+  if(error)*error=failure;
   return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);
