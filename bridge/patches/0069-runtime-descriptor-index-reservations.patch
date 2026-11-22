@@ -1,0 +1,200 @@
+--- a/crates/metal2vulkan-runtime/src/arrays.rs
++++ b/crates/metal2vulkan-runtime/src/arrays.rs
+@@ -36,15 +36,15 @@
+ //! take 1 to 65,535, an index valid in both texture arrays; samplers 1 to 3,999. Index 0 is nil
+ //! and never granted.
+ 
++use crate::Device;
+ use crate::counters::{Counters, Gauge, Metric, Part};
+ use crate::device::lock;
+ use crate::error::{Error, Limit, Refusal};
+-use crate::floor::{BelowFloor, Missing, SAMPLERS, SAMPLER_ARRAYS, TEXTURES};
+-use crate::Device;
++use crate::floor::{BelowFloor, Missing, SAMPLER_ARRAYS, SAMPLERS, TEXTURES};
+ use ash::vk;
+ use std::collections::HashMap;
+ use std::ops::Range;
+-use std::sync::Mutex;
++use std::sync::{Arc, Mutex};
+ 
+ /// The binding of the sampled-texture array.
+ pub(crate) const SAMPLED_BINDING: u32 = 0;
+@@ -191,6 +191,8 @@
+ pub(crate) struct Grants {
+     granted: [Bits; 2],
+     owners: [HashMap<u32, Owner>; 2],
++    /// The next reservation search starts after the preceding reservation, not at index 1.
++    reservation_next: [u32; 2],
+     /// The last owner word given.
+     last: u64,
+ }
+@@ -200,6 +202,7 @@
+         Grants {
+             granted: [Bits::new(TEXTURES), Bits::new(SAMPLERS)],
+             owners: [HashMap::new(), HashMap::new()],
++            reservation_next: [1; 2],
+             last: 0,
+         }
+     }
+@@ -228,6 +231,21 @@
+     /// Whether `owner` owns `index` of `class`.
+     pub(crate) fn owns(&self, class: IndexClass, index: u32, owner: Owner) -> bool {
+         self.owners[class.slot()].get(&index) == Some(&owner)
++    }
++
++    fn reserve_unused(&mut self, class: IndexClass) -> Option<(u32, Owner)> {
++        let range = class.range();
++        let next = self.reservation_next[class.slot()].clamp(range.start, range.end);
++        let index = (next..range.end).chain(range.start..next).find(|&index| {
++            self.bit(class, index) && !self.owners[class.slot()].contains_key(&index)
++        })?;
++        let owner = self.place(class, index).ok()?.owner;
++        self.reservation_next[class.slot()] = if index + 1 == range.end {
++            range.start
++        } else {
++            index + 1
++        };
++        Some((index, owner))
+     }
+ 
+     /// Gives back `index` of `class` where `owner` still owns it: whether it did. An object
+@@ -1098,6 +1116,50 @@
+         .image_info(infos)
+ }
+ 
++/// A granted descriptor index reserved before its resource is constructed.
++///
++/// Dropping it returns an unused reservation immediately. After construction placed an
++/// object at the index, that object's retirement owns the index and this drop does nothing.
++pub struct IndexReservation {
++    core: Arc<crate::device::Core>,
++    class: IndexClass,
++    index: u32,
++    owner: Owner,
++}
++
++impl IndexReservation {
++    /// The index passed to a texture, sampler or pipeline constructor.
++    pub fn index(&self) -> u32 {
++        self.index
++    }
++}
++
++impl Drop for IndexReservation {
++    fn drop(&mut self) {
++        lock(&self.core.arrays.grants).vacate(self.class, self.index, self.owner);
++    }
++}
++
++impl Device {
++    /// Reserves an unused index of a grant of `class`, without displacing any live object.
++    ///
++    /// None where every granted index is held. An object's index remains held until
++    /// GPU retirement; a failed constructor leaves only the reservation to drop.
++    pub fn reserve_index(&self, class: IndexClass) -> Option<IndexReservation> {
++        let core = Arc::clone(self.core());
++        let (index, owner) = {
++            let mut grants = lock(&core.arrays.grants);
++            grants.reserve_unused(class)?
++        };
++        Some(IndexReservation {
++            core,
++            class,
++            index,
++            owner,
++        })
++    }
++}
++
+ impl Device {
+     /// No Metal counterpart: grants the consumer `first..first + count` of `class`, the range it
+     /// names, so the resource IDs it chooses from it reproduce in replay. A texture or a sampler
+@@ -1116,3 +1178,36 @@
+         lock(&self.core().arrays.grants).grant(class, first, count)
+     }
+ }
++
++#[cfg(test)]
++mod reservation_tests {
++    use super::{Grants, IndexClass};
++    #[test]
++    fn reserves_unique_indices_wraps_and_reuses_only_vacated_owners() {
++        let mut grants = Grants::new();
++        let class = IndexClass::Texture;
++        grants.grant(class, 1, 4).unwrap();
++        let mut held = Vec::new();
++        for index in 1..=4 {
++            let (got, owner) = grants.reserve_unused(class).unwrap();
++            assert_eq!(got, index);
++            held.push(owner);
++        }
++        assert!(grants.reserve_unused(class).is_none());
++        assert!(grants.vacate(class, 2, held[1]));
++        assert_eq!(grants.reserve_unused(class).unwrap().0, 2);
++        assert!(grants.reserve_unused(class).is_none());
++    }
++    #[test]
++    fn reservation_drop_cannot_free_the_constructed_resources_index() {
++        let mut grants = Grants::new();
++        let class = IndexClass::Sampler;
++        grants.grant(class, 1, 1).unwrap();
++        let (index, reservation) = grants.reserve_unused(class).unwrap();
++        let resource = grants.place(class, index).unwrap().owner;
++        assert!(!grants.vacate(class, index, reservation));
++        assert!(grants.reserve_unused(class).is_none());
++        assert!(grants.vacate(class, index, resource));
++        assert_eq!(grants.reserve_unused(class).unwrap().0, index);
++    }
++}
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -67,7 +67,7 @@
+ mod times;
+ mod visibility;
+ 
+-pub use arrays::{IndexClass, IndexGrant, ResourceId};
++pub use arrays::{IndexClass, IndexGrant, IndexReservation, ResourceId};
+ pub use blit::{BlitCommandEncoder, BlitOption, BufferLayout, TexturePlace};
+ pub use block::Block;
+ pub use buffer::{Buffer, MAX_BUFFER_LENGTH};
+@@ -98,10 +98,10 @@
+ /// `MTLSamplerDescriptor`: the translator's.
+ pub use metal2vulkan::bind::SamplerDescriptor;
+ pub use metal2vulkan::library::Library;
++/// `MTLBindingAccess`, which a pipeline state's texture slots answer: the translator's.
++pub use metal2vulkan::metal::BindingAccess;
+ /// `MTLDepthStencilDescriptor` and its `MTLStencilDescriptor`: the translator's.
+ pub use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
+-/// `MTLBindingAccess`, which a pipeline state's texture slots answer: the translator's.
+-pub use metal2vulkan::metal::BindingAccess;
+ /// `MTLReadWriteTextureTier` and `MTLArgumentBuffersTier`: the translator's.
+ pub use metal2vulkan::metal::{ArgumentBuffersTier, ReadWriteTextureTier};
+ /// `MTLSamplerMinMagFilter`, `MTLSamplerMipFilter`, `MTLSamplerAddressMode`,
+@@ -135,10 +135,10 @@
+     ComputePipelineDescriptor, FunctionDescriptor, NumberedSampler, PrecisionNote, StageSource,
+ };
+ pub use pass::{
+-    ClearColor, LoadAction, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter,
+-    RenderPassColorAttachmentDescriptor, RenderPassDepthAttachmentDescriptor, RenderPassDescriptor,
++    ClearColor, LoadAction, MAX_COLOR_ATTACHMENTS, MultisampleDepthResolveFilter,
++    MultisampleStencilResolveFilter, RenderPassColorAttachmentDescriptor,
++    RenderPassDepthAttachmentDescriptor, RenderPassDescriptor,
+     RenderPassStencilAttachmentDescriptor, StoreAction, VisibilityResultType,
+-    MAX_COLOR_ATTACHMENTS,
+ };
+ pub use pipeline::{ComputePipelineState, DispatchVariant};
+ pub use pixel_format_info::{PixelFormatInfo, TextureLevelInfo, TextureLevelQuery};
+@@ -148,11 +148,11 @@
+     IndexBuffer, RenderCommandEncoder, ScissorRect, Viewport, VisibilityResultMode,
+ };
+ pub use sampler::SamplerState;
+-pub use stage::{serve_stage, StageBreach, StageFill, StageRequest, StageSpans};
++pub use stage::{StageBreach, StageFill, StageRequest, StageSpans, serve_stage};
+ pub use surface::{
+     PlaneLayout, PlaneSpec, Surface, SurfaceCopy, SurfaceExport, SurfaceForm, SurfaceSpec,
+ };
+ pub use texture::{
+     BytesPlace, HeapRange, Region, SizeAndAlign, StorageMode, Texture, TextureDescriptor,
+ };
+-pub use times::{host_time, HOST_DOMAIN};
++pub use times::{HOST_DOMAIN, host_time};

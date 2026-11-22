@@ -2,11 +2,41 @@
 //! Native Metal bridge: the metal2vulkan runtime (the Metal API on Vulkan) over Turnip, behind a C ABI the Objective-C
 //! Metal frontend and the plugin's self-test call. Turnip is opened as the runtime's Vulkan "loader" (it exports
 //! vkGetInstanceProcAddr; iPadOS has no Khronos loader). The pinned runtime is GPL-2.0-or-later OR LGPL-3.0-or-later and is
-//! linked unmodified from its own source; nothing of it is copied here.
+//! linked from its selected source with recorded consumer patches. The copied cache reader retains its license notice.
 //!
 //! The self-test runs real Metal-level work and checks the GPU's results: a compute kernel, a render pass, a render into
 //! host pages imported without a copy (the IOSurface path), and translation of the target's own QuartzCore library into
 //! A740 pipelines. Each step reports a marker before it starts so a hang names the step.
+
+#[path = "NativeMetalSystemCache.rs"]
+pub mod system_cache;
+
+#[path = "NativeMetalTrace.rs"]
+pub mod trace;
+
+#[path = "NativeMetalHostMapping.rs"]
+pub mod host_mapping;
+
+#[path = "NativeMetalBufferArena.rs"]
+pub mod buffer_arena;
+
+#[path = "NativeMetalArchive.rs"]
+pub mod archive;
+
+#[path = "NativeMetalPipelines.rs"]
+pub mod pipelines;
+
+#[path = "NativeMetalCapabilities.rs"]
+pub mod capabilities;
+
+#[path = "NativeMetalHeap.rs"]
+pub mod heap;
+
+#[path = "NativeMetalTexture.rs"]
+pub mod texture;
+
+#[path = "NativeMetalResources.rs"]
+pub mod resources;
 
 #[path = "NativeMetalLibrary.rs"]
 pub mod library;
@@ -22,10 +52,12 @@ pub mod purge;
 use metal2vulkan::metal::{PixelFormat, PrimitiveType, TextureUsage};
 use metal2vulkan::pipeline::{ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime::{
-    BlitOption, ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, HostMemory, LoadAction,
-    Origin, PipelineOptions, RenderPassDescriptor, ResourceOptions, Size, StoreAction, TextureDescriptor,
+    ClearColor, CommandBuffer, CommandBufferStatus, Device, DeviceOptions, LoadAction,
+    RenderPassDescriptor, StoreAction,
 };
 use std::ffi::{c_char, c_void, CStr};
+use crate::resources::{Buffer, ResourceOptions};
+use crate::texture::{Texture, TextureDescriptor};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Duration;
@@ -92,7 +124,7 @@ fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
     }
 }
 
-pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
+pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<(Device, std::sync::Arc<crate::archive::Registry>), String> {
     let loader = PathBuf::from(loader.to_str().map_err(|e| format!("loader path: {e}"))?);
     // SAFETY: the frontend gives the bundled Turnip library, which exports the Vulkan
     // instance entry points. The runtime keeps its dynamic-library handle alive.
@@ -107,6 +139,8 @@ pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
             continue;
         }
         let mut options = DeviceOptions::default();
+        let registry = crate::archive::Registry::new(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
+        options.cache_lookup = Some(registry.clone());
         options.pipeline_cache_dir = Some(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
         match Device::new(&physical, options) {
             Ok(device) => {
@@ -116,7 +150,8 @@ pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
                     device.grant_indices(class, range.start, range.end - range.start)
                         .map_err(|e| format!("resource-ID grant: {e:?}"))?;
                 }
-                return Ok(device);
+                registry.bind(&device);
+                return Ok((device, registry));
             }
             Err(why) => refusals.push(format!("device creation: {why:?}")),
         }
@@ -127,22 +162,21 @@ pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
 fn compute(device: &Device, library: &crate::library::Library) -> Result<u32, String> {
     const COUNT: usize = 1000;
     let function = library.new_function_with_name("scale_and_offset").map_err(|e| format!("{e:?}"))?;
-    let state = device
-        .new_compute_pipeline_state_with_function(&function, &PipelineOptions::default())
+    let state = crate::pipelines::compute(device, &metal2vulkan::pipeline::ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor())))
         .map_err(|e| format!("pipeline: {e:?}"))?;
     let input: Vec<u8> = (0..COUNT).flat_map(|i| (i as f32).to_le_bytes()).collect();
-    let input = device.new_buffer_with_bytes(&input, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    let output = device.new_buffer((COUNT * 4) as u64, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    let scale = device.new_buffer_with_bytes(&2.0f32.to_le_bytes(), ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    let queue = device.new_command_queue().map_err(|e| format!("{e:?}"))?;
+    let input = Buffer::allocate(device, (&input).len() as u64, ResourceOptions::shared(), Some(&input)).map_err(|e| format!("{e:?}"))?;
+    let output = Buffer::allocate(device, (COUNT * 4) as u64, ResourceOptions::shared(), None).map_err(|e| format!("{e:?}"))?;
+    let scale = Buffer::allocate(device, (&2.0f32.to_le_bytes()).len() as u64, ResourceOptions::shared(), Some(&2.0f32.to_le_bytes())).map_err(|e| format!("{e:?}"))?;
+    let queue = device.new_command_queue(64).map_err(|e| format!("{e:?}"))?;
     let command_buffer = queue.command_buffer().map_err(|e| format!("{e:?}"))?;
     let mut encoder = command_buffer.compute_command_encoder(metal2vulkan_runtime::DispatchType::Serial).map_err(|e| format!("{e:?}"))?;
     encoder.set_compute_pipeline_state(&state).map_err(|e| format!("{e:?}"))?;
     encoder.set_buffer(Some(&input), 0, 0).map_err(|e| format!("{e:?}"))?;
     encoder.set_buffer(Some(&output), 0, 1).map_err(|e| format!("{e:?}"))?;
     encoder.set_buffer(Some(&scale), 0, 2).map_err(|e| format!("{e:?}"))?;
-    encoder.dispatch_threads(Size::new(COUNT as u64, 1, 1), Size::new(64, 1, 1)).map_err(|e| format!("{e:?}"))?;
-    encoder.end_encoding().map_err(|e| format!("{e:?}"))?;
+    encoder.dispatch_threads([COUNT as u32, 1, 1], [64, 1, 1]).map_err(|e| format!("{e:?}"))?;
+    encoder.end_encoding();
     finish(&command_buffer)?;
     let contents = output.contents().ok_or("no contents")?;
     // SAFETY: the buffer holds COUNT floats and no command buffer writes it now.
@@ -158,31 +192,32 @@ fn draw_quad(device: &Device, library: &crate::library::Library, target: &metal2
     let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
     descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
     descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::RGBA8Unorm));
-    let state = device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()).map_err(|e| format!("pipeline: {e:?}"))?;
+    let state = crate::pipelines::render(device, &descriptor).map_err(|e| format!("pipeline: {e:?}"))?;
     let positions: [[f32; 2]; 6] = [[-1.0, 1.0], [0.0, 1.0], [-1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [-1.0, 0.0]];
     let positions: Vec<u8> = positions.iter().flatten().flat_map(|v| v.to_le_bytes()).collect();
     let colors: Vec<u8> = (0..6).flat_map(|_| [1.0f32, 0.2, 0.0, 1.0]).flat_map(|v| v.to_le_bytes()).collect();
-    let positions = device.new_buffer_with_bytes(&positions, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    let colors = device.new_buffer_with_bytes(&colors, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
-    let mut pass = RenderPassDescriptor::new();
+    let positions = Buffer::allocate(device, (&positions).len() as u64, ResourceOptions::shared(), Some(&positions)).map_err(|e| format!("{e:?}"))?;
+    let colors = Buffer::allocate(device, (&colors).len() as u64, ResourceOptions::shared(), Some(&colors)).map_err(|e| format!("{e:?}"))?;
+    let mut pass = RenderPassDescriptor::default();
     let color = &mut pass.color_attachments[0];
     color.texture = Some(target.clone());
     color.load_action = LoadAction::Clear;
     color.store_action = StoreAction::Store;
     color.clear_color = ClearColor::new(0.0, 0.0, 1.0, 1.0);
-    let queue = device.new_command_queue().map_err(|e| format!("{e:?}"))?;
+    let queue = device.new_command_queue(64).map_err(|e| format!("{e:?}"))?;
     let command_buffer = queue.command_buffer().map_err(|e| format!("{e:?}"))?;
     let mut encoder = command_buffer.render_command_encoder(&pass).map_err(|e| format!("{e:?}"))?;
     encoder.set_render_pipeline_state(&state).map_err(|e| format!("{e:?}"))?;
     encoder.set_vertex_buffer(Some(&positions), 0, 0).map_err(|e| format!("{e:?}"))?;
     encoder.set_vertex_buffer(Some(&colors), 0, 1).map_err(|e| format!("{e:?}"))?;
     encoder.draw_primitives(PrimitiveType::Triangle, 0, 6, 1, 0).map_err(|e| format!("{e:?}"))?;
-    encoder.end_encoding().map_err(|e| format!("{e:?}"))?;
+    encoder.end_encoding();
     if let Some((buffer, row, side)) = readback {
         let mut blit = command_buffer.blit_command_encoder().map_err(|e| format!("{e:?}"))?;
-        blit.copy_from_texture_to_buffer(target, 0, 0, Origin::new(0, 0, 0), Size::new(side, side, 1), buffer, 0, row,
-                                         row * side, BlitOption::None).map_err(|e| format!("{e:?}"))?;
-        blit.end_encoding().map_err(|e| format!("{e:?}"))?;
+        blit.copy_from_texture_to_buffer(target, metal2vulkan_runtime::TexturePlace::default(),
+            [u32::try_from(side).map_err(|_| "readback side exceeds u32")?, u32::try_from(side).map_err(|_| "readback side exceeds u32")?, 1], buffer,
+            metal2vulkan_runtime::BufferLayout { offset: 0, bytes_per_row: row, bytes_per_image: row.checked_mul(side).ok_or("readback image pitch overflow")? }).map_err(|e| format!("{e:?}"))?;
+        blit.end_encoding();
     }
     finish(&command_buffer)
 }
@@ -208,8 +243,8 @@ fn render(device: &Device, library: &crate::library::Library) -> Result<u32, Str
     let mut texture = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
     texture.usage = TextureUsage::RENDER_TARGET;
     texture.resource_options = ResourceOptions::private();
-    let target = device.new_texture(&texture).map_err(|e| format!("{e:?}"))?;
-    let readback = device.new_buffer(SIDE * 4 * SIDE, ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
+    let target = Texture::allocate(device, &texture).map_err(|e| format!("{e:?}"))?;
+    let readback = Buffer::allocate(device, SIDE * 4 * SIDE, ResourceOptions::shared(), None).map_err(|e| format!("{e:?}"))?;
     draw_quad(device, library, &target, Some((&readback, SIDE * 4, SIDE)))?;
     let contents = readback.contents().ok_or("no contents")?;
     // SAFETY: SIDE rows of SIDE * 4 bytes, no longer written.
@@ -234,9 +269,8 @@ fn import(device: &Device, library: &crate::library::Library) -> Result<u32, Str
         // SAFETY: the pages were just mapped; nothing else uses them.
         unsafe { std::ptr::write_bytes(pages as *mut u8, 0x5a, bytes) };
         // SAFETY: the mapping is writable, page aligned and outlives the buffer (dropped before the unmap).
-        let memory = unsafe { HostMemory::new(NonNull::new(pages as *mut u8).ok_or("null")?) };
         // SAFETY: as above, for `bytes` bytes.
-        let buffer = unsafe { device.new_buffer_with_bytes_no_copy(memory, bytes as u64, ResourceOptions::shared(), None) }
+        let buffer = unsafe { Buffer::import(device, NonNull::new(pages as *mut u8).ok_or("null")?, bytes as u64, ResourceOptions::shared(), None) }
             .map_err(|e| format!("no-copy buffer: {e:?}"))?;
         let mut texture = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
         texture.usage = TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ;
@@ -296,7 +330,7 @@ fn quartzcore(run: &mut Run, device: &Device, bytes: &[u8]) -> Result<(), String
         }
         match function.function_type() {
             Ok(metal2vulkan::metal::FunctionType::Kernel) => {
-                match device.new_compute_pipeline_state_with_function(&function, &PipelineOptions::default()) {
+                match crate::pipelines::compute(device, &metal2vulkan::pipeline::ComputePipelineDescriptor::new(StageSource::Function(function.function_descriptor()))) {
                     Ok(_) => run.out.qc_kernels_ok += 1,
                     Err(e) => {
                         run.out.qc_kernels_failed += 1;
@@ -323,7 +357,7 @@ fn quartzcore(run: &mut Run, device: &Device, bytes: &[u8]) -> Result<(), String
         let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
         descriptor.fragment = Some(StageSource::Function(fragment.function_descriptor()));
         descriptor.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
-        match device.new_render_pipeline_state(&descriptor, &PipelineOptions::default()) {
+        match crate::pipelines::render(device, &descriptor) {
             Ok(_) => run.out.qc_pairs_ok += 1,
             Err(e) => {
                 run.out.qc_pairs_failed += 1;
@@ -339,7 +373,7 @@ fn quartzcore(run: &mut Run, device: &Device, bytes: &[u8]) -> Result<(), String
 fn selftest(run: &mut Run, loader: &CStr, cache: &CStr, qc: &[u8]) -> u32 {
     run.step(0x6501);
     let device = match open(loader, cache) {
-        Ok(device) => device,
+        Ok((device, _registry)) => device,
         Err(why) => return run.fail(0x6501, why),
     };
     run.step(0x6502);

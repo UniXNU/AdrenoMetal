@@ -4937,7 +4937,7 @@ static void reportUnreadableLibrary(NSString *path) {
  if(!pipelineArchives(d.binaryArchives,archives,error)){delete p;return nil;}
  const NmbPipelineOptions creation={(uint64_t)options,archives.data(),archives.size()};
  const uint64_t pipelineBegan=nowUs();const NBCost costBegan=NBCost::now();
- uint64_t cacheBefore[10]={};if(!gJournalPath.empty())nmb_device_work_stats(gDevice,cacheBefore);
+ uint64_t cacheBefore[32]={};const bool haveCacheBefore=!gJournalPath.empty() && diagOn() && nmb_device_runtime_metrics(gDevice,cacheBefore);
  NmbRenderPipeline *handle=nmb_render_pipeline_new_with_options(gDevice,p,&creation);gTimePipeline.add(pipelineBegan);
  // With diagnostics on: which Metal functions the program Turnip just built for this pipeline belongs to (tu_darwin_last_program gives
  // the vertex and fragment shader hashes of the last program this thread built; the pass records of the frame trace name a pass's
@@ -4959,11 +4959,14 @@ static void reportUnreadableLibrary(NSString *path) {
  if(handle && reflection && wantsReflection(options))*reflection=(MTLRenderPipelineReflection *)renderReflection(p);
  delete p;
  std::string cost=gJournalPath.empty()?std::string():NBCost::now().since(costBegan);
- if(!gJournalPath.empty()) {   // what the shader cache did for this making: artifacts found, not found, handed to the directory
-  uint64_t after[10]={};nmb_device_work_stats(gDevice,after);
-  char text[96];snprintf(text,sizeof text," cache hit=%llu miss=%llu wr=%llu",(unsigned long long)(after[7]-cacheBefore[7]),(unsigned long long)(after[8]-cacheBefore[8]),
-   (unsigned long long)(after[9]-cacheBefore[9]));
-  cost+=text;
+ if(handle && haveCacheBefore) {
+  uint64_t after[32]={};
+  if(nmb_device_runtime_metrics(gDevice,after)) {
+   char text[128];snprintf(text,sizeof text," cache loaded=%llu translated=%llu written-bytes=%llu",
+    (unsigned long long)(after[13]-cacheBefore[13]),(unsigned long long)(after[12]-cacheBefore[12]),
+    (unsigned long long)(after[14]-cacheBefore[14]));
+   cost+=text;
+  }
  }
  journalRenderPipeline(d,pipelineBegan,handle?nullptr:nmb_last_error(),cost);
  if(!handle) {
@@ -5217,37 +5220,24 @@ static void logFlowCounts() {
  dispatch_resume(timer);
 }
 
-// With diag=1, a process other than the render server (which has the telemetry table) writes what it compiled to the system log
-// every 30 s while that changes: pipeline states, libraries and compiler requests made with their total and longest times, the
-// driver pipelines made (in all, at a state's creation, at a draw or dispatch) and the driver's time in them, the shader cache's
-// hits, misses and writes, and the MiB of the runtime's pooled, kept and dedicated blocks. One line a process, so a boot's log
-// says which app compiled how much at first use.
+// Report the rewritten runtime's own counters for client processes while work changes.
 static void logClientWork() {
  if(!diagOn() || isRenderServer())return;
  static dispatch_source_t timer;
  timer=dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,0,0,dispatch_get_global_queue(QOS_CLASS_UTILITY,0));
  dispatch_source_set_timer(timer,dispatch_time(DISPATCH_TIME_NOW,30*NSEC_PER_SEC),30*NSEC_PER_SEC,5*NSEC_PER_SEC);
  dispatch_source_set_event_handler(timer,^{
-  static uint64_t last[3];
-  uint64_t vp[8]={},work[10]={},mc[10]={},sy[4]={};
-  if(!nmb_device_pipeline_counts(gDevice,vp))return;
-  (void)nmb_system_cache_counts(sy);
-  const uint64_t now[3]={gTimePipeline.count.load(),gTimeCompile.count.load()+gCompileCached.load(),vp[0]};
+  static uint64_t last[4];
+  uint64_t m[32]={};NmbRuntimeMemory memory={};
+  if(!nmb_device_runtime_metrics(gDevice,m) || !nmb_device_runtime_memory(gDevice,&memory))return;
+  const uint64_t now[4]={m[1],m[10],m[12],m[13]};
   if(!memcmp(now,last,sizeof now))return;
   memcpy(last,now,sizeof now);
-  (void)nmb_device_work_stats(gDevice,work);(void)nmb_device_memory_counts(gDevice,mc);
-  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal work: pipeline %llu/%llums/%llums library %llu/%llums compile %llu/%llums cached %llu | vk %llu "
-   "create %llu/%llu step %llu drv %llu+%llums | cache hit %llu miss %llu wr %llu | system %llu/%lluK rej %llu refused %llu replies %llu | "
-   "mem %llu/%llu/%lluM | problems %llu",
-   (unsigned long long)gTimePipeline.count.load(),(unsigned long long)(gTimePipeline.total.load()/1000),
-   (unsigned long long)(gTimePipeline.slowest.load()/1000),(unsigned long long)gTimeLibrary.count.load(),
-   (unsigned long long)(gTimeLibrary.total.load()/1000),(unsigned long long)gTimeCompile.count.load(),
-   (unsigned long long)(gTimeCompile.total.load()/1000),(unsigned long long)gCompileCached.load(),(unsigned long long)vp[0],
-   (unsigned long long)vp[1],(unsigned long long)vp[2],(unsigned long long)vp[3],(unsigned long long)(vp[4]/1000000),
-   (unsigned long long)(vp[5]/1000000),(unsigned long long)work[7],(unsigned long long)work[8],(unsigned long long)work[9],
-   (unsigned long long)sy[0],(unsigned long long)(sy[3]>>10),(unsigned long long)sy[1],(unsigned long long)sy[2],
-   (unsigned long long)gCompileSystem.load(),
-   (unsigned long long)(mc[0]>>20),(unsigned long long)(mc[2]>>20),(unsigned long long)(mc[3]>>20),(unsigned long long)gProblems.load());
+  os_log(OS_LOG_DEFAULT,"NativeAdrenoMetal RT2 client: submit %llu pipeline %llu/%lluns translated %llu loaded %llu written %llu | shared %llu private %llu import %llu texture %llu | problems %llu",
+   (unsigned long long)m[1],(unsigned long long)m[10],(unsigned long long)m[11],(unsigned long long)m[12],
+   (unsigned long long)m[13],(unsigned long long)m[14],(unsigned long long)memory.shared_allocation_bytes,
+   (unsigned long long)memory.private_allocation_bytes,(unsigned long long)memory.import_bytes,
+   (unsigned long long)memory.texture_block_bytes,(unsigned long long)gProblems.load());
  });
  dispatch_resume(timer);
 }
@@ -5563,16 +5553,23 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
  if(diagOn() && gDevice) {
   NmbRuntimeMemory m={};
   if(nmb_device_runtime_memory(gDevice,&m) && m.version==2) {
-   row("MEM2 sample_ns=%llu shared=%llu private=%llu placed=%llu/%llu idle=%llu/%llu reserve=%llu/%llu",
-    (ull)m.sample_ns,(ull)m.shared_allocation_bytes,(ull)m.private_allocation_bytes,
-    (ull)m.shared_placed_bytes,(ull)m.private_placed_bytes,(ull)m.shared_idle_bytes,(ull)m.private_idle_bytes,
-    (ull)m.shared_reserve_bytes,(ull)m.private_reserve_bytes);
-   row("MEM2 imports=%llu bytes=%llu exports=%llu surface=%llu pending_cb=%llu releases_waiting=%llu freed_allocations=%llu",
-    (ull)m.imports,(ull)m.import_bytes,(ull)m.export_bytes,(ull)m.surface_import_bytes,
-    (ull)m.command_buffers,(ull)m.releases_waiting,(ull)m.allocations_freed);
-   row("MEM2 idle_age_ns=%llu/%llu texture_blocks=%llu/%llu buffer_bytes=%llu/%llu",
-    (ull)m.shared_idle_age_ns,(ull)m.private_idle_age_ns,(ull)m.texture_block_bytes,(ull)m.texture_block_held_bytes,
-    (ull)m.shared_buffer_bytes,(ull)m.private_buffer_bytes);
+   row("MEM2 ns=%llu shared=%llu private=%llu",(ull)m.sample_ns,(ull)m.shared_allocation_bytes,(ull)m.private_allocation_bytes);
+   row("MEM2 placed=%llu/%llu idle=%llu/%llu",(ull)m.shared_placed_bytes,(ull)m.private_placed_bytes,(ull)m.shared_idle_bytes,(ull)m.private_idle_bytes);
+   row("MEM2 reserve=%llu/%llu idle_ns=%llu/%llu",(ull)m.shared_reserve_bytes,(ull)m.private_reserve_bytes,(ull)m.shared_idle_age_ns,(ull)m.private_idle_age_ns);
+   row("MEM2 imports=%llu bytes=%llu exports=%llu surface=%llu",(ull)m.imports,(ull)m.import_bytes,(ull)m.export_bytes,(ull)m.surface_import_bytes);
+   row("MEM2 cb=%llu waiting=%llu freed=%llu",(ull)m.command_buffers,(ull)m.releases_waiting,(ull)m.allocations_freed);
+   row("MEM2 tex_block=%llu held=%llu buffer=%llu/%llu",(ull)m.texture_block_bytes,(ull)m.texture_block_held_bytes,(ull)m.shared_buffer_bytes,(ull)m.private_buffer_bytes);
+  }
+ }
+ if(gDevice && diagOn()) {
+  uint64_t m[32]={};
+  if(nmb_device_runtime_metrics(gDevice,m)) {
+   row("RT2 submit %llu infos %llu ns %llu max %llu qlock %llu",(ull)m[1],(ull)m[2],(ull)m[3],(ull)m[4],(ull)m[5]);
+   row("RT2 passes %llu barriers %llu copy %llu zero %llu pipelines %llu ns %llu",(ull)m[6],(ull)m[7],(ull)m[8],(ull)m[9],(ull)m[10],(ull)m[11]);
+   row("RT2 translate %llu load %llu written %llu dropped %llu import-copy %llu/%llu",(ull)m[12],(ull)m[13],(ull)m[14],(ull)m[15],(ull)m[16],(ull)m[17]);
+   row("RT2 freed %llu allocate %llu ns %llu held-release %llu/%llu",(ull)m[18],(ull)m[19],(ull)m[20],(ull)m[30],(ull)m[31]);
+   row("RT2 alloc-bytes texture %llu block %llu ring %llu stage %llu/%llu",(ull)m[21],(ull)m[22],(ull)m[23],(ull)m[24],(ull)m[25]);
+   row("RT2 alloc-bytes take %llu/%llu first-use %llu ns %llu",(ull)m[26],(ull)m[27],(ull)m[28],(ull)m[29]);
   }
  }
  if(gDevice) {

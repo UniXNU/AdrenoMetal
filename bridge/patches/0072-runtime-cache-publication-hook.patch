@@ -1,0 +1,51 @@
+--- a/crates/metal2vulkan-runtime/src/cache.rs
++++ b/crates/metal2vulkan-runtime/src/cache.rs
+@@ -144,6 +144,9 @@
+     fn read(&self, name: &str) -> Option<Vec<u8>>;
+     /// Record a decode verdict, for consumer diagnostics alone.
+     fn verdict(&self, name: &str, accepted: bool, bytes: u64);
++    /// Optional notification after a writable-cache publication. The consumer may make
++    /// its own system-cache files readable. A notification never changes cache acceptance.
++    fn published(&self, _path: &Path) {}
+ }
+ 
+ /// The cap of the lowerings in a cache directory where the consumer names none: half of it, what
+@@ -1486,6 +1489,14 @@
+         if let Some(store) = &self.store {
+             if store.put(file, bytes) {
+                 counters.cache_written(bytes.len() as u64);
++                if let Some(lookup) = &self.lookup {
++                    let young = store.young.load(Relaxed);
++                    for generation in [young, young.saturating_sub(1)] {
++                        if generation != 0 {
++                            lookup.published(&store.generation(generation).join(file));
++                        }
++                    }
++                }
+             }
+         }
+     }
+@@ -1759,6 +1770,9 @@
+         }
+         if write_whole(path, &[&frame(data), data]).is_ok() {
+             counters.cache_written(24 + len);
++            if let Some(lookup) = &self.lookup {
++                lookup.published(path);
++            }
+             lock(&self.pipelines).written = size;
+             #[cfg(all(test, any(m2v_gpu, m2v_cpu_icd)))]
+             self.writes
+--- a/crates/metal2vulkan-runtime/src/device.rs
++++ b/crates/metal2vulkan-runtime/src/device.rs
+@@ -687,6 +687,11 @@
+             &counters,
+         );
+         caches.lookup = options.cache_lookup;
++        if let (Some(lookup), Some(directory)) =
++            (&caches.lookup, options.pipeline_cache_dir.as_ref())
++        {
++            lookup.published(&directory.join("state"));
++        }
+         // SAFETY: the device was made from `raw` with `capabilities.features`, and the family is
+         // its queues' family.
+         let made = unsafe { objects(&device, &capabilities, &counters) };

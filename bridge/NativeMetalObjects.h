@@ -467,6 +467,15 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
 uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
+/* Runtime-v2 DEBUG metrics, 32 words: version; submissions, submit infos, submit ns/max ns,
+   queue-lock ns; passes, barriers, copied/zeroed bytes; pipelines, pipeline ns;
+   translations, loaded translations, cache bytes written, writes dropped;
+   imported-buffer copies/bytes; allocations freed, consumer allocations/ns;
+   allocation bytes by texture, texture block, ring, staging region, staging buffer,
+   shared take, private take; first-use waits/ns; held releases/bytes.
+   Version-1 statistics queries return false under runtime v2; their layouts are not equivalent. */
+bool nmb_device_runtime_metrics(const NmbDevice *, uint64_t *out);
+
 #ifdef __cplusplus
 }
 #endif

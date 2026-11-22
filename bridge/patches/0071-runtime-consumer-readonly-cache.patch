@@ -1,0 +1,238 @@
+--- a/crates/metal2vulkan-runtime/src/cache.rs
++++ b/crates/metal2vulkan-runtime/src/cache.rs
+@@ -121,10 +121,10 @@
+ //! [`Gauges::pipeline_cache_bytes`]: crate::Gauges::pipeline_cache_bytes
+ 
+ use crate::counters::{Counters, Gauge, Metric};
+-use crate::device::{lock, Core};
++use crate::device::{Core, lock};
+ use crate::times::host_time;
+ use ash::vk;
+-use metal2vulkan::cache::{Hash256, ARTIFACT_FORMAT_VERSION, SEMANTICS_VERSION};
++use metal2vulkan::cache::{ARTIFACT_FORMAT_VERSION, Hash256, SEMANTICS_VERSION};
+ use std::collections::VecDeque;
+ use std::fs::{self, File};
+ use std::io::{self, ErrorKind, Read, Write};
+@@ -135,6 +135,16 @@
+     TryLockError,
+ };
+ use std::time::{Duration, SystemTime};
++
++/// Consumer-owned read-only cache entries, such as a system cache or binary archive.
++/// The runtime validates each entry under the same content key, versions and checksum as its
++/// writable cache. Implementations bound reads and must not call back into this device.
++pub trait CacheLookup: Send + Sync {
++    /// Read one runtime-relative name, such as `translations/<digest>` or `pipelines-<header>`.
++    fn read(&self, name: &str) -> Option<Vec<u8>>;
++    /// Record a decode verdict, for consumer diagnostics alone.
++    fn verdict(&self, name: &str, accepted: bool, bytes: u64);
++}
+ 
+ /// The cap of the lowerings in a cache directory where the consumer names none: half of it, what
+ /// the store is sure to keep, is about seven times the 9.16 MB a long recorded session's 282
+@@ -363,6 +373,7 @@
+ 
+     /// Whether the directory holds `bytes` as `file`, reading it only where its length is
+     /// theirs; a file that differs stays.
++    #[cfg(test)]
+     pub(crate) fn holds(self: &Arc<Self>, file: &str, bytes: &[u8]) -> bool {
+         let len = Some(bytes.len() as u64);
+         self.lookup(file, len, |held| (held == bytes).then_some(()), false)
+@@ -923,6 +934,7 @@
+ /// A device's caches: the lowerings in the store, and the `VkPipelineCache` every `VkPipeline`
+ /// is made through, with its blob.
+ pub(crate) struct Caches {
++    pub(crate) lookup: Option<Arc<dyn CacheLookup>>,
+     store: Option<Arc<Store>>,
+     /// The cache directory, where there is one.
+     dir: Option<PathBuf>,
+@@ -1235,6 +1247,7 @@
+     /// removal thread counts in `counters`' thread gauge.
+     pub(crate) fn new(dir: Option<&Path>, cap: u64, counters: &Counters) -> Caches {
+         Caches {
++            lookup: None,
+             store: dir
+                 .map(|dir| Store::open(dir.to_owned(), cap, counters.clone(), Versions::BUILT)),
+             dir: dir.map(Path::to_owned),
+@@ -1414,12 +1427,28 @@
+         format!("{RENDERS}/{}", hex(content))
+     }
+ 
++    /// A writable-cache hit, else the consumer's entry under the same validation.
++    fn read_entry<T>(&self, file: &str, mut decode: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
++        if let Some(value) = self
++            .store
++            .as_ref()
++            .and_then(|store| store.get(file, |bytes| decode(bytes)))
++        {
++            return Some(value);
++        }
++        let lookup = self.lookup.as_ref()?;
++        let bytes = lookup.read(file)?;
++        let value = decode(&bytes);
++        lookup.verdict(file, value.is_some(), bytes.len() as u64);
++        value
++    }
++
+     /// The lowerings the record of the render content of descriptor key digest `content` names,
+     /// where the store holds one that reads as its record ([`read_record`]); bytes that do not are
+     /// removed, a miss.
+     pub(crate) fn record(&self, content: &Hash256) -> Option<Lowerings> {
+         let file = Caches::record_file(content);
+-        (self.store.as_ref()?).get(&file, |bytes| read_record(bytes, content))
++        self.read_entry(&file, |bytes| read_record(bytes, content))
+     }
+ 
+     /// What `decode` makes of the bytes kept for a lowered kernel of key digest `key`, where they
+@@ -1428,10 +1457,10 @@
+     pub(crate) fn translation<T>(
+         &self,
+         key: &[u8],
+-        decode: impl FnOnce(&[u8]) -> Option<T>,
++        mut decode: impl FnMut(&[u8]) -> Option<T>,
+     ) -> Option<T> {
+         let file = Caches::translation_file(key);
+-        let kept = self.store.as_ref()?.get(&file, |bytes| match bytes {
++        let kept = self.read_entry(&file, |bytes| match bytes {
+             REFUSED | OBSERVES => Some(None),
+             lowering => decode(lowering).map(Some),
+         });
+@@ -1463,17 +1492,19 @@
+ 
+     /// Whether the translator refused the lowering of key digest `key` on a device before.
+     pub(crate) fn refused(&self, key: &[u8]) -> bool {
+-        self.store
+-            .as_ref()
+-            .is_some_and(|store| store.holds(&Caches::translation_file(key), REFUSED))
++        self.read_entry(&Caches::translation_file(key), |bytes| {
++            Some(bytes == REFUSED)
++        })
++        .unwrap_or(false)
+     }
+ 
+     /// Whether the translator answered on a device before that the kernel whose
+     /// partial-threadgroups variant has key digest `key` observes its threadgroup partition.
+     pub(crate) fn observed(&self, key: &[u8]) -> bool {
+-        self.store
+-            .as_ref()
+-            .is_some_and(|store| store.holds(&Caches::translation_file(key), OBSERVES))
++        self.read_entry(&Caches::translation_file(key), |bytes| {
++            Some(bytes == OBSERVES)
++        })
++        .unwrap_or(false)
+     }
+ 
+     /// On the reaper, first: makes the device's `VkPipelineCache` empty, which creations waiting
+@@ -1517,13 +1548,24 @@
+             let name = blob_name(&header);
+             prune_blobs(dir, &name);
+             let path = dir.join(name);
+-            let file = read_whole(&path, None).ok().flatten();
++            let local = read_whole(&path, None).ok().flatten();
++            let external = local.is_none();
++            let file = local.or_else(|| {
++                self.lookup
++                    .as_ref()
++                    .and_then(|lookup| lookup.read(&blob_name(&header)))
++            });
+             let data = (file.as_deref())
+                 .and_then(unframe)
+                 .filter(|data| data.starts_with(&header));
+             // SAFETY: the data is what `vkGetPipelineCacheData` gave for a device of this header,
+             // whole, as its length and checksum show.
+             let seeded = data.and_then(|data| unsafe { make_cache(device, data) });
++            if external {
++                if let (Some(lookup), Some(bytes)) = (&self.lookup, &file) {
++                    lookup.verdict(&blob_name(&header), seeded.is_some(), bytes.len() as u64);
++                }
++            }
+             match seeded {
+                 // SAFETY: the cache is the device's, and this thread's alone.
+                 Some(seeded) => unsafe { self.take_seeded(device, seeded, counters) },
+@@ -1770,3 +1812,38 @@
+         unsafe { device.destroy_pipeline_cache(cache.0, None) };
+     }
+ }
++
++#[cfg(test)]
++mod consumer_cache_tests {
++    use super::{CacheLookup, Caches};
++    use crate::counters::Counters;
++    use std::sync::{Arc, Mutex};
++
++    struct Layer {
++        bytes: Vec<u8>,
++        verdicts: Mutex<Vec<bool>>,
++    }
++    impl CacheLookup for Layer {
++        fn read(&self, _name: &str) -> Option<Vec<u8>> {
++            Some(self.bytes.clone())
++        }
++        fn verdict(&self, _name: &str, accepted: bool, _bytes: u64) {
++            self.verdicts.lock().unwrap().push(accepted);
++        }
++    }
++    #[test]
++    fn readonly_entries_go_through_the_callers_decoder() {
++        let layer = Arc::new(Layer {
++            bytes: b"whole lowering".to_vec(),
++            verdicts: Mutex::default(),
++        });
++        let mut caches = Caches::new(None, 1024, &Counters::new());
++        caches.lookup = Some(layer.clone());
++        let decoded =
++            caches.translation(&[1; 32], |bytes| (bytes == b"whole lowering").then_some(7));
++        assert_eq!(decoded, Some(7));
++        let rejected = caches.translation(&[1; 32], |_bytes| None::<u32>);
++        assert_eq!(rejected, None);
++        assert_eq!(*layer.verdicts.lock().unwrap(), vec![true, false]);
++    }
++}
+--- a/crates/metal2vulkan-runtime/src/device.rs
++++ b/crates/metal2vulkan-runtime/src/device.rs
+@@ -33,10 +33,10 @@
+ use metal2vulkan::metal::{ArgumentBuffersTier, ReadWriteTextureTier};
+ use std::cell::Cell;
+ use std::collections::HashMap;
+-use std::ffi::{c_char, CString};
++use std::ffi::{CString, c_char};
+ use std::path::PathBuf;
+ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
++use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, Weak, mpsc};
+ use std::thread::{self, JoinHandle};
+ use std::time::{Duration, Instant};
+ 
+@@ -446,6 +446,8 @@
+     ///
+     /// [`Metrics::translations_loaded`]: crate::Metrics::translations_loaded
+     pub pipeline_cache_dir: Option<PathBuf>,
++    /// A consumer-owned read-only layer used after a writable-cache miss. None by default.
++    pub cache_lookup: Option<Arc<dyn crate::CacheLookup>>,
+     /// The most bytes the lowerings in [`pipeline_cache_dir`](Self::pipeline_cache_dir) take;
+     /// `None` is 128 MiB. The pipeline cache's file, at most 32 MiB per kind of device, is beside
+     /// them. Half of the cap is what the directory is sure to keep: a lowering stays for at least
+@@ -679,11 +681,12 @@
+         let max_allocations = properties.properties.limits.max_memory_allocation_count;
+         let granularity = properties.properties.limits.buffer_image_granularity;
+         let counters = Counters::new();
+-        let caches = Caches::new(
++        let mut caches = Caches::new(
+             options.pipeline_cache_dir.as_deref(),
+             (options.pipeline_cache_cap).unwrap_or(cache::DEFAULT_CAP),
+             &counters,
+         );
++        caches.lookup = options.cache_lookup;
+         // SAFETY: the device was made from `raw` with `capabilities.features`, and the family is
+         // its queues' family.
+         let made = unsafe { objects(&device, &capabilities, &counters) };
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -71,6 +71,7 @@
+ pub use blit::{BlitCommandEncoder, BlitOption, BufferLayout, TexturePlace};
+ pub use block::Block;
+ pub use buffer::{Buffer, MAX_BUFFER_LENGTH};
++pub use cache::CacheLookup;
+ pub use command::{
+     CommandBuffer, CommandBufferError, CommandBufferStatus, DeviceLoss, LossLocation,
+ };
