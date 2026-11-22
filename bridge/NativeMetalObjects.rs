@@ -43,6 +43,7 @@ use metal2vulkan_runtime::{CommandBufferError, MultisampleDepthResolveFilter, Mu
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static COMPLETING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SCHEDULING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_error(why: String) {
@@ -2504,7 +2505,7 @@ pub extern "C" fn nmb_command_buffer_on_scheduled(command_buffer: *mut NmbComman
         let context = Context(context);
         get(command_buffer)?.0.add_scheduled_handler(move |_: &CommandBuffer| {
             let context = context;
-            handler(context.0)
+            SCHEDULING.with(|flag| { let previous=flag.replace(true); handler(context.0); flag.set(previous); });
         }).map_err(e("scheduled handler"))?;
         Ok(true)
     })
@@ -2550,7 +2551,7 @@ pub extern "C" fn nmb_command_buffer_wait(command_buffer: *mut NmbCommandBuffer,
             command_buffer.wait_until_completed().map_err(e("wait"))?;
             return Ok(0);
         }
-        if COMPLETING.with(|flag| flag.get()) {
+        if COMPLETING.with(|flag| flag.get()) || SCHEDULING.with(|flag| flag.get()) {
             command_buffer.wait_until_completed().map_err(e("wait"))?;
             return Ok(0);
         }
