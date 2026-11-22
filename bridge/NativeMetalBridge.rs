@@ -152,9 +152,10 @@ pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<(Device, std::sync::Ar
             continue;
         }
         let mut options = DeviceOptions::default();
-        let registry = crate::archive::Registry::new(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
+        let runtime_cache = PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?).join(crate::archive::runtime_namespace());
+        let registry = crate::archive::Registry::new(runtime_cache.clone());
         registry.seed_driver_blobs();
-        options.pipeline_cache_dir = Some(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
+        options.pipeline_cache_dir = Some(runtime_cache);
         match Device::new(&physical, options) {
             Ok(device) => {
                 // This frontend owns the full resource-ID namespace of its device.

@@ -17,6 +17,8 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
+pub fn runtime_namespace() -> String { format!("runtime-{}", env!("NMB_RUNTIME_ID")) }
+
 const MAGIC: &[u8; 8] = b"NMBAR002";
 const MAX_BYTES: usize = 256 << 20;
 const MAX_ENTRIES: usize = 65536;
@@ -141,19 +143,19 @@ impl Registry {
             }
         }
         let system = self.system.as_ref()?;
-        if let Some(bytes) = system.read(Path::new(name), MAX_BYTES as u64) {
+        if let Some(bytes) = system.read(&PathBuf::from(runtime_namespace()).join(name), MAX_BYTES as u64) {
             return Some(bytes);
         }
         // A newer runtime stores lowerings in two generations. Content decoding still checks
         // versions, keys and checksums; this header chooses lookup paths only.
-        let state = system.read(Path::new("state"), 4096)?;
+        let state = system.read(&PathBuf::from(runtime_namespace()).join("state"), 4096)?;
         let young = u64::from_le_bytes(state.get(..8)?.try_into().ok()?);
         for generation in [young, young.saturating_sub(1)] {
             if generation == 0 {
                 continue;
             }
             if let Some(bytes) = system.read(
-                &PathBuf::from(format!("g{generation}")).join(name),
+                &PathBuf::from(runtime_namespace()).join(format!("g{generation}")).join(name),
                 MAX_BYTES as u64,
             ) {
                 return Some(bytes);
@@ -164,11 +166,11 @@ impl Registry {
     pub fn seed_driver_blobs(&self) {
         let Some(system)=&self.system else { return; };
         let mut remaining=4;
-        for entry in std::fs::read_dir(system.path()).into_iter().flatten().flatten() {
+        for entry in std::fs::read_dir(system.path().join(runtime_namespace())).into_iter().flatten().flatten() {
             let name=entry.file_name(); let Some(name)=name.to_str() else { continue; };
             let Some(digest)=name.strip_prefix("pipelines-") else { continue; };
             if digest.len()!=64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { continue; }
-            if let Some(bytes)=system.read(Path::new(name),32<<20) { let _=crate::cache_store::import_blob(&self.cache_root,name,&bytes); }
+            if let Some(bytes)=system.read(&PathBuf::from(runtime_namespace()).join(name),32<<20) { let _=crate::cache_store::import_blob(&self.cache_root,name,&bytes); }
             remaining-=1; if remaining==0 { break; }
         }
     }

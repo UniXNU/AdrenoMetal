@@ -4,7 +4,7 @@ This branch uses metal2vulkan development `4e9aad67d5af604a64725e26f3070968dd15a
 
 AdrenoMetal owns descriptor-index grants, heap and buffer placement leases, and bounded completion waits through public runtime APIs. Commands retain consumer ownership tokens through GPU retirement. Texture views retain backing leases separately from descriptor indices.
 
-Binary archives and the read-only system cache populate the upstream cache directory. Imports preserve its generation lock, byte accounting and version record. A system-cache writer publishes readable files; ordinary applications create no publication worker. Pipeline creation and cache decoding remain upstream operations.
+Binary archives and the read-only system cache populate the upstream cache directory, isolated by runtime build identity so removed translator patches cannot leave reusable artifacts. Imports preserve its generation lock, byte accounting and version record. A system-cache writer publishes readable files; ordinary applications create no publication worker. Pipeline creation and cache decoding remain upstream operations.
 
 The removed runtime patches `0066`–`0072` and local shader priming workarounds are not selected. Device-loss diagnostics use the upstream Vulkan call, result and fault report.
 
