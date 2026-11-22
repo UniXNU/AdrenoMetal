@@ -8,6 +8,9 @@
 //! host pages imported without a copy (the IOSurface path), and translation of the target's own QuartzCore library into
 //! A740 pipelines. Each step reports a marker before it starts so a hang names the step.
 
+#[path = "NativeMetalLibrary.rs"]
+pub mod library;
+
 #[path = "NativeMetalObjects.rs"]
 pub mod objects;
 #[path = "NativeMetalPurge.rs"]
@@ -80,21 +83,48 @@ const WAIT: Duration = Duration::from_secs(10);
 
 fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
     command_buffer.commit().map_err(|e| format!("commit: {e:?}"))?;
-    command_buffer.wait_until_completed_for(WAIT).map_err(|_| "no completion in 10 s".to_string())?;
+    if !command_buffer.wait_until_completed_for(WAIT).map_err(|e| format!("completion wait: {e:?}"))? {
+        return Err("no completion in 10 s".into());
+    }
     match command_buffer.status() {
         CommandBufferStatus::Completed => Ok(()),
         status => Err(format!("{status:?} {:?}", command_buffer.error())),
     }
 }
 
-fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
-    let mut options = DeviceOptions::default();
-    options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-    options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
-    Device::system_default_with(&options).map_err(|e| format!("device: {e:?}"))
+pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<Device, String> {
+    let loader = PathBuf::from(loader.to_str().map_err(|e| format!("loader path: {e}"))?);
+    // SAFETY: the frontend gives the bundled Turnip library, which exports the Vulkan
+    // instance entry points. The runtime keeps its dynamic-library handle alive.
+    let instance = unsafe {
+        metal2vulkan_runtime::Instance::with_drivers(Some(&loader), &[], &[])
+    }.map_err(|e| format!("Vulkan instance: {e:?}"))?;
+    let physicals = instance.physical_devices().map_err(|e| format!("Vulkan devices: {e:?}"))?;
+    let mut refusals = Vec::new();
+    for physical in physicals {
+        if let Err(why) = physical.check() {
+            refusals.push(format!("runtime floor: {why:?}"));
+            continue;
+        }
+        let mut options = DeviceOptions::default();
+        options.pipeline_cache_dir = Some(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
+        match Device::new(&physical, options) {
+            Ok(device) => {
+                // This frontend owns the full resource-ID namespace of its device.
+                for class in [metal2vulkan_runtime::IndexClass::Texture, metal2vulkan_runtime::IndexClass::Sampler] {
+                    let range = class.range();
+                    device.grant_indices(class, range.start, range.end - range.start)
+                        .map_err(|e| format!("resource-ID grant: {e:?}"))?;
+                }
+                return Ok(device);
+            }
+            Err(why) => refusals.push(format!("device creation: {why:?}")),
+        }
+    }
+    Err(format!("no bundled Vulkan device meets the runtime contract: {}", refusals.join("; ")))
 }
 
-fn compute(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
+fn compute(device: &Device, library: &crate::library::Library) -> Result<u32, String> {
     const COUNT: usize = 1000;
     let function = library.new_function_with_name("scale_and_offset").map_err(|e| format!("{e:?}"))?;
     let state = device
@@ -106,7 +136,7 @@ fn compute(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u
     let scale = device.new_buffer_with_bytes(&2.0f32.to_le_bytes(), ResourceOptions::shared()).map_err(|e| format!("{e:?}"))?;
     let queue = device.new_command_queue().map_err(|e| format!("{e:?}"))?;
     let command_buffer = queue.command_buffer().map_err(|e| format!("{e:?}"))?;
-    let mut encoder = command_buffer.compute_command_encoder().map_err(|e| format!("{e:?}"))?;
+    let mut encoder = command_buffer.compute_command_encoder(metal2vulkan_runtime::DispatchType::Serial).map_err(|e| format!("{e:?}"))?;
     encoder.set_compute_pipeline_state(&state).map_err(|e| format!("{e:?}"))?;
     encoder.set_buffer(Some(&input), 0, 0).map_err(|e| format!("{e:?}"))?;
     encoder.set_buffer(Some(&output), 0, 1).map_err(|e| format!("{e:?}"))?;
@@ -121,7 +151,7 @@ fn compute(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u
 }
 
 /// Draws the fixture's top-left-quarter quad into `target` (cleared blue) and returns the encoded command buffer's result.
-fn draw_quad(device: &Device, library: &metal2vulkan_runtime::Library, target: &metal2vulkan_runtime::Texture,
+fn draw_quad(device: &Device, library: &crate::library::Library, target: &metal2vulkan_runtime::Texture,
              readback: Option<(&metal2vulkan_runtime::Buffer, u64, u64)>) -> Result<(), String> {
     let vertex = library.new_function_with_name("colored_vertex").map_err(|e| format!("{e:?}"))?;
     let fragment = library.new_function_with_name("colored_fragment").map_err(|e| format!("{e:?}"))?;
@@ -173,7 +203,7 @@ fn wrong_texels(bytes: &[u8], row: usize, side: usize) -> u32 {
     bad
 }
 
-fn render(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
+fn render(device: &Device, library: &crate::library::Library) -> Result<u32, String> {
     const SIDE: u64 = 8;
     let mut texture = TextureDescriptor::texture_2d(PixelFormat::RGBA8Unorm, SIDE, SIDE, false);
     texture.usage = TextureUsage::RENDER_TARGET;
@@ -189,7 +219,7 @@ fn render(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u3
 
 /// The IOSurface path without an IOSurface: page-aligned host pages imported without a copy (the kernel pins them, Turnip maps
 /// them into the GPU), a linear render target over them, CPU caches cleaned before and invalidated after the GPU's use.
-fn import(device: &Device, library: &metal2vulkan_runtime::Library) -> Result<u32, String> {
+fn import(device: &Device, library: &crate::library::Library) -> Result<u32, String> {
     const SIDE: u64 = 64;
     const ROW: u64 = 256;
     let bytes = (ROW * SIDE) as usize;
@@ -253,7 +283,7 @@ pub fn air_slice(bytes: &[u8]) -> Option<&[u8]> {
 /// alike into render pipelines over a BGRA8 attachment. Counts only; refusals (function constants, tile functions) are expected.
 fn quartzcore(run: &mut Run, device: &Device, bytes: &[u8]) -> Result<(), String> {
     let bytes = air_slice(bytes).ok_or("QC library: no AIR64 slice")?;
-    let library = device.new_library_with_data(bytes).map_err(|e| format!("QC library: {e:?}"))?;
+    let library = crate::library::Library::from_metallib(bytes).map_err(|e| format!("QC library: {e:?}"))?;
     let names = library.function_names();
     let list = std::env::var_os("NMB_LIST").is_some();
     run.out.qc_functions = names.len() as u32;
@@ -313,8 +343,8 @@ fn selftest(run: &mut Run, loader: &CStr, cache: &CStr, qc: &[u8]) -> u32 {
         Err(why) => return run.fail(0x6501, why),
     };
     run.step(0x6502);
-    let library = match metal2vulkan::library::Library::from_air(FIXTURE_AIR) {
-        Ok(library) => device.new_library_with_compile_library(library),
+    let library = match crate::library::Library::from_air(FIXTURE_AIR) {
+        Ok(library) => library,
         Err(why) => return run.fail(0x6502, format!("{why:?}")),
     };
     run.step(0x6503);

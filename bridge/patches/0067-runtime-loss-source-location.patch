@@ -1,0 +1,141 @@
+diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-runtime/src/command.rs
+index da0cf8d2..55a80b97 100644
+--- a/crates/metal2vulkan-runtime/src/command.rs
++++ b/crates/metal2vulkan-runtime/src/command.rs
+@@ -104,6 +104,30 @@ pub enum CommandBufferError {
+     NotRun,
+ }
+ 
++/// Source location where a failing Vulkan operation was observed.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct LossLocation {
++    /// Runtime or consumer source file.
++    pub file: &'static str,
++    /// One-based line number.
++    pub line: u32,
++    /// One-based column number.
++    pub column: u32,
++}
++
++impl LossLocation {
++    /// Captures the caller without collecting or allocating a stack trace.
++    #[track_caller]
++    pub fn caller() -> Self {
++        let at = std::panic::Location::caller();
++        Self {
++            file: at.file(),
++            line: at.line(),
++            column: at.column(),
++        }
++    }
++}
++
+ /// The cause of a device's first loss ([`Device::loss`]): the Vulkan call that failed and what it
+ /// returned.
+ ///
+@@ -126,6 +150,8 @@ pub enum CommandBufferError {
+ pub struct DeviceLoss {
+     /// The Vulkan command, such as `vkQueueSubmit2`.
+     pub call: &'static str,
++    /// Source of the first failure, kept with this loss through later command failures.
++    pub source: Option<LossLocation>,
+     /// What it returned.
+     pub result: vk::Result,
+     /// The device's fault report (`vkGetDeviceFaultInfoEXT`), which the runtime reads once, at
+@@ -139,9 +165,12 @@ pub struct DeviceLoss {
+ 
+ impl DeviceLoss {
+     /// The loss a failed Vulkan `call` names, for `map_err`.
++    #[track_caller]
+     pub(crate) fn of(call: &'static str) -> impl FnOnce(vk::Result) -> DeviceLoss {
++        let source = Some(LossLocation::caller());
+         move |result| DeviceLoss {
+             call,
++            source,
+             result,
+             fault: None,
+         }
+@@ -1759,3 +1788,22 @@ impl Drop for CbInner {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod loss_location_tests {
++    use super::DeviceLoss;
++    use ash::vk;
++
++    #[test]
++    fn the_failure_mapper_keeps_its_creation_site() {
++        let line = line!() + 1;
++        let failure = DeviceLoss::of("vkQueueSubmit2");
++        let loss = failure(vk::Result::ERROR_DEVICE_LOST);
++        let at = loss.source.expect("failure source");
++        assert_eq!(at.file, file!());
++        assert_eq!(at.line, line);
++        assert_eq!(loss.call, "vkQueueSubmit2");
++        assert_eq!(loss.result, vk::Result::ERROR_DEVICE_LOST);
++        assert_eq!(loss.clone().source, Some(at));
++    }
++}
+diff --git a/crates/metal2vulkan-runtime/src/lib.rs b/crates/metal2vulkan-runtime/src/lib.rs
+index d61ce001..3cd44a47 100644
+--- a/crates/metal2vulkan-runtime/src/lib.rs
++++ b/crates/metal2vulkan-runtime/src/lib.rs
+@@ -71,7 +71,9 @@ pub use arrays::{IndexClass, IndexGrant, ResourceId};
+ pub use blit::{BlitCommandEncoder, BlitOption, BufferLayout, TexturePlace};
+ pub use block::Block;
+ pub use buffer::{Buffer, MAX_BUFFER_LENGTH};
+-pub use command::{CommandBuffer, CommandBufferError, CommandBufferStatus, DeviceLoss};
++pub use command::{
++    CommandBuffer, CommandBufferError, CommandBufferStatus, DeviceLoss, LossLocation,
++};
+ pub use counters::{Counters, Gauges, Metrics, SiteAllocations, Timed, VariantMake, VariantStart};
+ #[cfg(windows)]
+ pub use d3d11::D3d11Plane;
+diff --git a/crates/metal2vulkan-runtime/src/tests/command.rs b/crates/metal2vulkan-runtime/src/tests/command.rs
+index ab16883c..95ebb49a 100644
+--- a/crates/metal2vulkan-runtime/src/tests/command.rs
++++ b/crates/metal2vulkan-runtime/src/tests/command.rs
+@@ -3926,11 +3926,13 @@ pub(crate) mod on_device {
+     #[test]
+     fn every_device_ends_its_work_at_a_reported_loss_and_a_new_device_opens() {
+         let first = DeviceLoss {
++            source: None,
+             call: "vkQueuePresentKHR",
+             result: vk::Result::ERROR_DEVICE_LOST,
+             fault: None,
+         };
+         let second = DeviceLoss {
++            source: None,
+             call: "vkAcquireNextImageKHR",
+             result: vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+             fault: None,
+@@ -4024,6 +4026,7 @@ pub(crate) mod on_device {
+     #[test]
+     fn every_device_takes_a_reported_loss_as_given_whatever_its_result() {
+         let report = DeviceLoss {
++            source: None,
+             call: "vkQueuePresentKHR",
+             result: vk::Result::SUCCESS,
+             fault: None,
+diff --git a/crates/metal2vulkan-runtime/src/tests/import.rs b/crates/metal2vulkan-runtime/src/tests/import.rs
+index f9f4f896..7a41341d 100644
+--- a/crates/metal2vulkan-runtime/src/tests/import.rs
++++ b/crates/metal2vulkan-runtime/src/tests/import.rs
+@@ -213,6 +213,7 @@ pub(crate) mod on_device {
+     #[test]
+     fn every_device_runs_a_waiting_release_after_a_loss() {
+         let loss = DeviceLoss {
++            source: None,
+             call: "vkQueuePresentKHR",
+             result: vk::Result::ERROR_DEVICE_LOST,
+             fault: None,
+@@ -281,6 +282,7 @@ pub(crate) mod on_device {
+     #[test]
+     fn every_device_runs_a_release_waiting_on_other_work_after_a_loss() {
+         let loss = DeviceLoss {
++            source: None,
+             call: "vkQueuePresentKHR",
+             result: vk::Result::ERROR_DEVICE_LOST,
+             fault: None,

@@ -19,17 +19,18 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BinaryArchive, BinaryArchiveDescriptor, BlitCommandEncoder, FamilyRow, FeatureRow, GpuFamily, RowState, BlitOption, Buffer, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, DeviceOptions, MessageSeverity, MessageSink, Event, EventRef, Fence, Function, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, Library, LoadAction,
+    ComputePipelineState, Deallocator, DebugMessage, DepthStencilState, Device, MessageSeverity, MessageSink, Event, Fence, Heap, HeapDescriptor, HeapType, HostMemory, IoSurfacePlane, IoSurfaceYCbCr, LoadAction,
     Origin, PipelineOption, PipelineOptions, PurgeableState, PrivateCount, PrivateFlag, PrivateProperties, MAX_COLOR_ATTACHMENTS, Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState, ResourceOptions,
-    SamplerState, ScissorRect, SharedEvent, SharedEventListener, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
+    SamplerState, ScissorRect, SharedEvent, Size, StoreAction, Texture, TextureDescriptor, Viewport, VisibilityResultMode,
 };
 use crate::purge::{Cause, Purge, Resource};
+use crate::library::{Function, Library};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void, CStr};
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::time::Duration;
-use metal2vulkan_runtime::{CommandBufferError, FailureOrigin, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter};
+use metal2vulkan_runtime::{CommandBufferError, MultisampleDepthResolveFilter, MultisampleStencilResolveFilter};
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -67,7 +68,6 @@ mod loss_description_tests {
 }
 
 pub(crate) fn set_error(why: String) {
-    let why = loss_description(why, Device::lost_at());
     LAST.with(|last| {
         let mut last = last.borrow_mut();
         last.clear();
@@ -285,41 +285,9 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         }
         // SAFETY: the caller's contract.
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
-        let mut options = DeviceOptions::default();
-        options.loader = Some(PathBuf::from(loader.to_string_lossy().into_owned()));
-        options.shader_cache = metal2vulkan_runtime::ShaderCacheOptions::in_directory(cache.to_string_lossy().into_owned());
-        options.messages = Some(MessageSink::new(observe_message));
-        // Render imported surfaces and padded buffers directly under the board policy.
-        options.policy.host_page_textures = metal2vulkan::device::HostPageTexturePolicy::InPlaceWrites;
-        options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
-        // Render encoder calls are checked at the call and lowered on the device's lowering thread, so the program's thread does not
-        // pay for them (the render server's main thread spent most of the plugin's CPU time lowering). A refusal only the lowering
-        // finds fails the command buffer, naming the call. `metal-flow=` without bit 1 keeps the lowering at the call.
-        if flow_bits() & 1 != 0 {
-            options.policy.render_lowering = metal2vulkan::device::RenderLoweringPolicy::Worker;
-        }
-        let records = (flow_bits() & 4 != 0).then(|| PipelineRecords::open(cache.to_string_lossy().as_ref())).flatten();
-        if let Some(records) = records.clone() {
-            options.pipeline_records = Some(std::sync::Arc::new(move |record| records.keep(&record)));
-        }
-        // Every texture given a shadow image is announced with why no image aliases its bytes (`shadow.log`).
-        options.announce_each.insert(metal2vulkan_runtime::Degradation::ShadowedTexture);
-        let _ = SHADOW_LOG.set(PathBuf::from(cache.to_string_lossy().into_owned()).join("shadow.log"));
         open_runtime_diagnostics(cache.to_string_lossy().as_ref());
-        let device = Device::system_default_with(&options).map_err(e("device"))?;
-        if std::env::var("NATIVE_METAL_TILING_CHECK").as_deref() == Ok("1") {
-            let settled = device.settle_tiling_cost_check(std::time::Duration::from_secs(3));
-            eprintln!("native-metal tiling-check settled={settled}: {}", device.tiling_cost_check_report());
-        }
+        let device = crate::open(loader, cache)?;
         write_runtime_policy(&device);
-        // No caller moves or detaches the pages of a no-copy buffer (the frontend has no rebind or detach): the encoders log no calls
-        // to encode again and hold no surface's buffer per command, which every frame of the render server paid for.
-        device.refuse_rebinds();
-        // What this program made in earlier processes is made again in the background, below every other making. The shader cache's own
-        // capacity bounds the data, so the pass takes no budget of its own.
-        if let Some(records) = records {
-            device.warm(records.take_earlier(), u64::MAX);
-        }
         let purge = Purge::new(&device);
         Ok(boxed(NmbDevice(device, std::sync::OnceLock::new(), std::sync::Mutex::default(), purge)))
     })
@@ -381,18 +349,16 @@ fn open_runtime_diagnostics(cache: &str) {
 fn diagnostic_stamp() -> String {
     let boot = std::env::var("NATIVE_METAL_BOOT_SESSION").unwrap_or_else(|_| "unknown".into());
     let build = option_env!("NMB_COMPONENT_ID").unwrap_or("host-working-tree");
-    let uptime = metal2vulkan_runtime::stage_trace::now_nanos() / 1000;
+    let uptime = metal2vulkan_runtime::host_time() / 1000;
     let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros());
     format!("boot={boot} build={build} runtime={} uptime_us={uptime} time_us={time}", env!("NMB_RUNTIME_ID"))
 }
 
 fn write_runtime_policy(device: &Device) {
     let Some(path) = POLICY_LOG.get() else { return; };
-    let profile = device.compile_device();
-    let text = format!("{}\npolicy={:#?}\nsubmit={}\nqueue-switch={}\nin-place={:#?}\ntiling-cost={}\nprofile={:#?}\n",
-        diagnostic_stamp(), profile.policy(), device.submit_check_report(),
-        device.queue_switch_check_report(), device.in_place_check_report(),
-        device.tiling_cost_check_report(), profile.profile());
+    let text = format!("{}\nunified={}\nextensions={:#?}\nmemory_types={:#?}\nprofile={:#?}\n",
+        diagnostic_stamp(), device.has_unified_memory(), device.extensions(),
+        device.memory_types(), device.translator().profile());
     let text: String = text.chars().take(64 * 1024).collect();
     let _ = std::fs::write(path, text);
 }
@@ -604,6 +570,76 @@ pub extern "C" fn nmb_device_pass_counts(device: *const NmbDevice, out: *mut u64
         out.copy_from_slice(&[w.render_passes_begun_instances, w.inline_passes_split, w.instance_splits_barrier,
                               w.instance_splits_tile_memory, w.instance_splits_memoryless_write, w.instance_splits_pending_pipeline,
                               w.stand_ins_made, w.stand_in_bytes, w.stand_in_copies_made, w.stand_in_copies_made_at_draws]);
+        Ok(true)
+    })
+}
+
+/// Runtime v2 memory counters. Fields overlap; each counter is sampled independently.
+#[repr(C)]
+pub struct NmbRuntimeMemory {
+    pub version: u64,
+    pub sample_ns: u64,
+    pub shared_allocation_bytes: u64,
+    pub private_allocation_bytes: u64,
+    pub shared_placed_bytes: u64,
+    pub private_placed_bytes: u64,
+    pub shared_idle_bytes: u64,
+    pub private_idle_bytes: u64,
+    pub shared_reserve_bytes: u64,
+    pub private_reserve_bytes: u64,
+    pub shared_idle_age_ns: u64,
+    pub private_idle_age_ns: u64,
+    pub import_bytes: u64,
+    pub export_bytes: u64,
+    pub surface_import_bytes: u64,
+    pub imports: u64,
+    pub command_buffers: u64,
+    pub releases_waiting: u64,
+    pub allocations_freed: u64,
+    pub texture_block_bytes: u64,
+    pub texture_block_held_bytes: u64,
+    pub shared_buffer_bytes: u64,
+    pub private_buffer_bytes: u64,
+}
+
+/// # Safety
+/// `out` points to one writable `NmbRuntimeMemory`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nmb_device_runtime_memory(device: *const NmbDevice, out: *mut NmbRuntimeMemory) -> bool {
+    guard(false, || {
+        if std::env::var("SHENG_DIAG").as_deref() != Ok("1") {
+            return Ok(false);
+        }
+        // SAFETY: the caller supplies one writable record.
+        let out = unsafe { out.as_mut() }.ok_or("null memory snapshot")?;
+        let counters = get(device)?.0.counters();
+        let g = counters.gauges();
+        let m = counters.metrics();
+        *out = NmbRuntimeMemory {
+            version: 2,
+            sample_ns: metal2vulkan_runtime::host_time(),
+            shared_allocation_bytes: g.shared_allocation_bytes,
+            private_allocation_bytes: g.private_allocation_bytes,
+            shared_placed_bytes: g.shared_placed_bytes,
+            private_placed_bytes: g.private_placed_bytes,
+            shared_idle_bytes: g.shared_idle_bytes,
+            private_idle_bytes: g.private_idle_bytes,
+            shared_reserve_bytes: g.shared_reserve_bytes,
+            private_reserve_bytes: g.private_reserve_bytes,
+            shared_idle_age_ns: g.shared_idle_age_nanos,
+            private_idle_age_ns: g.private_idle_age_nanos,
+            import_bytes: g.import_bytes,
+            export_bytes: g.export_bytes,
+            surface_import_bytes: g.surface_import_bytes,
+            imports: g.imports,
+            command_buffers: g.command_buffers,
+            releases_waiting: g.releases_waiting,
+            allocations_freed: m.allocations_freed,
+            texture_block_bytes: g.texture_block_bytes,
+            texture_block_held_bytes: g.texture_block_held_bytes,
+            shared_buffer_bytes: g.shared_buffer_bytes,
+            private_buffer_bytes: g.private_buffer_bytes,
+        };
         Ok(true)
     })
 }
@@ -1835,16 +1871,16 @@ pub struct NmbFunction(Function);
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_library_new(device: *mut NmbDevice, bytes: *const c_void, length: usize, air: bool) -> *mut NmbLibrary {
     guard(std::ptr::null_mut(), || {
-        let device = &get(device)?.0;
+        get(device)?;
         if bytes.is_null() || length == 0 {
             return Err("no library bytes".into());
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) };
         let library = if air {
-            device.new_library_with_compile_library(metal2vulkan::library::Library::from_air(bytes).map_err(e("AIR"))?)
+            Library::from_air(bytes).map_err(e("AIR"))?
         } else {
-            device.new_library_with_data(crate::air_slice(bytes).ok_or("metallib without an AIR64 slice")?).map_err(e("metallib"))?
+            Library::from_metallib(crate::air_slice(bytes).ok_or("metallib without an AIR64 slice")?).map_err(e("metallib"))?
         };
         let names = library.function_names();
         Ok(boxed(NmbLibrary(library, names)))
@@ -2808,11 +2844,12 @@ pub extern "C" fn nmb_depth_stencil_release(state: *mut NmbDepthStencil) {
 // ---- queues and command buffers ----
 
 pub struct NmbQueue(CommandQueue);
-pub struct NmbCommandBuffer(CommandBuffer);
+pub struct NmbCommandBuffer(CommandBuffer, Device, u64);
+static COMMAND_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_queue_new(device: *mut NmbDevice) -> *mut NmbQueue {
-    guard(std::ptr::null_mut(), || Ok(boxed(NmbQueue(get(device)?.0.new_command_queue().map_err(e("queue"))?))))
+    guard(std::ptr::null_mut(), || Ok(boxed(NmbQueue(get(device)?.0.new_command_queue(64).map_err(e("queue"))?))))
 }
 
 #[unsafe(no_mangle)]
@@ -2822,7 +2859,11 @@ pub extern "C" fn nmb_queue_release(queue: *mut NmbQueue) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_new(queue: *mut NmbQueue) -> *mut NmbCommandBuffer {
-    guard(std::ptr::null_mut(), || Ok(boxed(NmbCommandBuffer(get(queue)?.0.command_buffer().map_err(e("command buffer"))?))))
+    guard(std::ptr::null_mut(), || {
+        let queue = &get(queue)?.0;
+        Ok(boxed(NmbCommandBuffer(queue.command_buffer().map_err(e("command buffer"))?, queue.device().clone(),
+            COMMAND_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -2891,13 +2932,8 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
     let began = TIMING_LOG.get().map(|_| std::time::Instant::now());
     let result = guard(false, || {
-        // The committing thread submits where no other pass is under way, with no wake of the scheduler thread between commit and GPU.
-        let command_buffer = &get(command_buffer)?.0;
-        if flow_bits() & 2 != 0 {
-            command_buffer.commit_and_submit().map_err(e("commit"))?;
-        } else {
-            command_buffer.commit().map_err(e("commit"))?;
-        }
+        // The rewritten runtime owns submission ordering for every device.
+        get(command_buffer)?.0.commit().map_err(e("commit"))?;
         Ok(true)
     });
     if let Some(began) = began {
@@ -2917,30 +2953,44 @@ pub extern "C" fn nmb_command_buffer_wait(command_buffer: *mut NmbCommandBuffer,
             command_buffer.wait_until_completed().map_err(e("wait"))?;
             return Ok(0);
         }
-        Ok(if command_buffer.wait_until_completed_for(Duration::from_millis(timeout_ms)).is_ok() { 0 } else { 1 })
+        Ok(if command_buffer.wait_until_completed_for(Duration::from_millis(timeout_ms)).map_err(e("wait"))? { 0 } else { 1 })
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_status(command_buffer: *const NmbCommandBuffer) -> u64 {
     guard(5, || {
-        Ok(get(command_buffer)?.0.status().raw())
+        use metal2vulkan_runtime::CommandBufferStatus;
+        Ok(match get(command_buffer)?.0.status() {
+            CommandBufferStatus::NotEnqueued => 0,
+            CommandBufferStatus::Enqueued => 1,
+            CommandBufferStatus::Committed => 2,
+            CommandBufferStatus::Scheduled => 3,
+            CommandBufferStatus::Completed => 4,
+            CommandBufferStatus::Error => 5,
+        })
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuffer, out: *mut c_char, size: usize) -> usize {
     guard(0, || {
-        let cb = &get(command_buffer)?.0;
-        let description = cb.error_description().or_else(|| cb.error().map(|error| format!("{error:?}")));
-        Ok(description.map_or(0, |text| copy_out(&loss_description(text, Device::lost_at()), out, size)))
+        let cb = get(command_buffer)?;
+        let loss = cb.1.loss();
+        let description = cb.0.error().map(|error| format!("{error:?}; first device loss={loss:?}"));
+        let origin = loss.as_ref().and_then(|loss| loss.source.as_ref()).map(|at| (at.file, at.line));
+        Ok(description.map_or(0, |text| copy_out(&loss_description(text, origin), out, size)))
     })
 }
 
-// Preserve the runtime's distinction between Metal failures and translation refusals.
-// In particular, DeviceLost must reach clients as MTLCommandBufferErrorDeviceRemoved.
+// A device loss invalidates every command queue, including its recovery victims.
 fn metal_command_buffer_error_code(error: Option<CommandBufferError>) -> u64 {
-    error.filter(|error| error.origin() == FailureOrigin::Metal).map_or(0, |error| error.metal_code())
+    match error {
+        Some(CommandBufferError::DeviceLost { .. }) => 11,
+        Some(CommandBufferError::NotRun) => 1,
+        Some(_) => 1,
+        None => 0,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2953,11 +3003,10 @@ mod command_buffer_error_tests {
     use super::*;
 
     #[test]
-    fn metal_errors_keep_their_codes_and_runtime_refusals_keep_their_domain() {
-        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::DeviceLost)), 11);
-        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::PageFault)), 3);
-        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::OutOfMemory)), 8);
-        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::Refused)), 0);
+    fn device_loss_and_abandoned_work_keep_distinct_codes() {
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::DeviceLost { in_flight: true })), 11);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::DeviceLost { in_flight: false })), 11);
+        assert_eq!(metal_command_buffer_error_code(Some(CommandBufferError::NotRun)), 1);
         assert_eq!(metal_command_buffer_error_code(None), 0);
     }
 }
@@ -2967,7 +3016,7 @@ pub extern "C" fn nmb_command_buffer_gpu_time(command_buffer: *const NmbCommandB
     guard(0.0, || {
         let command_buffer = &get(command_buffer)?.0;
         let time = if end { command_buffer.gpu_end_time() } else { command_buffer.gpu_start_time() };
-        time.map_err(e("GPU time"))
+        Ok(time as f64 / 1_000_000_000.0)
     })
 }
 
@@ -2980,10 +3029,10 @@ pub enum NmbEvent {
 pub struct NmbFence(Fence);
 
 impl NmbEvent {
-    fn as_ref(&self) -> EventRef<'_> {
+    fn as_ref(&self) -> &Event {
         match self {
-            NmbEvent::Event(e) => EventRef::Event(e),
-            NmbEvent::Shared(s) => EventRef::Shared(s),
+            NmbEvent::Event(e) => e,
+            NmbEvent::Shared(s) => s.as_event(),
         }
     }
 }
@@ -2993,13 +3042,6 @@ fn shared<'a>(event: *const NmbEvent) -> Result<&'a SharedEvent, String> {
         NmbEvent::Shared(s) => Ok(s),
         NmbEvent::Event(_) => Err("not a shared event".into()),
     }
-}
-
-/// One listener thread for every notification of this process (Metal's listener only names the queue a block runs on; the frontend
-/// forwards to it).
-fn listener() -> Result<&'static SharedEventListener, String> {
-    static LISTENER: std::sync::OnceLock<Result<SharedEventListener, String>> = std::sync::OnceLock::new();
-    LISTENER.get_or_init(|| Ok(SharedEventListener::new())).as_ref().map_err(|why: &String| why.clone())
 }
 
 #[unsafe(no_mangle)]
@@ -3034,7 +3076,7 @@ pub extern "C" fn nmb_shared_event_set_value(event: *mut NmbEvent, value: u64) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_shared_event_wait(event: *mut NmbEvent, value: u64, timeout_ms: u64) -> bool {
-    guard(false, || Ok(shared(event)?.wait_until_signaled_value(value, Duration::from_millis(timeout_ms))))
+    guard(false, || shared(event)?.wait_until_signaled_value(value, Duration::from_millis(timeout_ms)).map_err(e("shared event wait")))
 }
 
 #[unsafe(no_mangle)]
@@ -3043,10 +3085,12 @@ pub extern "C" fn nmb_shared_event_notify(event: *mut NmbEvent, value: u64, hand
     guard(false, || {
         let handler = handler.ok_or("null handler")?;
         let context = Context(context);
-        shared(event)?.notify_listener(listener()?, value, Box::new(move |_, reached| {
+        // The runtime completion thread detects the value; the frontend dispatches
+        // the notification to the caller's Metal listener queue.
+        shared(event)?.notify_listener(value, move |reached| {
             let context = context;
             handler(context.0, reached)
-        }));
+        }).map_err(e("shared event notification"))?;
         Ok(true)
     })
 }
@@ -3084,7 +3128,10 @@ pub extern "C" fn nmb_encoder_update_fence(encoder: *mut NmbEncoder, fence: *mut
         match get_mut(encoder)? {
             NmbEncoder::Compute(c) => c.update_fence(fence),
             NmbEncoder::Blit(b) => b.update_fence(fence),
-            NmbEncoder::Render(r) => r.update_fence(fence, raw::<RenderStages>(stages, "render stages")?),
+            NmbEncoder::Render(r) => {
+                raw::<RenderStages>(stages, "render stages")?;
+                r.update_fence(fence)
+            },
         }
         .map_err(e("update fence"))?;
         Ok(true)
@@ -3098,7 +3145,10 @@ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut N
         match get_mut(encoder)? {
             NmbEncoder::Compute(c) => c.wait_for_fence(fence),
             NmbEncoder::Blit(b) => b.wait_for_fence(fence),
-            NmbEncoder::Render(r) => r.wait_for_fence(fence, raw::<RenderStages>(stages, "render stages")?),
+            NmbEncoder::Render(r) => {
+                raw::<RenderStages>(stages, "render stages")?;
+                r.wait_for_fence(fence)
+            },
         }
         .map_err(e("wait for fence"))?;
         Ok(true)
@@ -3116,7 +3166,7 @@ pub enum NmbEncoder {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_compute_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
     guard(std::ptr::null_mut(), || {
-        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder().map_err(e("compute encoder"))?)))
+        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder(metal2vulkan_runtime::DispatchType::Serial).map_err(e("compute encoder"))?)))
     })
 }
 
@@ -3781,14 +3831,15 @@ pub unsafe extern "C" fn nmb_function_set_specialized_name(function: *mut NmbFun
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_queue_new_with_max_command_buffer_count(device: *mut NmbDevice, count: usize) -> *mut NmbQueue {
     guard(std::ptr::null_mut(), || {
-        let queue = get(device)?.0.new_command_queue_with_max_command_buffer_count(count).map_err(e("command queue"))?;
+        let count = u32::try_from(count).map_err(e("command queue limit"))?;
+        let queue = get(device)?.0.new_command_queue(count).map_err(e("command queue"))?;
         Ok(Box::into_raw(Box::new(NmbQueue(queue))))
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_diagnostic_id(buffer: *const NmbCommandBuffer) -> u64 {
-    guard(0, || Ok(get(buffer)?.0.diagnostic_id()))
+    guard(0, || Ok(get(buffer)?.2))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_gpu_diagnostic_hook(hook: extern "C" fn(u32,u64,u64,u64)) {

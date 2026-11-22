@@ -76,6 +76,34 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+// Runtime v2: overlapping counters, sampled independently; available only with SHENG_DIAG=1.
+typedef struct NmbRuntimeMemory {
+ uint64_t version;
+ uint64_t sample_ns;
+ uint64_t shared_allocation_bytes;
+ uint64_t private_allocation_bytes;
+ uint64_t shared_placed_bytes;
+ uint64_t private_placed_bytes;
+ uint64_t shared_idle_bytes;
+ uint64_t private_idle_bytes;
+ uint64_t shared_reserve_bytes;
+ uint64_t private_reserve_bytes;
+ uint64_t shared_idle_age_ns;
+ uint64_t private_idle_age_ns;
+ uint64_t import_bytes;
+ uint64_t export_bytes;
+ uint64_t surface_import_bytes;
+ uint64_t imports;
+ uint64_t command_buffers;
+ uint64_t releases_waiting;
+ uint64_t allocations_freed;
+ uint64_t texture_block_bytes;
+ uint64_t texture_block_held_bytes;
+ uint64_t shared_buffer_bytes;
+ uint64_t private_buffer_bytes;
+} NmbRuntimeMemory;
+bool nmb_device_runtime_memory(const NmbDevice *, NmbRuntimeMemory *out);
+
 // Live blocks of the runtime's own device memory: seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
 // larger) of pooled blocks with a placement [0], pooled blocks kept empty [7], spare image blocks [14], dedicated blocks of an image
 // [21] and of a buffer [28]; bytes of the spare blocks [35] and of the dedicated blocks of images [36] and buffers [37]; lazily

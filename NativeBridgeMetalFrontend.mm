@@ -5560,6 +5560,21 @@ extern "C" size_t native_bridge_metal_telemetry(char *out,size_t size) {
   sideStats=(void (*)(uint64_t *))dlsym(turnip,"tu_gmem_side_stats");
  }
  // ---- where this process's GPU memory is ----
+ if(diagOn() && gDevice) {
+  NmbRuntimeMemory m={};
+  if(nmb_device_runtime_memory(gDevice,&m) && m.version==2) {
+   row("MEM2 sample_ns=%llu shared=%llu private=%llu placed=%llu/%llu idle=%llu/%llu reserve=%llu/%llu",
+    (ull)m.sample_ns,(ull)m.shared_allocation_bytes,(ull)m.private_allocation_bytes,
+    (ull)m.shared_placed_bytes,(ull)m.private_placed_bytes,(ull)m.shared_idle_bytes,(ull)m.private_idle_bytes,
+    (ull)m.shared_reserve_bytes,(ull)m.private_reserve_bytes);
+   row("MEM2 imports=%llu bytes=%llu exports=%llu surface=%llu pending_cb=%llu releases_waiting=%llu freed_allocations=%llu",
+    (ull)m.imports,(ull)m.import_bytes,(ull)m.export_bytes,(ull)m.surface_import_bytes,
+    (ull)m.command_buffers,(ull)m.releases_waiting,(ull)m.allocations_freed);
+   row("MEM2 idle_age_ns=%llu/%llu texture_blocks=%llu/%llu buffer_bytes=%llu/%llu",
+    (ull)m.shared_idle_age_ns,(ull)m.private_idle_age_ns,(ull)m.texture_block_bytes,(ull)m.texture_block_held_bytes,
+    (ull)m.shared_buffer_bytes,(ull)m.private_buffer_bytes);
+  }
+ }
  if(gDevice) {
   // MiB: the runtime's pooled blocks (placed in them), empty kept blocks and spares, dedicated blocks, host imports, allocated so
   // far; live pooled and dedicated block counts; GPU pool blocks made and released; then Turnip's cache of freed BOs now and at

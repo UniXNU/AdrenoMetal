@@ -1,0 +1,73 @@
+--- a/crates/metal2vulkan-runtime/src/command.rs
++++ b/crates/metal2vulkan-runtime/src/command.rs
+@@ -803,6 +803,36 @@
+         Ok(())
+     }
+ 
++    /// A bounded host wait for completion and all completed handlers.
++    ///
++    /// `Ok(false)` is a timeout and does not cancel, retire or release any work.
++    /// Refused on the same runtime threads as `wait_until_completed`.
++    pub fn wait_until_completed_for(&self, timeout: std::time::Duration) -> Result<bool, Error> {
++        not_in_scheduled_handler()?;
++        if self.on_completion_thread() {
++            return match self.status() {
++                CommandBufferStatus::Completed | CommandBufferStatus::Error => Ok(true),
++                _ => Err(Error::Refused(Refusal::WaitOnOwnThread)),
++            };
++        }
++        self.send();
++        let began = std::time::Instant::now();
++        let mut state = self.state();
++        while !state.finished {
++            let left = timeout.saturating_sub(began.elapsed());
++            if left.is_zero() {
++                return Ok(false);
++            }
++            let (next, _) = self
++                .inner
++                .changed
++                .wait_timeout(state, left)
++                .unwrap_or_else(PoisonError::into_inner);
++            state = next;
++        }
++        Ok(true)
++    }
++
+     /// Whether this thread is the completion thread of the command buffer's device.
+     fn on_completion_thread(&self) -> bool {
+         (self.inner.queue.core()).is_some_and(|core| crate::device::on_completion_thread(&core))
+--- a/crates/metal2vulkan-runtime/src/tests/command.rs
++++ b/crates/metal2vulkan-runtime/src/tests/command.rs
+@@ -3918,6 +3918,31 @@
+         });
+     }
+ 
++    #[test]
++    fn every_device_bounded_wait_leaves_uncommitted_work_live() {
++        each_device("bounded_wait", |name, _, device| {
++            let queue = queue(&device);
++            let cb = queue.command_buffer().expect("a command buffer");
++            assert!(
++                !cb.wait_until_completed_for(std::time::Duration::ZERO)
++                    .expect("a bounded wait"),
++                "{name}: not committed"
++            );
++            assert_eq!(cb.status(), CommandBufferStatus::NotEnqueued);
++            cb.commit().expect("commit after timeout");
++            assert!(
++                cb.wait_until_completed_for(std::time::Duration::from_secs(30))
++                    .expect("completion wait"),
++                "{name}: completed after commit"
++            );
++            assert!(
++                cb.wait_until_completed_for(std::time::Duration::ZERO)
++                    .expect("completed wait"),
++                "{name}: stays completed"
++            );
++        });
++    }
++
+     /// At a loss the consumer reports, its own `vkQueuePresentKHR`'s (`Device::report_loss`): a
+     /// host wait for a pending signal ends false; the command buffer in flight ends DeviceLost in
+     /// flight, the held one and every later commit DeviceLost not in flight; the device names the
