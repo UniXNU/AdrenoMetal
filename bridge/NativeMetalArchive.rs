@@ -61,6 +61,7 @@ pub struct Registry {
     indices: [Arc<crate::ownership::IndexPool>; 2],
     cache_root: PathBuf,
     shared_writer: bool,
+    warmed: Mutex<BTreeSet<(u8, Hash256)>>,
     system: Option<Arc<crate::system_cache::SystemLayer>>,
 }
 fn devices() -> &'static Mutex<BTreeMap<usize, Weak<Registry>>> {
@@ -91,6 +92,7 @@ impl Registry {
             shared_writer: crate::system_cache::cache_readable_by_all(),
             buffers: crate::buffer_arena::BufferArena::default(),
             archives: Mutex::default(),
+            warmed: Mutex::default(),
             indices: [crate::ownership::IndexPool::new(rt::IndexClass::Texture), crate::ownership::IndexPool::new(rt::IndexClass::Sampler)],
             system: crate::system_cache::system_layer(),
         });
@@ -179,8 +181,14 @@ impl Registry {
         let _ = crate::cache_store::import(&self.cache_root, name, &bytes);
         Some(bytes)
     }
+    fn first_lookup(&self, kind: u8, key: Hash256) -> bool {
+        let mut warmed=self.warmed.lock().unwrap_or_else(|e| e.into_inner());
+        if warmed.len()==MAX_ENTRIES { warmed.clear(); }
+        warmed.insert((kind,key))
+    }
     pub fn prepare_compute(&self, device: &rt::Device, descriptor: &ComputePipelineDescriptor) {
         if self.system.is_none() && self.archives.lock().unwrap_or_else(|e| e.into_inner()).is_empty() { return; }
+        if !self.first_lookup(0, *device.translator().compute_pipeline_key(descriptor).digest()) { return; }
         let StageSource::Function(function) = &descriptor.kernel else { return; };
         let translator=device.translator();
         let Ok(plain)=translator.kernel_inputs_read(function,&descriptor.lowering_inputs(),&Budget::standard(),&StageEntries::new()) else { return; };
@@ -190,6 +198,7 @@ impl Registry {
     }
     pub fn prepare_render(&self, device: &rt::Device, descriptor: &RenderPipelineDescriptor) {
         if self.system.is_none() && self.archives.lock().unwrap_or_else(|e| e.into_inner()).is_empty() { return; }
+        if !self.first_lookup(1, *device.translator().queried_render_descriptor_key(descriptor).digest()) { return; }
         let translator=device.translator();
         let record=format!("renders/{}",hex(translator.queried_render_descriptor_key(descriptor).digest()));
         if let Some(bytes)=self.seed(&record) {
@@ -215,6 +224,7 @@ impl Registry {
                 directories.push(entry.path().join("renders"));
             }
         }
+        seen.retain(|path, _| directories.contains(path));
         for directory in directories {
             let Ok(metadata)=std::fs::symlink_metadata(&directory) else { continue; };
             if !metadata.is_dir() { continue; }
@@ -698,5 +708,17 @@ fn publish_permissions(root: &Path, path: &Path) -> Result<(), String> {
 impl Drop for Registry {
     fn drop(&mut self) {
         if self.shared_writer { self.publish_changed(&mut BTreeMap::new()); }
+    }
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::*;
+    #[test]
+    fn cache_warmup_runs_once_per_pipeline_descriptor() {
+        let registry=Registry::new(PathBuf::from("unused-regression-cache"));
+        assert!(registry.first_lookup(0,[7;32]));
+        assert!(!registry.first_lookup(0,[7;32]));
+        assert!(registry.first_lookup(1,[7;32]));
     }
 }
