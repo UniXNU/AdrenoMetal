@@ -9,6 +9,11 @@ This integration branch uses the rewritten runtime v2. Hardware qualification of
 an earlier runtime does not qualify this version. Device creation checks the
 upstream Vulkan floor and reports every missing requirement.
 
+The native display driver presents completed images. The bridge creates the
+runtime instance without Vulkan presentation, so surface and swapchain
+extensions are omitted while all rendering and memory requirements remain.
+Device-open failures are written to DEBUG stderr and the bounded timing log.
+
 ## Build checks
 
 From the resolved UniXNU tree:

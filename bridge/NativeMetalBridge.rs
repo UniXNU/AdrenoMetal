@@ -127,9 +127,10 @@ fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
 pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<(Device, std::sync::Arc<crate::archive::Registry>), String> {
     let loader = PathBuf::from(loader.to_str().map_err(|e| format!("loader path: {e}"))?);
     // SAFETY: the frontend gives the bundled Turnip library, which exports the Vulkan
-    // instance entry points. The runtime keeps its dynamic-library handle alive.
+    // instance entry points. Display submission is owned by the native display driver;
+    // no Vulkan surface or swapchain is used. The runtime keeps the library alive.
     let instance = unsafe {
-        metal2vulkan_runtime::Instance::with_drivers(Some(&loader), &[], &[])
+        metal2vulkan_runtime::Instance::without_presentation(Some(&loader), &[], &[])
     }.map_err(|e| format!("Vulkan instance: {e:?}"))?;
     let physicals = instance.physical_devices().map_err(|e| format!("Vulkan devices: {e:?}"))?;
     let mut refusals = Vec::new();

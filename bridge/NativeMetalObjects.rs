@@ -211,7 +211,16 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         // SAFETY: the caller's contract.
         let (loader, cache) = unsafe { (CStr::from_ptr(loader), CStr::from_ptr(cache)) };
         open_runtime_diagnostics(cache.to_string_lossy().as_ref());
-        let (device, registry) = crate::open(loader, cache)?;
+        let (device, registry) = match crate::open(loader, cache) {
+            Ok(opened) => opened,
+            Err(error) => {
+                if std::env::var("SHENG_DIAG").as_deref() == Ok("1") {
+                    eprintln!("{} device-open refused: {error}", diagnostic_stamp());
+                    note_encoder_timing(&format!("device-open refused: {error}"));
+                }
+                return Err(error);
+            }
+        };
         write_runtime_policy(&device);
         let purge = Purge::new(&device);
         Ok(boxed(NmbDevice(device, registry, std::sync::Mutex::default(), purge)))
