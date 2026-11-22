@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-//! Consumer-owned binary archives and the read-only cache layer supplied to runtime v2.
+//! Consumer-owned archives imported into the upstream runtime cache directory.
 use metal2vulkan::{
     Budget,
     cache::{ARTIFACT_FORMAT_VERSION, Hash256, SEMANTICS_VERSION, VariantKey},
@@ -56,6 +56,7 @@ fn hex(bytes: &[u8]) -> String {
 pub struct Registry {
     pub buffers: crate::buffer_arena::BufferArena,
     archives: Mutex<Vec<Weak<Mutex<Files>>>>,
+    indices: [Arc<crate::ownership::IndexPool>; 2],
     cache_root: PathBuf,
     shared_writer: bool,
     system: Option<Arc<crate::system_cache::SystemLayer>>,
@@ -83,13 +84,32 @@ impl Registry {
             .ok_or_else(|| "device has no consumer allocation context".into())
     }
     pub fn new(cache_root: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
+        let registry = Arc::new(Self {
             cache_root,
             shared_writer: crate::system_cache::cache_readable_by_all(),
             buffers: crate::buffer_arena::BufferArena::default(),
             archives: Mutex::default(),
+            indices: [crate::ownership::IndexPool::new(rt::IndexClass::Texture), crate::ownership::IndexPool::new(rt::IndexClass::Sampler)],
             system: crate::system_cache::system_layer(),
-        })
+        });
+        if registry.shared_writer {
+            let weak = Arc::downgrade(&registry);
+            // Only a system-cache writer publishes. Ordinary applications create no worker.
+            let _ = std::thread::Builder::new().name("nmb-cache-publish".into()).spawn(move || {
+                let mut seen = BTreeMap::new();
+                loop {
+                    let Some(registry) = weak.upgrade() else { break; };
+                    registry.publish_changed(&mut seen);
+                    drop(registry);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            });
+        }
+        registry
+    }
+    pub fn reserve(&self, class: rt::IndexClass) -> Option<crate::ownership::Reservation> {
+        let slot = match class { rt::IndexClass::Texture => 0, rt::IndexClass::Sampler => 1, _ => return None };
+        self.indices[slot].reserve()
     }
     fn add(&self, files: &Arc<Mutex<Files>>) {
         let mut archives = self.archives.lock().unwrap_or_else(|e| e.into_inner());
@@ -97,7 +117,7 @@ impl Registry {
         archives.push(Arc::downgrade(files));
     }
 }
-impl rt::CacheLookup for Registry {
+impl Registry {
     fn read(&self, name: &str) -> Option<Vec<u8>> {
         // The runtime produces these names; archive parsing admits only this same namespace.
         if !valid_name(name) && !name.starts_with("pipelines-") {
@@ -141,35 +161,76 @@ impl rt::CacheLookup for Registry {
         }
         None
     }
+    pub fn seed_driver_blobs(&self) {
+        let Some(system)=&self.system else { return; };
+        let mut remaining=4;
+        for entry in std::fs::read_dir(system.path()).into_iter().flatten().flatten() {
+            let name=entry.file_name(); let Some(name)=name.to_str() else { continue; };
+            let Some(digest)=name.strip_prefix("pipelines-") else { continue; };
+            if digest.len()!=64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { continue; }
+            if let Some(bytes)=system.read(Path::new(name),32<<20) { let _=crate::cache_store::import_blob(&self.cache_root,name,&bytes); }
+            remaining-=1; if remaining==0 { break; }
+        }
+    }
+    fn seed(&self, name: &str) -> Option<Vec<u8>> {
+        let bytes = self.read(name)?;
+        let _ = crate::cache_store::import(&self.cache_root, name, &bytes);
+        Some(bytes)
+    }
+    pub fn prepare_compute(&self, device: &rt::Device, descriptor: &ComputePipelineDescriptor) {
+        if self.system.is_none() && self.archives.lock().unwrap_or_else(|e| e.into_inner()).is_empty() { return; }
+        let StageSource::Function(function) = &descriptor.kernel else { return; };
+        let translator=device.translator();
+        let Ok(plain)=translator.kernel_inputs_read(function,&descriptor.lowering_inputs(),&Budget::standard(),&StageEntries::new()) else { return; };
+        for inputs in [plain.clone(), plain.kernel_variant(KernelVariant::PartialThreadgroups),plain.kernel_variant(KernelVariant::EmulatedSimdgroups)] {
+            self.seed(&format!("translations/{}",hex(translator.function_compile_key(function,&inputs).digest())));
+        }
+    }
+    pub fn prepare_render(&self, device: &rt::Device, descriptor: &RenderPipelineDescriptor) {
+        if self.system.is_none() && self.archives.lock().unwrap_or_else(|e| e.into_inner()).is_empty() { return; }
+        let translator=device.translator();
+        let record=format!("renders/{}",hex(translator.queried_render_descriptor_key(descriptor).digest()));
+        if let Some(bytes)=self.seed(&record) {
+            // Only derive bounded digest names; the runtime checks record versions, keys and checksum.
+            if bytes.len()==122 && &bytes[..8]==b"m2vrndr1" {
+                for at in [48usize,81] { if bytes[at]==1 { self.seed(&format!("translations/{}",hex(&bytes[at+1..at+33]))); } }
+            }
+        }
+        let Ok(keys)=translator.render_variant_key(descriptor,&VariantKey::new(),&Budget::standard(),&StageEntries::new()) else { return; };
+        for (source,inputs) in [(Some(&descriptor.vertex), keys.vertex_inputs.as_ref()),(descriptor.fragment.as_ref(),keys.fragment_inputs.as_ref())] {
+            if let (Some(StageSource::Function(function)),Some(inputs))=(source,inputs) {
+                self.seed(&format!("translations/{}",hex(translator.function_compile_key(function,inputs).digest())));
+            }
+        }
+    }
+    fn publish_changed(&self, seen: &mut BTreeMap<PathBuf, std::time::SystemTime>) {
+        let mut directories = vec![self.cache_root.clone()];
+        for entry in std::fs::read_dir(&self.cache_root).into_iter().flatten().flatten() {
+            let name=entry.file_name(); let Some(name)=name.to_str() else { continue; };
+            if name.strip_prefix('g').is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                directories.push(entry.path());
+                directories.push(entry.path().join("translations"));
+                directories.push(entry.path().join("renders"));
+            }
+        }
+        for directory in directories {
+            let Ok(metadata)=std::fs::symlink_metadata(&directory) else { continue; };
+            if !metadata.is_dir() { continue; }
+            let Ok(modified)=metadata.modified() else { continue; };
+            if seen.get(&directory)==Some(&modified) { continue; }
+            seen.insert(directory.clone(),modified);
+            self.published(&directory);
+            for entry in std::fs::read_dir(directory).into_iter().flatten().flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_file()) && !entry.file_name().to_string_lossy().starts_with('.') { self.published(&entry.path()); }
+            }
+        }
+    }
     fn published(&self, path: &Path) {
         if self.shared_writer {
             let _ = publish_permissions(&self.cache_root, path);
         }
     }
-    fn verdict(&self, name: &str, accepted: bool, bytes: u64) {
-        let from_archive = self
-            .archives
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|files| {
-                files
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .files
-                    .contains_key(name)
-            });
-        if !from_archive {
-            if let Some(system) = &self.system {
-                if accepted {
-                    system.accepted(bytes);
-                } else {
-                    system.rejected();
-                }
-            }
-        }
-    }
+
 }
 fn valid_name(name: &str) -> bool {
     let Some((kind, digest)) = name.split_once('/') else {
@@ -630,4 +691,10 @@ fn publish_permissions(root: &Path, path: &Path) -> Result<(), String> {
         directory = opened;
     }
     Ok(())
+}
+
+impl Drop for Registry {
+    fn drop(&mut self) {
+        if self.shared_writer { self.publish_changed(&mut BTreeMap::new()); }
+    }
 }

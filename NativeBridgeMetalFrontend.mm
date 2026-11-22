@@ -965,6 +965,7 @@ static void answerMissing(NSInvocation *invocation) {
 // A command buffer names the object from now on (YES) until it completed or went (NO): a buffer or a texture is not discarded
 // meanwhile (nmb_buffer_hold). YES where the object is discarded as the hold begins. Nothing for any other object.
 - (BOOL)purgeHold:(BOOL)hold;
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command;
 @end
 // What the caller asked of setPurgeableState: (MTLResource, MTLHeap), for the telemetry's PG row: how much memory the process has declared
 // discardable. [0..2] requests on buffers, textures, heaps; [3] bytes of the objects whose state is Volatile now, [4] of those whose
@@ -1042,6 +1043,7 @@ static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeabl
 @implementation NBObject
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (BOOL)purgeHold:(BOOL)hold {(void)hold;return NO;}
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {(void)command;return YES;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
  NSMethodSignature *signature=[super methodSignatureForSelector:selector];
  return signature?signature:missingSignature(self,selector);
@@ -1103,6 +1105,7 @@ static void releaseSurface(void *context,void *,uint64_t) {DetailSpan timing(7,(
 }
 - (BOOL)isAliasable {return nmb_buffer_is_aliasable(_handle);}
 - (void)makeAliasable {if(!nmb_buffer_make_aliasable(_handle))NBLOG(@"native-metal: buffer makeAliasable: %@",lastError());}
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,0);}
 - (void)dealloc {
  DetailSpan timing(4,(uintptr_t)_handle);
  if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_buffer_length(_handle));
@@ -1382,6 +1385,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
  const uint64_t s=_descriptor.swizzle;
  return MTLTextureSwizzleChannelsMake((MTLTextureSwizzle)(s&255),(MTLTextureSwizzle)((s>>8)&255),(MTLTextureSwizzle)((s>>16)&255),(MTLTextureSwizzle)((s>>24)&255));
 }
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,1);}
 - (void)dealloc {
  DetailSpan timing(5,(uintptr_t)_handle);
  if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_texture_allocated_size(_handle));
@@ -1946,6 +1950,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic) NmbComputePipeline *handle;
 @end
 @implementation NBComputePipeline
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,3);}
 - (void)dealloc {DetailSpan timing(10,(uintptr_t)_handle);nmb_compute_pipeline_release(_handle);}
 - (NSUInteger)maxTotalThreadsPerThreadgroup {return nmb_compute_pipeline_max_threads(_handle);}
 - (NSUInteger)threadExecutionWidth {return nmb_compute_pipeline_execution_width(_handle);}
@@ -1956,6 +1961,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @property(nonatomic) uint32_t stateFormat;   // its colour 0 pixel format (the DF rows)
 @end
 @implementation NBRenderPipeline
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,4);}
 - (void)dealloc {DetailSpan timing(11,(uintptr_t)_handle);nmb_render_pipeline_release(_handle);}
 // The threadgroup size a tile dispatch of this pipeline could use: the device's limit (no tile shaders are offered).
 - (NSUInteger)maxTotalThreadsPerThreadgroup {
@@ -1970,6 +1976,7 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
 @implementation NBSampler {
  NSMutableDictionary<NSString *,NBSampler *> *_clamped;
 }
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,2);}
 - (void)dealloc {DetailSpan timing(12,(uintptr_t)_handle);nmb_sampler_release(_handle);}
 - (NSUInteger)pixelFormat {return MTLPixelFormatInvalid;}   // SPI: a sampler built from a plain descriptor names no format
 // This sampler with its LOD clamps replaced (a binding's lodMinClamp:lodMaxClamp:, which GFXBench's Car Chase uses): made once per pair
@@ -2611,6 +2618,7 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)sampler:(id<MTLSamplerState>)sampler index:(NSUInteger)index stage:(uint32_t)stage {
  if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){[_commandBuffer refuse:@"foreign sampler"];return;}
+ if(sampler)[_commandBuffer own:sampler];
  [self dumpBind:sampler index:index stage:stage+8];
  if(gDrawStats)[self noteState:kDSSampler key:stage<<8|(uint32_t)index object:(__bridge const void *)sampler value:0];
  ENCODE([self check:nmb_encoder_set_sampler(self->_handle,stage,sampler?[(NBSampler *)sampler handle]:nullptr,(uint32_t)index) what:"setSamplerState"]);
@@ -2650,6 +2658,8 @@ static uint64_t encodeCommandOf(id object) {
 - (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
+ [self.commandBuffer own:state];
+ [self.commandBuffer own:state];
  ENCODE([self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"]);
 }
 - (void)setBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:0];}
@@ -2733,6 +2743,8 @@ static uint64_t encodeCommandOf(id object) {
  if(dumpRange().first)self.dumpPipeline=state;
  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
+ [self.commandBuffer own:state];
+ [self.commandBuffer own:state];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
 }
 - (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {[self buffer:b offset:o index:i stage:1];}
@@ -3325,7 +3337,10 @@ static char kUserDictionaryKey;
 - (void)own:(id)resource {
  const NSUInteger before=_resourceOwners.count;
  [_resourceOwners addObject:resource];
- if(_resourceOwners.count!=before && [(NBObject *)resource purgeHold:YES])noteLateUse();
+ if(_resourceOwners.count!=before) {
+  if([(NBObject *)resource purgeHold:YES])noteLateUse();
+  if(![(NBObject *)resource keepForCommand:_handle])[self refuse:lastError()];
+ }
 }
 // The resources go: the command buffer completed, was refused, or was released without a commit.
 - (void)disown {

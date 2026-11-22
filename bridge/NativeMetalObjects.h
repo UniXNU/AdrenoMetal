@@ -476,6 +476,9 @@ void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
    Version-1 statistics queries return false under runtime v2; their layouts are not equivalent. */
 bool nmb_device_runtime_metrics(const NmbDevice *, uint64_t *out);
 
+// Retain consumer placement and index leases until command retirement.
+bool nmb_command_buffer_keep(const NmbCommandBuffer *, const void *, uint32_t kind);
+
 #ifdef __cplusplus
 }
 #endif

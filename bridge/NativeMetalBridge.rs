@@ -20,6 +20,15 @@ pub mod host_mapping;
 #[path = "NativeMetalBufferArena.rs"]
 pub mod buffer_arena;
 
+#[path = "NativeMetalOwnership.rs"]
+pub mod ownership;
+
+#[path = "NativeMetalWait.rs"]
+pub mod completion;
+
+#[path = "NativeMetalCacheStore.rs"]
+pub mod cache_store;
+
 #[path = "NativeMetalArchive.rs"]
 pub mod archive;
 
@@ -113,9 +122,12 @@ impl Run<'_> {
 
 const WAIT: Duration = Duration::from_secs(10);
 
-fn finish(command_buffer: &CommandBuffer) -> Result<(), String> {
+fn finish(command_buffer: &CommandBuffer, queue: &metal2vulkan_runtime::CommandQueue, owners: Vec<crate::ownership::Owner>) -> Result<(), String> {
+    command_buffer.add_completed_handler(move |_| drop(owners)).map_err(|e| format!("resource retirement: {e:?}"))?;
+    let completion = crate::completion::Completion::attach(command_buffer).map_err(|e| format!("completion handler: {e:?}"))?;
     command_buffer.commit().map_err(|e| format!("commit: {e:?}"))?;
-    if !command_buffer.wait_until_completed_for(WAIT).map_err(|e| format!("completion wait: {e:?}"))? {
+    queue.send_now(command_buffer);
+    if !completion.wait(WAIT) {
         return Err("no completion in 10 s".into());
     }
     match command_buffer.status() {
@@ -141,7 +153,7 @@ pub(crate) fn open(loader: &CStr, cache: &CStr) -> Result<(Device, std::sync::Ar
         }
         let mut options = DeviceOptions::default();
         let registry = crate::archive::Registry::new(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
-        options.cache_lookup = Some(registry.clone());
+        registry.seed_driver_blobs();
         options.pipeline_cache_dir = Some(PathBuf::from(cache.to_str().map_err(|e| format!("cache path: {e}"))?));
         match Device::new(&physical, options) {
             Ok(device) => {
@@ -178,7 +190,7 @@ fn compute(device: &Device, library: &crate::library::Library) -> Result<u32, St
     encoder.set_buffer(Some(&scale), 0, 2).map_err(|e| format!("{e:?}"))?;
     encoder.dispatch_threads([COUNT as u32, 1, 1], [64, 1, 1]).map_err(|e| format!("{e:?}"))?;
     encoder.end_encoding();
-    finish(&command_buffer)?;
+    finish(&command_buffer, &queue, vec![input.ownership.clone(), output.ownership.clone(), scale.ownership.clone(), state.ownership.clone()])?;
     let contents = output.contents().ok_or("no contents")?;
     // SAFETY: the buffer holds COUNT floats and no command buffer writes it now.
     let values = unsafe { std::slice::from_raw_parts(contents.as_ptr() as *const f32, COUNT) };
@@ -186,8 +198,8 @@ fn compute(device: &Device, library: &crate::library::Library) -> Result<u32, St
 }
 
 /// Draws the fixture's top-left-quarter quad into `target` (cleared blue) and returns the encoded command buffer's result.
-fn draw_quad(device: &Device, library: &crate::library::Library, target: &metal2vulkan_runtime::Texture,
-             readback: Option<(&metal2vulkan_runtime::Buffer, u64, u64)>) -> Result<(), String> {
+fn draw_quad(device: &Device, library: &crate::library::Library, target: &Texture,
+             readback: Option<(&Buffer, u64, u64)>) -> Result<(), String> {
     let vertex = library.new_function_with_name("colored_vertex").map_err(|e| format!("{e:?}"))?;
     let fragment = library.new_function_with_name("colored_fragment").map_err(|e| format!("{e:?}"))?;
     let mut descriptor = RenderPipelineDescriptor::new(StageSource::Function(vertex.function_descriptor()));
@@ -201,7 +213,7 @@ fn draw_quad(device: &Device, library: &crate::library::Library, target: &metal2
     let colors = Buffer::allocate(device, (&colors).len() as u64, ResourceOptions::shared(), Some(&colors)).map_err(|e| format!("{e:?}"))?;
     let mut pass = RenderPassDescriptor::default();
     let color = &mut pass.color_attachments[0];
-    color.texture = Some(target.clone());
+    color.texture = Some((**target).clone());
     color.load_action = LoadAction::Clear;
     color.store_action = StoreAction::Store;
     color.clear_color = ClearColor::new(0.0, 0.0, 1.0, 1.0);
@@ -220,7 +232,9 @@ fn draw_quad(device: &Device, library: &crate::library::Library, target: &metal2
             metal2vulkan_runtime::BufferLayout { offset: 0, bytes_per_row: row, bytes_per_image: row.checked_mul(side).ok_or("readback image pitch overflow")? }).map_err(|e| format!("{e:?}"))?;
         blit.end_encoding();
     }
-    finish(&command_buffer)
+    let mut owners: Vec<crate::ownership::Owner> = vec![target.ownership.clone(), positions.ownership.clone(), colors.ownership.clone(), state.ownership.clone()];
+    if let Some((buffer, _, _)) = readback { owners.push(buffer.ownership.clone()); }
+    finish(&command_buffer, &queue, owners)
 }
 
 /// Texels off the expected picture: the top-left quarter drawn (255, 51, 0, 255), the rest cleared blue.

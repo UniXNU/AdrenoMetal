@@ -19,14 +19,17 @@ use metal2vulkan::pipeline::{
 };
 use metal2vulkan_runtime::{
     BlitCommandEncoder, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
-    ComputePipelineState, DepthStencilState, Device, Event, Fence, LoadAction,
-    Region, RenderCommandEncoder, RenderPassDescriptor, RenderPipelineState,
+    DepthStencilState, Device, Event, Fence, LoadAction,
+    Region, RenderCommandEncoder, RenderPassDescriptor,
     SamplerState, ScissorRect, SharedEvent, StoreAction, Viewport, VisibilityResultMode,
 };
 use crate::purge::{Cause, Purge, Resource};
 use crate::library::{Function, Library};
 use crate::resources::{Buffer, PurgeableState, ResourceOptions};
 use crate::archive::BinaryArchive;
+use crate::pipelines::{ComputePipelineState, RenderPipelineState};
+use crate::ownership::{Owner, Ownership};
+use std::sync::{Arc, Mutex};
 use crate::texture::{Texture, TextureDescriptor};
 use crate::heap::{Heap, HeapDescriptor, HeapType};
 type Deallocator = Box<dyn FnOnce(NonNull<u8>, u64) + Send>;
@@ -39,37 +42,7 @@ use metal2vulkan_runtime::{CommandBufferError, MultisampleDepthResolveFilter, Mu
 
 thread_local! {
     static LAST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
-}
-
-fn loss_description(why: String, origin: Option<(&str, u32)>) -> String {
-    match origin {
-        // The place within the runtime's sources, not the build tree's path before them.
-        Some((file, line)) if ["DeviceLost", "GpuRecoveryVictim", "MadeBeforeRecovery"].iter().any(|name| why.contains(name)) => {
-            let file = file.rfind("/src/").map_or(file, |at| &file[at + 5..]);
-            format!("{why} (first process loss at {file}:{line})")
-        }
-        _ => why,
-    }
-}
-
-#[cfg(test)]
-mod loss_description_tests {
-    use super::loss_description;
-
-    #[test]
-    fn victims_keep_the_first_process_loss_origin() {
-        for error in ["DeviceLost", "GpuRecoveryVictim", "NotImplemented(MadeBeforeRecovery)"] {
-            let text = loss_description(error.into(), Some(("/build/runtime/src/device/submit.rs", 70)));
-            assert_eq!(text, format!("{error} (first process loss at device/submit.rs:70)"));
-        }
-    }
-
-    #[test]
-    fn ordinary_errors_and_missing_origins_stay_unchanged() {
-        assert_eq!(loss_description("OutOfMemory".into(), Some(("device.rs", 1))), "OutOfMemory");
-        assert_eq!(loss_description("DeviceLost".into(), None), "DeviceLost");
-        assert_eq!(loss_description(String::new(), Some(("device.rs", 1))), "");
-    }
+    static COMPLETING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub(crate) fn set_error(why: String) {
@@ -1729,7 +1702,7 @@ pub extern "C" fn nmb_function_patch_control_point_count(function: *const NmbFun
 
 pub struct NmbComputePipeline(ComputePipelineState);
 pub struct NmbRenderPipeline(RenderPipelineState);
-pub struct NmbSampler(SamplerState);
+pub struct NmbSampler(SamplerState, Arc<Ownership>);
 pub struct NmbDepthStencil(DepthStencilState);
 
 #[unsafe(no_mangle)]
@@ -2395,8 +2368,8 @@ pub extern "C" fn nmb_sampler_new(device: *mut NmbDevice, descriptor: *const Nmb
         out.lod_min_clamp = d.lod_min;
         out.lod_max_clamp = d.lod_max;
         let device = &get(device)?.0;
-        let index = device.reserve_index(metal2vulkan_runtime::IndexClass::Sampler).ok_or("sampler index space exhausted")?;
-        Ok(boxed(NmbSampler(device.new_sampler_state(&out, index.index()).map_err(e("sampler"))?)))
+        let index = crate::ownership::reserve(device, metal2vulkan_runtime::IndexClass::Sampler)?;
+        Ok(boxed(NmbSampler(device.new_sampler_state(&out, index.index()).map_err(e("sampler"))?, Ownership::new(vec![index.owner()]))))
     })
 }
 
@@ -2455,7 +2428,7 @@ pub extern "C" fn nmb_depth_stencil_release(state: *mut NmbDepthStencil) {
 // ---- queues and command buffers ----
 
 pub struct NmbQueue(CommandQueue);
-pub struct NmbCommandBuffer(CommandBuffer, Device, u64);
+pub struct NmbCommandBuffer(CommandBuffer, Device, u64, Arc<Mutex<Vec<Owner>>>, CommandQueue, Mutex<Option<Arc<crate::completion::Completion>>>);
 static COMMAND_BUFFER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[unsafe(no_mangle)]
@@ -2472,8 +2445,12 @@ pub extern "C" fn nmb_queue_release(queue: *mut NmbQueue) {
 pub extern "C" fn nmb_command_buffer_new(queue: *mut NmbQueue) -> *mut NmbCommandBuffer {
     guard(std::ptr::null_mut(), || {
         let queue = &get(queue)?.0;
-        Ok(boxed(NmbCommandBuffer(queue.command_buffer().map_err(e("command buffer"))?, queue.device().clone(),
-            COMMAND_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))))
+        let command = queue.command_buffer().map_err(e("command buffer"))?;
+        let owners = Arc::new(Mutex::new(Vec::<Owner>::new()));
+        let held = owners.clone();
+        command.add_completed_handler(move |_| held.lock().unwrap_or_else(|e| e.into_inner()).clear()).map_err(e("resource retirement"))?;
+        Ok(boxed(NmbCommandBuffer(command, queue.device().clone(),
+            COMMAND_BUFFER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed), owners, queue.clone(), Mutex::new(None))))
     })
 }
 
@@ -2512,7 +2489,7 @@ pub extern "C" fn nmb_command_buffer_on_completed(command_buffer: *mut NmbComman
         get(command_buffer)?.0.add_completed_handler(move |_: &CommandBuffer| {
             crate::trace::mark(id, 14, 0);
             let context = context;
-            handler(context.0);
+            COMPLETING.with(|flag| { let previous=flag.replace(true); handler(context.0); flag.set(previous); });
             crate::trace::mark(id, 55, 0);
         }).map_err(e("completed handler"))?;
         Ok(true)
@@ -2549,6 +2526,9 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
         let buffer = get(command_buffer)?;
         crate::trace::mark(buffer.2, 1, 0);
         crate::trace::mark(buffer.2, 3, 0);
+        let mut completion = buffer.5.lock().unwrap_or_else(|e| e.into_inner());
+        if completion.is_none() { *completion = Some(crate::completion::Completion::attach(&buffer.0).map_err(e("completion handler"))?); }
+        drop(completion);
         buffer.0.commit().map_err(e("commit"))?;
         Ok(true)
     });
@@ -2564,12 +2544,19 @@ pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffe
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_wait(command_buffer: *mut NmbCommandBuffer, timeout_ms: u64) -> i32 {
     guard(-1, || {
-        let command_buffer = &get(command_buffer)?.0;
+        let buffer = get(command_buffer)?;
+        let command_buffer = &buffer.0;
         if timeout_ms == 0 {
             command_buffer.wait_until_completed().map_err(e("wait"))?;
             return Ok(0);
         }
-        Ok(if command_buffer.wait_until_completed_for(Duration::from_millis(timeout_ms)).map_err(e("wait"))? { 0 } else { 1 })
+        if COMPLETING.with(|flag| flag.get()) {
+            command_buffer.wait_until_completed().map_err(e("wait"))?;
+            return Ok(0);
+        }
+        buffer.4.send_now(command_buffer);
+        let completion = buffer.5.lock().unwrap_or_else(|e| e.into_inner()).clone().ok_or("command buffer not committed")?;
+        Ok(if completion.wait(Duration::from_millis(timeout_ms)) { 0 } else { 1 })
     })
 }
 
@@ -2594,8 +2581,7 @@ pub extern "C" fn nmb_command_buffer_error(command_buffer: *const NmbCommandBuff
         let cb = get(command_buffer)?;
         let loss = cb.1.loss();
         let description = cb.0.error().map(|error| format!("{error:?}; first device loss={loss:?}"));
-        let origin = loss.as_ref().and_then(|loss| loss.source.as_ref()).map(|at| (at.file, at.line));
-        Ok(description.map_or(0, |text| copy_out(&loss_description(text, origin), out, size)))
+        Ok(description.map_or(0, |text| copy_out(&text, out, size)))
     })
 }
 
@@ -3517,4 +3503,21 @@ impl PipelineOptions {
         }
         Ok(())
     }
+}
+
+/// Keeps consumer leases independently of Objective-C handle lifetime until GPU retirement.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_keep(command: *const NmbCommandBuffer, resource: *const c_void, kind: u32) -> bool {
+    guard(false, || {
+        let owner: Owner = match kind {
+            0 => get(resource.cast::<NmbBuffer>())?.0.live()?.ownership.clone(),
+            1 => get(resource.cast::<NmbTexture>())?.0.live()?.ownership.clone(),
+            2 => get(resource.cast::<NmbSampler>())?.1.clone(),
+            3 => get(resource.cast::<NmbComputePipeline>())?.0.ownership.clone(),
+            4 => get(resource.cast::<NmbRenderPipeline>())?.0.ownership.clone(),
+            _ => return Err("invalid consumer resource kind".into()),
+        };
+        get(command)?.3.lock().unwrap_or_else(|e| e.into_inner()).push(owner);
+        Ok(true)
+    })
 }

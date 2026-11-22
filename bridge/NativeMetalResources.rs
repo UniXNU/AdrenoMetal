@@ -77,6 +77,7 @@ pub struct Buffer {
     _blocks: Arc<Vec<rt::Block>>,
     imported_pointer: Option<usize>,
     lease: Option<Arc<crate::heap::Lease>>,
+    pub(crate) ownership: Arc<crate::ownership::Ownership>,
 }
 
 impl Deref for Buffer {
@@ -100,6 +101,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(Vec::new()),
             imported_pointer: None,
+            ownership: crate::ownership::Ownership::new(vec![lease.clone()]),
             lease: Some(lease),
         }
     }
@@ -153,9 +155,7 @@ impl Buffer {
             device.new_buffer(block, offset, length, Some(0))
         }
         .map_err(|e| format!("buffer placement: {e:?}"))?;
-        for allocation in placements {
-            raw.retain_until_unused(allocation);
-        }
+
         let blocks = Vec::new();
         let buffer = Self {
             raw,
@@ -164,6 +164,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: None,
+            ownership: crate::ownership::Ownership::new(placements.into_iter().map(|p| p as crate::ownership::Owner).collect()),
             lease: None,
         };
         if let Some(bytes) = bytes {
@@ -321,6 +322,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: Some(pointer.as_ptr() as usize),
+            ownership: crate::ownership::Ownership::new(vec![]),
             lease: None,
         })
     }

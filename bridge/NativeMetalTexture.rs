@@ -104,6 +104,9 @@ pub struct Texture {
     device: rt::Device,
     state: Arc<AtomicU64>,
     lease: Option<Arc<crate::heap::Lease>>,
+    pub(crate) ownership: Arc<crate::ownership::Ownership>,
+    backing_size: u64,
+    backing: Arc<crate::ownership::Ownership>,
 }
 impl Deref for Texture {
     type Target = rt::Texture;
@@ -117,12 +120,18 @@ impl Texture {
         descriptor: TextureDescriptor,
         device: rt::Device,
         lease: Arc<crate::heap::Lease>,
+        index: crate::ownership::Reservation,
+        backing_size: u64,
     ) -> Self {
+        let backing = crate::ownership::Ownership::new(vec![lease.clone()]);
         Self {
             raw,
             descriptor,
             device,
             state: Arc::new(AtomicU64::new(2)),
+            ownership: crate::ownership::Ownership::new(vec![backing.clone(), index.owner()]),
+            backing,
+            backing_size,
             lease: Some(lease),
         }
     }
@@ -139,9 +148,7 @@ impl Texture {
             .is_some_and(|lease| lease.is_aliasable())
     }
     pub fn allocate(device: &rt::Device, descriptor: &TextureDescriptor) -> Result<Self, String> {
-        let index = device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = crate::ownership::reserve(device, rt::IndexClass::Texture)?;
         let raw = device
             .new_texture(&descriptor.runtime()?, Some(index.index()))
             .map_err(|e| format!("texture: {e:?}"))?;
@@ -150,6 +157,9 @@ impl Texture {
             descriptor: descriptor.clone(),
             device: device.clone(),
             state: Arc::new(AtomicU64::new(2)),
+            ownership: crate::ownership::Ownership::new(vec![index.owner()]),
+            backing: crate::ownership::Ownership::new(vec![]),
+            backing_size: allocation_size(device, descriptor),
             lease: None,
         })
     }
@@ -160,9 +170,7 @@ impl Texture {
         bytes_per_row: u64,
     ) -> Result<Self, String> {
         let device = buffer.device();
-        let index = device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = crate::ownership::reserve(device, rt::IndexClass::Texture)?;
         let raw = (**buffer)
             .new_texture(
                 &descriptor.runtime()?,
@@ -176,6 +184,9 @@ impl Texture {
             descriptor: descriptor.clone(),
             device: device.clone(),
             state: Arc::new(AtomicU64::new(2)),
+            ownership: crate::ownership::Ownership::new(vec![index.owner(), buffer.ownership.clone()]),
+            backing_size: buffer.length(),
+            backing: crate::ownership::Ownership::new(vec![buffer.ownership.clone()]),
             lease: None,
         })
     }
@@ -213,10 +224,7 @@ impl Texture {
         swizzle: TextureSwizzleChannels,
     ) -> Result<Self, String> {
         let narrow = |v| u32::try_from(v).map_err(|_| "texture view range exceeds u32".to_owned());
-        let index = self
-            .device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = crate::ownership::reserve(&self.device, rt::IndexClass::Texture)?;
         let raw = self
             .raw
             .new_texture_view_with_swizzle(
@@ -243,6 +251,9 @@ impl Texture {
             descriptor,
             device: self.device.clone(),
             state: self.state.clone(),
+            ownership: crate::ownership::Ownership::new(vec![index.owner(), self.backing.clone()]),
+            backing: self.backing.clone(),
+            backing_size: self.backing_size,
             lease: self.lease.clone(),
         })
     }
@@ -298,8 +309,9 @@ impl Texture {
         }
         PurgeableState::from_raw(previous)
     }
+    /// Placement requirement for purge accounting; physical pool residency comes from runtime gauges.
     pub fn backing_allocation_size(&self) -> u64 {
-        self.raw.backing_allocation_size()
+        self.backing_size
     }
 }
 impl Buffer {
@@ -311,4 +323,14 @@ impl Buffer {
     ) -> Result<Texture, String> {
         Texture::over_buffer(self, descriptor, offset, bytes_per_row)
     }
+}
+
+fn allocation_size(device: &rt::Device, descriptor: &TextureDescriptor) -> u64 {
+    if let Ok(size) = descriptor.runtime().and_then(|d| device.heap_texture_size_and_align(&d).map_err(|e| format!("{e:?}"))) { return size.size; }
+    // Dedicated-only images remain supported; estimate purge bytes from public level metadata.
+    let layers = descriptor.array_length.saturating_mul(if matches!(descriptor.texture_type, TextureType::Cube | TextureType::CubeArray) { 6 } else { 1 });
+    (0..descriptor.mipmap_level_count).map(|level| device.texture_level_info(&rt::TextureLevelQuery {
+        pixel_format: descriptor.pixel_format.as_raw() as u64, width: descriptor.width, height: descriptor.height,
+        depth: descriptor.depth, array_length: layers, level, planes: 0,
+    }).bytes.saturating_mul(descriptor.sample_count)).fold(0, u64::saturating_add)
 }

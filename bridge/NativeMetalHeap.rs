@@ -263,7 +263,6 @@ impl Heap {
             .device
             .new_heap_buffer(self.range(), offset, length)
             .map_err(|e| format!("heap buffer: {e:?}"))?;
-        raw.retain_until_unused(lease.clone());
         Ok(Buffer::placed(raw, self.0.device.clone(), options, lease))
     }
     pub fn new_texture(&self, descriptor: &TextureDescriptor) -> Result<Texture, String> {
@@ -291,22 +290,19 @@ impl Heap {
             .heap_texture_size_and_align(&d)
             .map_err(|e| format!("heap texture size: {e:?}"))?;
         let (lease, offset) = self.place(requirement, offset)?;
-        let index = self
-            .0
-            .device
-            .reserve_index(rt::IndexClass::Texture)
-            .ok_or("texture index space exhausted")?;
+        let index = crate::ownership::reserve(&self.0.device, rt::IndexClass::Texture)?;
         let raw = self
             .0
             .device
             .new_heap_texture(&d, Some(index.index()), self.range(), offset)
             .map_err(|e| format!("heap texture: {e:?}"))?;
-        raw.retain_until_unused(lease.clone());
         Ok(Texture::placed(
             raw,
             descriptor.clone(),
             self.0.device.clone(),
             lease,
+            index,
+            requirement.size,
         ))
     }
     pub fn set_purgeable_state(&self, state: PurgeableState) -> Result<PurgeableState, String> {
