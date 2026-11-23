@@ -351,6 +351,8 @@ bool nmb_command_buffer_on_completed(NmbCommandBuffer *, void (*handler)(void *c
 bool nmb_command_buffer_on_scheduled(NmbCommandBuffer *, void (*handler)(void *context), void *context);
 bool nmb_command_buffer_commit(NmbCommandBuffer *);
 bool nmb_command_buffer_enqueue(NmbCommandBuffer *);
+// Native display fence snapshots must follow the final driver submission, not queue staging.
+bool nmb_command_buffer_native_presentation(const NmbCommandBuffer *);
 /* Wait for scheduling and scheduled handlers only; false on a refused wait. */
 bool nmb_command_buffer_wait_scheduled(NmbCommandBuffer *);
 /* 0 completed in time, 1 timed out (timeout_ms 0 waits without a bound). */

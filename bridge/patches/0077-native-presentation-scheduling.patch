@@ -1,0 +1,95 @@
+diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-runtime/src/command.rs
+--- a/crates/metal2vulkan-runtime/src/command.rs
++++ b/crates/metal2vulkan-runtime/src/command.rs
+@@ -263,6 +263,7 @@
+ /// What the GPU uses: the recorder, the segments, and the blocks kept until retirement.
+ pub(crate) struct Gpu {
+     pub(crate) recorder: Option<Recorder>,
++    pub(crate) native_presentation: bool,
+     pub(crate) segments: Vec<Segment>,
+     /// Each heap's block the commands use (`useHeap:`), once: a block released meanwhile is
+     /// reused only after the command buffer retires.
+@@ -310,6 +311,10 @@
+     pub(crate) fn presents(&self) -> bool {
+         (self.segments.last()).is_some_and(|segment| !segment.binary.is_empty())
+     }
++
++    pub(crate) fn schedules_after_submit(&self) -> bool {
++        self.native_presentation || self.presents()
++    }
+ }
+
+ /// One submission's part of a command buffer: its waits, its commands and its signals.
+@@ -396,6 +401,7 @@
+                         device,
+                         gpu: Gpu {
+                             recorder: None,
++                            native_presentation: false,
+                             segments: vec![Segment::default()],
+                             blocks: Vec::new(),
+                             kept,
+@@ -435,6 +441,16 @@
+
+     fn state(&self) -> MutexGuard<'_, CbState> {
+         lock(&self.inner.state)
++    }
++
++    /// Delay scheduling until the final native display write has reached the driver.
++    /// The consumer presents outside Vulkan and captures the driver's submitted fence
++    /// from its scheduled handler or after `wait_until_scheduled` returns.
++    pub fn schedule_native_presentation(&self) -> Result<(), Error> {
++        self.building(|building| {
++            building.gpu.native_presentation = true;
++            Ok(())
++        })
+     }
+
+     /// Runs `f` on what is being recorded. Err: [`Refusal::Committed`];
+@@ -1672,6 +1688,7 @@
+         fences,
+         executed,
+         queries,
++        native_presentation: _,
+     } = gpu;
+     if let Some(recorder) = recorder {
+         core.recorders.give_back(core, recorder);
+diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-runtime/src/submit.rs
+--- a/crates/metal2vulkan-runtime/src/submit.rs
++++ b/crates/metal2vulkan-runtime/src/submit.rs
+@@ -1635,7 +1635,7 @@
+             return;
+         };
+         let empty = pending.gpu.is_empty() && !captured.waits_for(pending.seq);
+-        if entry.error.is_some() || empty || pending.gpu.presents() {
++        if entry.error.is_some() || empty || pending.gpu.schedules_after_submit() {
+             fifo.send_through = fifo.send_through.max(entry.place);
+             return;
+         }
+@@ -1865,7 +1865,8 @@
+         else {
+             return Step::Staged;
+         };
+-        if held.is_none() && !pending.gpu.presents() {
++        let native_presentation = pending.gpu.native_presentation;
++        if held.is_none() && !pending.gpu.schedules_after_submit() {
+             let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+             cb.scheduled(now, !scheduled.is_empty());
+             if !scheduled.is_empty() {
+@@ -1878,7 +1879,7 @@
+         // A command buffer held for room behind it joins it or, not taken, sends it first: with
+         // room the two would have been staged together.
+         let held_behind = (fifo.entries.front()).is_some_and(|entry| entry.held.is_some());
+-        match signals || (fifo.goes(stop) && !held_behind) {
++        match signals || native_presentation || (fifo.goes(stop) && !held_behind) {
+             true => Step::Goes(index),
+             false => Step::Staged,
+         }
+@@ -2554,7 +2555,7 @@
+             // retires.
+             let now = times::host_time();
+             for (cb, pending, error) in &mut finished {
+-                if error.is_none() && pending.gpu.presents() {
++                if error.is_none() && pending.gpu.schedules_after_submit() {
+                     let scheduled = std::mem::take(&mut pending.handlers.scheduled);
+                     cb.scheduled(now, !scheduled.is_empty());
+                     if !scheduled.is_empty() {

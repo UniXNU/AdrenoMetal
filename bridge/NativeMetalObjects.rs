@@ -2530,6 +2530,14 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_native_presentation(command_buffer: *const NmbCommandBuffer) -> bool {
+    guard(false, || {
+        get(command_buffer)?.0.schedule_native_presentation().map_err(e("native presentation"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_enqueue(command_buffer: *mut NmbCommandBuffer) -> bool {
     guard(false, || {
         get(command_buffer)?.0.enqueue().map_err(e("enqueue"))?;

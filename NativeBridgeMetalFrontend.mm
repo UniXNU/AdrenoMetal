@@ -2138,6 +2138,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 @property(nonatomic,strong) NBQueue *queue;
 @property(atomic,copy) NSString *encodeFailure;
 @property(atomic) BOOL committed,failedLocally;
+@property(nonatomic) BOOL nativePresentation;
 @property(atomic) BOOL submitted;   // the runtime has been given the commit (the encoding thread's half of it, -submit)
 @property(nonatomic) uint64_t committedUs;
 @property(nonatomic) uint32_t commitIndex;
@@ -2149,6 +2150,7 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
 // Adds a resource a command names to resourceOwners, and holds it against a discard until the command buffer completed or went
 // (purgeHold:). Called on the thread that makes the call, before the command reaches the runtime.
 - (void)own:(id)resource;
+- (void)noteSurfaceWrite:(NBTexture *)texture;
 // The sampled sources watched for a rewrite while the GPU could read them (gWatchSources), kept alive until completion.
 @property(nonatomic,strong) NSMutableSet *sampled;
 - (void)watchTexture:(NBTexture *)texture;
@@ -2533,6 +2535,8 @@ static uint64_t encodeCommandOf(id object) {
 }
 - (void)declareResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
  if(![self holdIndirectResource:resource])return;
+ if((usage&MTLResourceUsageWrite) && [(id)resource isKindOfClass:[NBTexture class]])
+  [self.commandBuffer noteSurfaceWrite:(NBTexture *)resource];
  NBBuffer *buffer=[(id)resource isKindOfClass:[NBBuffer class]]?(NBBuffer *)resource:nil;
  NBTexture *texture=[(id)resource isKindOfClass:[NBTexture class]]?(NBTexture *)resource:nil;
  ENCODE([self check:nmb_encoder_use_resource(self.handle,buffer.handle,texture.handle,usage,stages) what:"useResource"]);
@@ -2677,7 +2681,11 @@ static uint64_t encodeCommandOf(id object) {
                         [NSString stringWithFormat:@"kernel %u texture %lu",_commandBuffer.dumpKernels,(unsigned long)index]);
   if(_commandBuffer.dumpTargets.count>before)[_dumpEntries addObject:_commandBuffer.dumpTargets.lastObject];
  }
- if(texture){[_commandBuffer own:texture];}
+ if(texture){
+  [_commandBuffer own:texture];
+  if(texture.usage==MTLTextureUsageUnknown || (texture.usage&MTLTextureUsageShaderWrite))
+   [_commandBuffer noteSurfaceWrite:(NBTexture *)texture];
+ }
  [self dumpBind:texture index:index stage:stage+4];
  if(texture && [(NBTexture *)texture surface])[_commandBuffer.surfaces addObject:texture];
  if(texture && gWatchSources)[_commandBuffer watchTexture:(NBTexture *)texture];
@@ -3072,6 +3080,7 @@ static uint64_t encodeCommandOf(id object) {
 - (void)copyFromTexture:(id<MTLTexture>)s sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)z
               toTexture:(id<MTLTexture>)d destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dO {
  if(![self textures:NB_OBJECTS(s,d) count:2])return;
+ [self.commandBuffer noteSurfaceWrite:(NBTexture *)d];
  const std::array<uint64_t,3> a={so.x,so.y,so.z},size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
  ENCODE([self check:nmb_blit_copy_texture(self.handle,[(NBTexture *)s handle],ss,sl,a.data(),size.data(),[(NBTexture *)d handle],ds,dl,b.data())
                 what:"copyFromTexture:toTexture:"]);
@@ -3119,6 +3128,7 @@ static uint64_t encodeCommandOf(id object) {
   return;
  }
  const std::array<uint64_t,3> size={z.width,z.height,z.depth},b={dO.x,dO.y,dO.z};
+ [self.commandBuffer noteSurfaceWrite:(NBTexture *)d];
  ENCODE([self check:nmb_blit_buffer_to_texture(self.handle,[(NBBuffer *)s handle],o,row,image,size.data(),[(NBTexture *)d handle],slice,level,b.data())
                 what:"copyFromBuffer:toTexture:"]);
 }
@@ -3380,6 +3390,9 @@ static void dumpReadback(NBCommandBuffer *source,uint64_t appIndex) {
 
 // Retain the surface's colour-space description and serialized-property hash with each sample.
 @implementation NBCommandBuffer
+- (void)noteSurfaceWrite:(NBTexture *)texture {
+ if(texture.surface)self.nativePresentation=YES;
+}
 // IOGPUMetalCommandBuffer's userDictionary: a mutable dictionary per command buffer, which MPS keeps its per-buffer state in (nil lost it).
 static char kUserDictionaryKey;
 - (id)userDictionary {
@@ -3545,13 +3558,13 @@ static char kUserDictionaryKey;
   if(!a.texture)return true;
   if(![(id)a.texture isKindOfClass:[NBTexture class]])return false;
   NBTexture *texture=(NBTexture *)a.texture;if(texture.surface)[_surfaces addObject:texture];
-  [self own:texture];
+  [self own:texture];[self noteSurfaceWrite:texture];
   const size_t copiesBefore=resolveCopies.size();
   out.texture=texture.handle;out.level=a.level;out.slice=a.slice;out.depth_plane=a.depthPlane;out.load=a.loadAction;out.store=a.storeAction;
   if(a.resolveTexture) {
    if(![(id)a.resolveTexture isKindOfClass:[NBTexture class]])return false;
    NBTexture *resolve=(NBTexture *)a.resolveTexture;
-   [self own:resolve];if(resolve.surface)[_surfaces addObject:resolve];
+   [self own:resolve];[self noteSurfaceWrite:resolve];if(resolve.surface)[_surfaces addObject:resolve];
    const bool resolves=a.storeAction==MTLStoreActionMultisampleResolve || a.storeAction==MTLStoreActionStoreAndMultisampleResolve;
    if(singleSample()) {
     if(resolves) {
@@ -3634,6 +3647,9 @@ static char kUserDictionaryKey;
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 - (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration {
+ [self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAfterMinimumDuration:duration];}];
+}
 - (void)enqueue {
  if(self.committed){[self refuse:@"enqueue after commit"];return;}
  encodeDrain();
@@ -3772,6 +3788,8 @@ static char kUserDictionaryKey;
   }
   ++gWallpaperAllowed;
  }
+ if(self.nativePresentation && !self.encodeFailure && !nmb_command_buffer_native_presentation(_handle))
+  [self refuse:[@"native presentation: " stringByAppendingString:lastError()]];
  if(!self.encodeFailure) {
   frontStage(traceNumber,self.commitIndex,4);
   const uint64_t flushed=flushSurfaces(_surfaces);
