@@ -9,9 +9,29 @@ use metal2vulkan::metal::format::{ChromaSubsampling, YCbCrReads, ycbcr_format};
 use metal2vulkan::metal::{PixelFormat, TextureSwizzleChannels, TextureType};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+
+/// Maximum YCbCr conversion command buffers allowed in flight concurrently so bursty
+/// 4K video/wallpaper startup cannot stack dozens of full-frame backings in VRAM.
+const MAX_IN_FLIGHT_YCBCR: usize = 3;
+
+/// Selects the most compact backing format that preserves the YCbCr format range and precision.
+pub(crate) fn backing_format_for(pixel_format: PixelFormat) -> PixelFormat {
+    match ycbcr_format(pixel_format) {
+        Some(fmt) => match fmt.reads {
+            YCbCrReads::ExtendedRange | YCbCrReads::Pq | YCbCrReads::Hlg => {
+                PixelFormat::RGBA16Float
+            }
+            YCbCrReads::Srgb => PixelFormat::RGB10A2Unorm,
+            _ if fmt.bits <= 8 => PixelFormat::RGBA8Unorm,
+            _ => PixelFormat::RGB10A2Unorm,
+        },
+        None => PixelFormat::RGBA16Float,
+    }
+}
 
 /// The two-plane YCbCr conversion compute kernel (shaders/ycbcr_convert.ll), assembled to AIR at build time.
 static YCBCR_CONVERT_AIR: &[u8] = include_bytes!(env!("NMB_YCBCR_AIR"));
@@ -71,9 +91,50 @@ struct ConverterState {
     pipeline: ComputePipelineState,
 }
 
-/// Lazily initialized compute queue and pipeline for converting two-plane YCbCr IOSurfaces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BackingCacheKey {
+    buffer_owner_ptr: usize,
+    pixel_format: u32,
+    width: u64,
+    height: u64,
+    pixel_format_view: bool,
+    luma_offset: u64,
+    luma_bytes_per_row: u64,
+    chroma_offset: u64,
+    chroma_bytes_per_row: u64,
+    ostype: u32,
+    plane: u64,
+    matrix: u8,
+}
+
+impl BackingCacheKey {
+    fn of(buffer: &Buffer, layout: &YCbCrSurfaceLayout, descriptor: &TextureDescriptor) -> Self {
+        Self {
+            buffer_owner_ptr: Arc::as_ptr(&buffer.ownership) as usize,
+            pixel_format: descriptor.pixel_format.as_raw(),
+            width: descriptor.width,
+            height: descriptor.height,
+            pixel_format_view: descriptor.usage.contains(metal2vulkan::metal::TextureUsage::PIXEL_FORMAT_VIEW),
+            luma_offset: layout.luma_offset,
+            luma_bytes_per_row: layout.luma_bytes_per_row,
+            chroma_offset: layout.chroma_offset,
+            chroma_bytes_per_row: layout.chroma_bytes_per_row,
+            ostype: layout.ostype,
+            plane: layout.plane,
+            matrix: match layout.matrix {
+                YCbCrMatrix::Bt601 => 0,
+                YCbCrMatrix::Bt709 => 1,
+                YCbCrMatrix::Bt2020 => 2,
+            },
+        }
+    }
+}
+
+/// Lazily initialized compute queue, pipeline, weak backing cache, and in-flight throttle for YCbCr conversion.
 pub struct YCbCrConverter {
     state: Mutex<Option<ConverterState>>,
+    cache: Mutex<HashMap<BackingCacheKey, Weak<YCbCrRefresh>>>,
+    in_flight: Mutex<VecDeque<rt::CommandBuffer>>,
     converted: AtomicU64,
 }
 
@@ -81,12 +142,79 @@ impl YCbCrConverter {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(None),
+            cache: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(VecDeque::new()),
             converted: AtomicU64::new(0),
         }
     }
 
     pub fn converted_count(&self) -> u64 {
         self.converted.load(Ordering::Relaxed)
+    }
+
+    fn drain_in_flight(&self) {
+        loop {
+            let oldest = {
+                let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+                while let Some(front) = guard.front() {
+                    if matches!(
+                        front.status(),
+                        rt::CommandBufferStatus::Completed | rt::CommandBufferStatus::Error
+                    ) {
+                        guard.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if guard.len() < MAX_IN_FLIGHT_YCBCR {
+                    return;
+                }
+                guard.pop_front()
+            };
+            if let Some(cb) = oldest {
+                // Ignore WaitOnOwnThread if invoked on a completion callback thread.
+                let _ = cb.wait_until_completed();
+            }
+        }
+    }
+
+    fn track_in_flight(&self, cb: rt::CommandBuffer) {
+        let mut guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(front) = guard.front() {
+            if matches!(
+                front.status(),
+                rt::CommandBufferStatus::Completed | rt::CommandBufferStatus::Error
+            ) {
+                guard.pop_front();
+            } else {
+                break;
+            }
+        }
+        guard.push_back(cb);
+    }
+
+    fn lookup_backing(
+        &self,
+        key: BackingCacheKey,
+        buffer: &Buffer,
+    ) -> Option<Arc<YCbCrRefresh>> {
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get(&key)?.upgrade();
+        match entry {
+            Some(refresh) if Arc::ptr_eq(&refresh.source.buffer.ownership, &buffer.ownership) => {
+                Some(refresh)
+            }
+            _ => {
+                guard.remove(&key);
+                None
+            }
+        }
+    }
+
+    fn insert_backing(&self, key: BackingCacheKey, refresh: &Arc<YCbCrRefresh>) {
+        let mut guard = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.retain(|_, v| v.strong_count() > 0);
+        guard.insert(key, Arc::downgrade(refresh));
     }
 
     fn state(&self, device: &rt::Device) -> Result<ConverterState, String> {
@@ -187,6 +315,7 @@ pub struct YCbCrRefresh {
     source: Arc<YCbCrSource>,
     backing_raw: rt::Texture,
     backing_ownership: Arc<crate::ownership::Ownership>,
+    backing_size: u64,
     params: YCbCrParams,
     state: Mutex<RefreshState>,
 }
@@ -282,9 +411,11 @@ impl YCbCrSource {
         command_buffer
             .add_completed_handler(move |_| drop(owners))
             .map_err(|e| format!("ycbcr completion handler: {e:?}"))?;
+        self.converter.drain_in_flight();
         command_buffer
             .commit()
             .map_err(|e| format!("ycbcr commit: {e:?}"))?;
+        self.converter.track_in_flight(command_buffer);
         self.converter.converted.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -292,30 +423,46 @@ impl YCbCrSource {
     pub fn convert(self: &Arc<Self>, descriptor: &TextureDescriptor) -> Result<Texture, String> {
         let params = build_params(descriptor, &self.layout, self.buffer.length())?;
         let device = self.buffer.device();
-        let state = self.converter.state(device)?;
-        let (raw, ownership, backing_size) = Texture::allocate_ycbcr_target(device, descriptor)?;
-        let initial_seed = self.seed.map(SurfaceSeed::read);
-        self.dispatch_into(&state, &raw, &ownership, params)?;
+        let key = BackingCacheKey::of(&self.buffer, &self.layout, descriptor);
+        let backing = if let Some(refresh) = self.converter.lookup_backing(key, &self.buffer) {
+            refresh.refresh_for_use(0)?;
+            Texture::from_ycbcr_backing(
+                device,
+                descriptor,
+                refresh.backing_raw.clone(),
+                refresh.backing_ownership.clone(),
+                refresh.backing_size,
+                refresh,
+            )
+        } else {
+            self.converter.drain_in_flight();
+            let state = self.converter.state(device)?;
+            let (raw, ownership, backing_size) = Texture::allocate_ycbcr_target(device, descriptor)?;
+            let initial_seed = self.seed.map(SurfaceSeed::read);
+            self.dispatch_into(&state, &raw, &ownership, params)?;
 
-        let refresh = Arc::new(YCbCrRefresh {
-            source: Arc::clone(self),
-            backing_raw: raw.clone(),
-            backing_ownership: ownership.clone(),
-            params,
-            state: Mutex::new(RefreshState {
-                last_seed: initial_seed,
-                last_use_tag: 0,
-                fresh_from_create: true,
-            }),
-        });
-        let backing = Texture::from_ycbcr_backing(
-            device,
-            descriptor,
-            raw,
-            ownership,
-            backing_size,
-            refresh,
-        );
+            let refresh = Arc::new(YCbCrRefresh {
+                source: Arc::clone(self),
+                backing_raw: raw.clone(),
+                backing_ownership: ownership.clone(),
+                backing_size,
+                params,
+                state: Mutex::new(RefreshState {
+                    last_seed: initial_seed,
+                    last_use_tag: 0,
+                    fresh_from_create: true,
+                }),
+            });
+            self.converter.insert_backing(key, &refresh);
+            Texture::from_ycbcr_backing(
+                device,
+                descriptor,
+                raw,
+                ownership,
+                backing_size,
+                refresh,
+            )
+        };
 
         if descriptor.swizzle != TextureSwizzleChannels::DEFAULT {
             backing.new_texture_view_with_swizzle(
@@ -669,5 +816,15 @@ mod tests {
         assert!(go);
         let (go, _) = decide_refresh(&u3, None, 2);
         assert!(!go);
+    }
+
+    #[test]
+    fn backing_format_uses_32bpp_for_sdr_and_fp16_for_hdr() {
+        assert_eq!(backing_format_for(PixelFormat::YCBCR84202P), PixelFormat::RGBA8Unorm);
+        assert_eq!(backing_format_for(PixelFormat::YCBCR104202P), PixelFormat::RGB10A2Unorm);
+        assert_eq!(backing_format_for(PixelFormat::YCBCR84202PSRGB), PixelFormat::RGB10A2Unorm);
+        assert_eq!(backing_format_for(PixelFormat::YCBCR104202PSRGB), PixelFormat::RGB10A2Unorm);
+        assert_eq!(backing_format_for(PixelFormat::YCBCR104202PPQ), PixelFormat::RGBA16Float);
+        assert_eq!(backing_format_for(PixelFormat::YCBCR104202PHLG), PixelFormat::RGBA16Float);
     }
 }

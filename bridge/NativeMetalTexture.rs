@@ -183,7 +183,7 @@ impl Texture {
         descriptor: &TextureDescriptor,
     ) -> Result<(rt::Texture, Arc<crate::ownership::Ownership>, u64), String> {
         let mut backing_desc = TextureDescriptor::texture_2d(
-            PixelFormat::RGBA16Float,
+            crate::ycbcr::backing_format_for(descriptor.pixel_format),
             descriptor.width,
             descriptor.height,
             false,
@@ -314,7 +314,7 @@ impl Texture {
             }
         }
         let runtime_format = if self.ycbcr.is_some() && format == self.descriptor.pixel_format {
-            PixelFormat::RGBA16Float
+            self.raw.descriptor().pixel_format
         } else {
             format
         };
