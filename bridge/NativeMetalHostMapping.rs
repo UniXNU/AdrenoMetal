@@ -6,15 +6,22 @@ use std::ptr::NonNull;
 pub struct HostMapping {
     address: usize,
     length: usize,
+    offset: usize,
     writable: bool,
 }
 
 impl HostMapping {
-    /// Alias the caller's readable, page-aligned range without copying its pages.
+    /// Alias the enclosing page-aligned range covering `(pointer, length)` without copying pages.
+    /// `min_alignment` is the Vulkan host-pointer import granule (power of two, e.g. 4096); the
+    /// remapped alias is aligned to `max(vm_page_size, min_alignment)`.
     /// Read-only mappings stay read-only; the kernel pins and maps them read-only in SMMU.
     /// The caller must own and keep the range valid until this method returns.
     #[cfg(target_vendor = "apple")]
-    pub unsafe fn alias(pointer: NonNull<u8>, length: u64) -> Result<Self, String> {
+    pub unsafe fn alias(
+        pointer: NonNull<u8>,
+        length: u64,
+        min_alignment: u64,
+    ) -> Result<Self, String> {
         unsafe extern "C" {
             static mach_task_self_: u32;
             fn mach_vm_remap(
@@ -33,25 +40,45 @@ impl HostMapping {
             fn mach_vm_deallocate(task: u32, address: u64, length: u64) -> i32;
         }
         let length_usize = usize::try_from(length).map_err(|_| "host import is too long")?;
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page <= 0
-            || length == 0
-            || !(pointer.as_ptr() as usize).is_multiple_of(page as usize)
-            || !length_usize.is_multiple_of(page as usize)
-        {
-            return Err("host import must span whole aligned pages".into());
+        if length_usize == 0 {
+            return Err("host import requires non-zero length".into());
         }
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page <= 0 {
+            return Err("invalid system page size".into());
+        }
+        let page = page as usize;
+        let min_align = usize::try_from(min_alignment.max(1))
+            .map_err(|_| "host import alignment overflow")?;
+        let granule = if min_align.is_power_of_two() {
+            page.max(min_align)
+        } else {
+            return Err("host import alignment must be a power of two".into());
+        };
+        if !granule.is_power_of_two() || !granule.is_multiple_of(page) {
+            return Err("host import alignment is incompatible with system page size".into());
+        }
+        let start = pointer.as_ptr() as usize;
+        let aligned_start = start & !(granule - 1);
+        let offset = start - aligned_start;
+        let end = start
+            .checked_add(length_usize)
+            .ok_or("host import range overflow")?;
+        let aligned_end = end
+            .checked_next_multiple_of(granule)
+            .ok_or("host import alignment overflow")?;
+        let aligned_length = aligned_end - aligned_start;
         let (mut address, mut current, mut maximum) = (0u64, 0i32, 0i32);
         // SAFETY: out parameters are local; copy=false shares the source objects in a fresh mapping.
         let status = unsafe {
             mach_vm_remap(
                 mach_task_self_,
                 &mut address,
-                length,
-                0,
+                aligned_length as u64,
+                (granule - 1) as u64,
                 1,
                 mach_task_self_,
-                pointer.as_ptr() as u64,
+                aligned_start as u64,
                 0,
                 &mut current,
                 &mut maximum,
@@ -61,28 +88,50 @@ impl HostMapping {
         if status != 0 {
             return Err(format!("host import remap failed: {status}"));
         }
-        if current & 1 == 0 || address == 0 {
-            // SAFETY: release only the alias this call created; never alter the caller's protection.
+        if current & 1 == 0 || address == 0 || !(address as usize).is_multiple_of(granule) {
+            // SAFETY: release only the alias this call created; never alter caller protection.
             unsafe {
-                mach_vm_deallocate(mach_task_self_, address, length);
+                mach_vm_deallocate(mach_task_self_, address, aligned_length as u64);
             }
             return Err("host import requires readable pages".into());
         }
         Ok(Self {
             address: address as usize,
-            length: length_usize,
+            length: aligned_length,
+            offset,
             writable: current & 2 != 0,
         })
     }
 
     #[cfg(not(target_vendor = "apple"))]
-    pub unsafe fn alias(_pointer: NonNull<u8>, _length: u64) -> Result<Self, String> {
+    pub unsafe fn alias(
+        _pointer: NonNull<u8>,
+        _length: u64,
+        _min_alignment: u64,
+    ) -> Result<Self, String> {
         Err("stable host aliases require the Darwin VM API".into())
     }
 
-    pub fn pointer(&self) -> NonNull<u8> {
+    /// Granule-aligned base address of the remapped alias for Vulkan host-pointer import.
+    pub fn page_pointer(&self) -> NonNull<u8> {
         // SAFETY: construction rejects address zero, and this value owns the mapping.
         unsafe { NonNull::new_unchecked(self.address as *mut u8) }
+    }
+
+    /// Granule-multiple byte length of the remapped alias for Vulkan host-pointer import.
+    pub fn page_length(&self) -> u64 {
+        self.length as u64
+    }
+
+    /// Byte offset from `page_pointer()` to the start of the requested caller range.
+    pub fn offset(&self) -> u64 {
+        self.offset as u64
+    }
+
+    /// Exact aliased pointer corresponding to the requested caller range.
+    pub fn pointer(&self) -> NonNull<u8> {
+        // SAFETY: `offset < length` and `address != 0`.
+        unsafe { NonNull::new_unchecked((self.address + self.offset) as *mut u8) }
     }
 
     pub fn is_writable(&self) -> bool {
@@ -124,7 +173,7 @@ mod tests {
             assert_ne!(original, libc::MAP_FAILED);
             std::ptr::write_bytes(original, 0x31, length);
             let alias =
-                HostMapping::alias(NonNull::new(original.cast::<u8>()).unwrap(), length as u64)
+                HostMapping::alias(NonNull::new(original.cast::<u8>()).unwrap(), length as u64, 1)
                     .unwrap();
             assert_eq!(libc::munmap(original, length), 0);
             let replacement = libc::mmap(
@@ -181,7 +230,7 @@ mod tests {
             std::ptr::write_bytes(original, 0x5a, length);
             assert_eq!(libc::mprotect(original, length, libc::PROT_READ), 0);
             let pointer = NonNull::new(original.cast::<u8>()).unwrap();
-            let alias = HostMapping::alias(pointer, length as u64).unwrap();
+            let alias = HostMapping::alias(pointer, length as u64, 1).unwrap();
             assert!(!alias.is_writable());
             assert_eq!(std::ptr::read_volatile(alias.pointer().as_ptr()), 0x5a);
             assert_eq!(libc::munmap(original, length), 0);
@@ -190,28 +239,88 @@ mod tests {
         }
     }
     #[test]
-    fn invalid_imports_reject_unreadable_and_unaligned_ranges() {
+    fn invalid_imports_reject_unreadable_empty_and_overflowing_ranges() {
         unsafe {
-            let length = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let region = libc::mmap(
+                std::ptr::null_mut(),
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(region, libc::MAP_FAILED);
+            assert_eq!(libc::mprotect(region.cast::<u8>().add(page).cast(), page, libc::PROT_NONE), 0);
+            let base = NonNull::new(region.cast::<u8>()).unwrap();
+            let guard_page = NonNull::new(region.cast::<u8>().add(page)).unwrap();
+            // Unreadable page rejected.
+            assert!(HostMapping::alias(guard_page, page as u64, 1).is_err());
+            // Unaligned range crossing from readable page into PROT_NONE page rejected.
+            assert!(HostMapping::alias(NonNull::new(base.as_ptr().add(page - 16)).unwrap(), 64, 1).is_err());
+            // Zero length and range overflow rejected.
+            assert!(HostMapping::alias(base, 0, 1).is_err());
+            assert!(HostMapping::alias(base, u64::MAX, 1).is_err());
+            assert_eq!(libc::munmap(region, page * 2), 0);
+        }
+    }
+
+    #[test]
+    fn unaligned_and_sub_page_alias_preserves_exact_bytes_and_offset() {
+        unsafe {
+            let page = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let original = libc::mmap(
                 std::ptr::null_mut(),
-                length,
-                libc::PROT_NONE,
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_ANON | libc::MAP_PRIVATE,
                 -1,
                 0,
             );
             assert_ne!(original, libc::MAP_FAILED);
-            let pointer = NonNull::new(original.cast::<u8>()).unwrap();
-            assert!(HostMapping::alias(pointer, length as u64).is_err());
-            assert!(
-                HostMapping::alias(
-                    NonNull::new(pointer.as_ptr().add(1)).unwrap(),
-                    length as u64
-                )
-                .is_err()
+            let bytes = std::slice::from_raw_parts_mut(original.cast::<u8>(), page * 2);
+            for (i, b) in bytes.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            // Sub-page length at page-aligned base.
+            let sub = HostMapping::alias(NonNull::new(original.cast::<u8>()).unwrap(), 256, 4096).unwrap();
+            assert_eq!(sub.offset(), 0);
+            assert_eq!(sub.page_length(), page as u64);
+            assert_eq!(sub.pointer().as_ptr(), sub.page_pointer().as_ptr());
+
+            // Unaligned pointer crossing page boundary.
+            let off = page - 64;
+            let len = 192usize;
+            let cross = HostMapping::alias(
+                NonNull::new(original.cast::<u8>().add(off)).unwrap(),
+                len as u64,
+                4096,
+            )
+            .unwrap();
+            assert_eq!(cross.offset(), off as u64);
+            assert_eq!(cross.page_length(), (page * 2) as u64);
+            assert_eq!((cross.page_pointer().as_ptr() as usize) % page, 0);
+
+            // Replace original mapping; alias keeps original bytes intact.
+            assert_eq!(libc::munmap(original, page * 2), 0);
+            let replacement = libc::mmap(
+                original,
+                page * 2,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
             );
-            assert_eq!(libc::munmap(original, length), 0);
+            assert_eq!(replacement, original);
+            std::ptr::write_bytes(replacement, 0xff, page * 2);
+
+            let aliased = std::slice::from_raw_parts(cross.pointer().as_ptr(), len);
+            for (i, &b) in aliased.iter().enumerate() {
+                assert_eq!(b, ((off + i) % 251) as u8);
+            }
+            drop(sub);
+            drop(cross);
+            assert_eq!(libc::munmap(replacement, page * 2), 0);
         }
     }
 }

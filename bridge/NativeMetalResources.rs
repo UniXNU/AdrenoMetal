@@ -275,31 +275,48 @@ impl Buffer {
         // Failed construction leaves ownership with the C caller.
         let pending = Arc::new(Mutex::new(None::<Box<dyn FnOnce() + Send>>));
         let freed = pending.clone();
-        // The GPU imports an alias, not the reusable virtual address the client gave.
-        // Read-only aliases stay read-only and are pinned read-only by the kernel driver.
-        // This mapping is released after Vulkan frees the imported memory.
-        let mapping = unsafe { crate::host_mapping::HostMapping::alias(pointer, length) }?;
-        if !mapping.is_writable() && options.storage_mode() == StorageMode::Managed {
-            return Err("read-only host pages require Shared storage".into());
-        }
-        let imported = mapping.pointer();
-        let read_only = !mapping.is_writable() || requested_read_only;
-        let callback = Box::new(move || {
-            let callback = freed.lock().unwrap_or_else(|e| e.into_inner()).take();
-            drop(mapping);
-            if let Some(callback) = callback {
-                callback();
+        // The GPU imports a granule-aligned alias covering the caller range, not the reusable
+        // virtual address the client gave. Read-only aliases stay read-only and are pinned
+        // read-only by the kernel driver. This mapping is released after Vulkan frees the import.
+        let mut min_align = 4096u64;
+        let (block, offset) = loop {
+            let mapping =
+                unsafe { crate::host_mapping::HostMapping::alias(pointer, length, min_align) }?;
+            if !mapping.is_writable() && options.storage_mode() == StorageMode::Managed {
+                return Err("read-only host pages require Shared storage".into());
             }
-        });
-        let (block, _) = if read_only {
-            // SAFETY: the ABI caller keeps these readable pages mapped until release runs;
-            // runtime write paths refuse writes and the kernel pins the pages read-only.
-            unsafe { device.import_read_only_host_memory(imported, length, Some(callback)) }
-        } else {
-            // SAFETY: the ABI caller keeps these readable and writable pages mapped until release runs.
-            unsafe { device.import_host_memory(imported, length, Some(callback)) }
-        }
-        .map_err(|e| format!("host-page import: {e:?}"))?;
+            let imported = mapping.page_pointer();
+            let imported_len = mapping.page_length();
+            let offset = mapping.offset();
+            let read_only = !mapping.is_writable() || requested_read_only;
+            let freed_cb = freed.clone();
+            let callback = Box::new(move || {
+                let callback = freed_cb.lock().unwrap_or_else(|e| e.into_inner()).take();
+                drop(mapping);
+                if let Some(callback) = callback {
+                    callback();
+                }
+            });
+            let attempt = if read_only {
+                // SAFETY: enclosing readable pages stay aliased until release runs;
+                // runtime write paths refuse writes and the kernel pins the pages read-only.
+                unsafe {
+                    device.import_read_only_host_memory(imported, imported_len, Some(callback))
+                }
+            } else {
+                // SAFETY: enclosing readable and writable pages stay aliased until release runs.
+                unsafe { device.import_host_memory(imported, imported_len, Some(callback)) }
+            };
+            match attempt {
+                Ok((block, _)) => break (block, offset),
+                Err(rt::Error::Limit(rt::Limit::ImportAlignment { alignment, .. }))
+                    if alignment > min_align && alignment.is_power_of_two() =>
+                {
+                    min_align = alignment;
+                }
+                Err(e) => return Err(format!("host-page import: {e:?}")),
+            }
+        };
         let mut blocks = vec![block];
         let raw = if options.storage_mode() == StorageMode::Managed {
             let copy = if device.has_unified_memory() {
@@ -312,9 +329,9 @@ impl Buffer {
                 );
                 Some((blocks[1].id, 0))
             };
-            device.new_managed_buffer((blocks[0].id, 0), copy, length, length)
+            device.new_managed_buffer((blocks[0].id, offset), copy, length, length)
         } else {
-            device.new_buffer(blocks[0].id, 0, length, None)
+            device.new_buffer(blocks[0].id, offset, length, None)
         }
         .map_err(|e| format!("import placement: {e:?}"))?;
         if let Some(release) = release {
