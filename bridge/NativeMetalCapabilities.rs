@@ -140,6 +140,9 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
             as u64,
         "supportsSIMDGroup" => (p.simd.kernel.cross_lane != OpBits::NONE) as u64,
         "supportsPrimitiveType:" => (arg <= 4) as u64,
+        "supportsTextureWriteRoundingMode:" => {
+            metal2vulkan::metal::TextureWriteRoundingMode::from_raw(arg).is_ok() as u64
+        }
         "supportsVertexAmplificationCount:" => (arg == 1) as u64,
         // Keep the frontend's existing OS compatibility families. No higher family is inferred from the Vulkan floor.
         "supportsFamily:" => [1001, 1002, 1003, 3001, 3002].contains(&arg) as u64,
