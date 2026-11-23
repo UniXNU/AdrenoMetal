@@ -6,10 +6,12 @@ use std::ptr::NonNull;
 pub struct HostMapping {
     address: usize,
     length: usize,
+    writable: bool,
 }
 
 impl HostMapping {
-    /// Alias the caller's writable, page-aligned range without copying its pages.
+    /// Alias the caller's readable, page-aligned range without copying its pages.
+    /// Read-only mappings stay read-only; the kernel pins and maps them read-only in SMMU.
     /// The caller must own and keep the range valid until this method returns.
     #[cfg(target_vendor = "apple")]
     pub unsafe fn alias(pointer: NonNull<u8>, length: u64) -> Result<Self, String> {
@@ -59,16 +61,17 @@ impl HostMapping {
         if status != 0 {
             return Err(format!("host import remap failed: {status}"));
         }
-        if current & 3 != 3 || address == 0 {
+        if current & 1 == 0 || address == 0 {
             // SAFETY: release only the alias this call created; never alter the caller's protection.
             unsafe {
                 mach_vm_deallocate(mach_task_self_, address, length);
             }
-            return Err("host import requires readable and writable pages".into());
+            return Err("host import requires readable pages".into());
         }
         Ok(Self {
             address: address as usize,
             length: length_usize,
+            writable: current & 2 != 0,
         })
     }
 
@@ -80,6 +83,10 @@ impl HostMapping {
     pub fn pointer(&self) -> NonNull<u8> {
         // SAFETY: construction rejects address zero, and this value owns the mapping.
         unsafe { NonNull::new_unchecked(self.address as *mut u8) }
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable
     }
 }
 
@@ -159,13 +166,37 @@ mod tests {
         }
     }
     #[test]
-    fn invalid_imports_do_not_upgrade_the_callers_permissions() {
+    fn read_only_alias_keeps_original_pages_without_upgrading_permissions() {
         unsafe {
             let length = libc::sysconf(libc::_SC_PAGESIZE) as usize;
             let original = libc::mmap(
                 std::ptr::null_mut(),
                 length,
-                libc::PROT_READ,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE,
+                -1,
+                0,
+            );
+            assert_ne!(original, libc::MAP_FAILED);
+            std::ptr::write_bytes(original, 0x5a, length);
+            assert_eq!(libc::mprotect(original, length, libc::PROT_READ), 0);
+            let pointer = NonNull::new(original.cast::<u8>()).unwrap();
+            let alias = HostMapping::alias(pointer, length as u64).unwrap();
+            assert!(!alias.is_writable());
+            assert_eq!(std::ptr::read_volatile(alias.pointer().as_ptr()), 0x5a);
+            assert_eq!(libc::munmap(original, length), 0);
+            assert_eq!(std::ptr::read_volatile(alias.pointer().as_ptr()), 0x5a);
+            drop(alias);
+        }
+    }
+    #[test]
+    fn invalid_imports_reject_unreadable_and_unaligned_ranges() {
+        unsafe {
+            let length = libc::sysconf(libc::_SC_PAGESIZE) as usize;
+            let original = libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_NONE,
                 libc::MAP_ANON | libc::MAP_PRIVATE,
                 -1,
                 0,
@@ -180,7 +211,6 @@ mod tests {
                 )
                 .is_err()
             );
-            assert_eq!(std::ptr::read_volatile(pointer.as_ptr()), 0);
             assert_eq!(libc::munmap(original, length), 0);
         }
     }

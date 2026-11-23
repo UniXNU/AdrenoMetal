@@ -267,16 +267,21 @@ impl Buffer {
         ) {
             return Err("no-copy buffers require Shared or Managed storage".into());
         }
-        if options.raw() & (1 << 24) != 0 {
-            return Err("read-only no-copy memory requires a protected import; runtime v2 has no read-only import".into());
+        let requested_read_only = options.raw() & (1 << 24) != 0;
+        if requested_read_only && options.storage_mode() == StorageMode::Managed {
+            return Err("read-only no-copy buffers require Shared storage".into());
         }
         // Arm the caller callback only after all fallible placement operations succeed.
         // Failed construction leaves ownership with the C caller.
         let pending = Arc::new(Mutex::new(None::<Box<dyn FnOnce() + Send>>));
         let freed = pending.clone();
         // The GPU imports an alias, not the reusable virtual address the client gave.
+        // Read-only aliases stay read-only and are pinned read-only by the kernel driver.
         // This mapping is released after Vulkan frees the imported memory.
         let mapping = unsafe { crate::host_mapping::HostMapping::alias(pointer, length) }?;
+        if !mapping.is_writable() && options.storage_mode() == StorageMode::Managed {
+            return Err("read-only host pages require Shared storage".into());
+        }
         let imported = mapping.pointer();
         let callback = Box::new(move || {
             let callback = freed.lock().unwrap_or_else(|e| e.into_inner()).take();
