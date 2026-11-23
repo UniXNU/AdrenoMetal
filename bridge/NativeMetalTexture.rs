@@ -123,16 +123,20 @@ impl Texture {
         descriptor: TextureDescriptor,
         device: rt::Device,
         lease: Arc<crate::heap::Lease>,
-        index: crate::ownership::Reservation,
+        index: Option<crate::ownership::Reservation>,
         backing_size: u64,
     ) -> Self {
         let backing = crate::ownership::Ownership::new(vec![lease.clone()]);
+        let mut owners: Vec<crate::ownership::Owner> = vec![backing.clone()];
+        if let Some(index) = index {
+            owners.push(index.owner());
+        }
         Self {
             raw,
             descriptor,
             device,
             state: Arc::new(AtomicU64::new(2)),
-            ownership: crate::ownership::Ownership::new(vec![backing.clone(), index.owner()]),
+            ownership: crate::ownership::Ownership::new(owners),
             backing,
             backing_size,
             lease: Some(lease),
@@ -152,16 +156,22 @@ impl Texture {
             .is_some_and(|lease| lease.is_aliasable())
     }
     pub fn allocate(device: &rt::Device, descriptor: &TextureDescriptor) -> Result<Self, String> {
-        let index = crate::ownership::reserve(device, rt::IndexClass::Texture)?;
+        let runtime = descriptor.runtime()?;
+        let index = if texture_needs_index(runtime.pixel_format, runtime.usage) {
+            Some(crate::ownership::reserve(device, rt::IndexClass::Texture)?)
+        } else {
+            None
+        };
         let raw = device
-            .new_texture(&descriptor.runtime()?, Some(index.index()))
+            .new_texture(&runtime, index.as_ref().map(|r| r.index()))
             .map_err(|e| format!("texture: {e:?}"))?;
+        let owners = index.into_iter().map(|r| r.owner()).collect();
         Ok(Self {
             raw,
             descriptor: descriptor.clone(),
             device: device.clone(),
             state: Arc::new(AtomicU64::new(2)),
-            ownership: crate::ownership::Ownership::new(vec![index.owner()]),
+            ownership: crate::ownership::Ownership::new(owners),
             backing: crate::ownership::Ownership::new(vec![]),
             backing_size: allocation_size(device, descriptor),
             lease: None,
@@ -227,21 +237,31 @@ impl Texture {
         bytes_per_row: u64,
     ) -> Result<Self, String> {
         let device = buffer.device();
-        let index = crate::ownership::reserve(device, rt::IndexClass::Texture)?;
+        let runtime = descriptor.runtime()?;
+        let index = if texture_needs_index(runtime.pixel_format, runtime.usage) {
+            Some(crate::ownership::reserve(device, rt::IndexClass::Texture)?)
+        } else {
+            None
+        };
         let raw = (**buffer)
             .new_texture(
-                &descriptor.runtime()?,
-                Some(index.index()),
+                &runtime,
+                index.as_ref().map(|r| r.index()),
                 offset,
                 bytes_per_row,
             )
             .map_err(|e| format!("texture over buffer: {e:?}"))?;
+        let mut owners: Vec<crate::ownership::Owner> = Vec::with_capacity(2);
+        if let Some(index) = index {
+            owners.push(index.owner());
+        }
+        owners.push(buffer.ownership.clone());
         Ok(Self {
             raw,
             descriptor: descriptor.clone(),
             device: device.clone(),
             state: Arc::new(AtomicU64::new(2)),
-            ownership: crate::ownership::Ownership::new(vec![index.owner(), buffer.ownership.clone()]),
+            ownership: crate::ownership::Ownership::new(owners),
             backing_size: buffer.length(),
             backing: crate::ownership::Ownership::new(vec![buffer.ownership.clone()]),
             lease: None,
@@ -299,7 +319,11 @@ impl Texture {
             format
         };
         let narrow = |v| u32::try_from(v).map_err(|_| "texture view range exceeds u32".to_owned());
-        let index = crate::ownership::reserve(&self.device, rt::IndexClass::Texture)?;
+        let index = if texture_needs_index(runtime_format, self.raw.descriptor().usage) {
+            Some(crate::ownership::reserve(&self.device, rt::IndexClass::Texture)?)
+        } else {
+            None
+        };
         let raw = self
             .raw
             .new_texture_view_with_swizzle(
@@ -308,7 +332,7 @@ impl Texture {
                 narrow(levels.start)?..narrow(levels.end)?,
                 narrow(slices.start)?..narrow(slices.end)?,
                 swizzle,
-                Some(index.index()),
+                index.as_ref().map(|r| r.index()),
             )
             .map_err(|e| format!("texture view: {e:?}"))?;
         let runtime = raw.descriptor();
@@ -326,12 +350,17 @@ impl Texture {
         descriptor.array_length = runtime.array_length as u64;
         descriptor.mipmap_level_count = runtime.mipmap_level_count as u64;
         descriptor.swizzle = runtime.swizzle;
+        let mut owners: Vec<crate::ownership::Owner> = Vec::with_capacity(2);
+        if let Some(index) = index {
+            owners.push(index.owner());
+        }
+        owners.push(self.backing.clone());
         Ok(Self {
             raw,
             descriptor,
             device: self.device.clone(),
             state: self.state.clone(),
-            ownership: crate::ownership::Ownership::new(vec![index.owner(), self.backing.clone()]),
+            ownership: crate::ownership::Ownership::new(owners),
             backing: self.backing.clone(),
             backing_size: self.backing_size,
             lease: self.lease.clone(),
@@ -416,6 +445,23 @@ fn allocation_size(device: &rt::Device, descriptor: &TextureDescriptor) -> u64 {
     }).bytes.saturating_mul(descriptor.sample_count)).fold(0, u64::saturating_add)
 }
 
+/// Matches `metal2vulkan-runtime` texture reachability (`reached(pf, effective_usage)`):
+/// empty usage (`MTLTextureUsageUnknown`) expands to `SHADER_READ | SHADER_WRITE | RENDER_TARGET | PIXEL_FORMAT_VIEW`,
+/// and depth/stencil render-target-only textures take no descriptor-set index.
+pub(crate) fn texture_needs_index(pixel_format: PixelFormat, usage: TextureUsage) -> bool {
+    let effective = if usage.is_empty() {
+        TextureUsage::SHADER_READ
+            | TextureUsage::SHADER_WRITE
+            | TextureUsage::RENDER_TARGET
+            | TextureUsage::PIXEL_FORMAT_VIEW
+    } else {
+        usage
+    };
+    effective.intersects(TextureUsage::SHADER_READ | TextureUsage::SHADER_WRITE)
+        || (effective.contains(TextureUsage::RENDER_TARGET)
+            && !metal2vulkan::metal::format::is_depth_stencil(pixel_format))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +474,40 @@ mod tests {
         assert_eq!(desc.resource_options.storage_mode(), StorageMode::Memoryless);
         let runtime = desc.runtime().unwrap();
         assert_eq!(runtime.storage_mode, rt::StorageMode::Private);
+    }
+
+    #[test]
+    fn depth_stencil_render_target_only_takes_no_texture_index() {
+        for pf in [
+            PixelFormat::Depth32FloatStencil8,
+            PixelFormat::Depth32Float,
+            PixelFormat::Depth16Unorm,
+            PixelFormat::Stencil8,
+            PixelFormat::Depth24UnormStencil8,
+            PixelFormat::X32Stencil8,
+            PixelFormat::X24Stencil8,
+        ] {
+            assert!(!texture_needs_index(pf, TextureUsage::RENDER_TARGET), "{pf:?}");
+            assert!(
+                !texture_needs_index(pf, TextureUsage::RENDER_TARGET | TextureUsage::PIXEL_FORMAT_VIEW),
+                "{pf:?}"
+            );
+            assert!(
+                texture_needs_index(pf, TextureUsage::RENDER_TARGET | TextureUsage::SHADER_READ),
+                "{pf:?}"
+            );
+            assert!(texture_needs_index(pf, TextureUsage::empty()), "{pf:?}");
+        }
+    }
+
+    #[test]
+    fn colour_render_target_and_shader_usages_require_texture_index() {
+        for pf in [PixelFormat::BGRA8Unorm, PixelFormat::RGBA16Float, PixelFormat::RG16Float] {
+            assert!(texture_needs_index(pf, TextureUsage::RENDER_TARGET), "{pf:?}");
+            assert!(texture_needs_index(pf, TextureUsage::SHADER_READ), "{pf:?}");
+            assert!(texture_needs_index(pf, TextureUsage::SHADER_WRITE), "{pf:?}");
+            assert!(texture_needs_index(pf, TextureUsage::empty()), "{pf:?}");
+            assert!(!texture_needs_index(pf, TextureUsage::PIXEL_FORMAT_VIEW), "{pf:?}");
+        }
     }
 }

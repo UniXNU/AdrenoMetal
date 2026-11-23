@@ -297,11 +297,15 @@ impl Heap {
             .heap_texture_size_and_align(&d)
             .map_err(|e| format!("heap texture size: {e:?}"))?;
         let (lease, offset) = self.place(requirement, offset)?;
-        let index = crate::ownership::reserve(&self.0.device, rt::IndexClass::Texture)?;
+        let index = if crate::texture::texture_needs_index(d.pixel_format, d.usage) {
+            Some(crate::ownership::reserve(&self.0.device, rt::IndexClass::Texture)?)
+        } else {
+            None
+        };
         let raw = self
             .0
             .device
-            .new_heap_texture(&d, Some(index.index()), self.range(), offset)
+            .new_heap_texture(&d, index.as_ref().map(|r| r.index()), self.range(), offset)
             .map_err(|e| format!("heap texture: {e:?}"))?;
         Ok(Texture::placed(
             raw,
