@@ -1,0 +1,436 @@
+diff --git a/crates/metal2vulkan-runtime/src/blit.rs b/crates/metal2vulkan-runtime/src/blit.rs
+index f051c990..dc33cd72 100644
+--- a/crates/metal2vulkan-runtime/src/blit.rs
++++ b/crates/metal2vulkan-runtime/src/blit.rs
+@@ -200,6 +200,9 @@ impl BlitCommandEncoder {
+         if !source.is_of(core) || !destination.is_of(core) {
+             return Err(Error::Refused(Refusal::OtherDevice));
+         }
++        if destination.is_over_read_only_buffer() {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         // A texture buffer's texels are its buffer's bytes, which no image copy reaches.
+         if source.texels() || destination.texels() {
+             return Err(Error::Unsupported(Gap::TextureCopy {
+@@ -423,6 +426,9 @@ impl BlitCommandEncoder {
+         if !source.is_of(core) || !destination.is_of(core) {
+             return Err(Error::Refused(Refusal::OtherDevice));
+         }
++        if destination.is_read_only() {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         // A Managed buffer's GPU side is its device copy, where it has one.
+         let span = |buffer: &Buffer| {
+             let (buffer_of, base) = buffer.device_range();
+@@ -496,6 +502,11 @@ impl BlitCommandEncoder {
+         if !texture.is_of(&self.core) || !buffer.is_of(&self.core) {
+             return Err(Error::Refused(Refusal::OtherDevice));
+         }
++        if (!into_image && buffer.is_read_only())
++            || (into_image && texture.is_over_read_only_buffer())
++        {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         // A texture buffer's texels are its buffer's bytes, which no image copy reaches.
+         if texture.texels() {
+             return Err(Error::Unsupported(Gap::TextureBytes {
+@@ -664,6 +675,9 @@ impl BlitCommandEncoder {
+         if !buffer.is_of(core) {
+             return Err(Error::Refused(Refusal::OtherDevice));
+         }
++        if buffer.is_read_only() {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         let (vk_buffer, base) = buffer.device_range();
+         let (offset, length) = fill_range(base, buffer.length(), range)?;
+         building.keep(buffer);
+@@ -801,6 +815,9 @@ impl BlitCommandEncoder {
+         if !texture.is_of(core) {
+             return Err(Error::Refused(Refusal::OtherDevice));
+         }
++        if texture.is_over_read_only_buffer() {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         let d = *texture.descriptor();
+         let pixel_format = d.pixel_format;
+         if d.mipmap_level_count < 2 {
+diff --git a/crates/metal2vulkan-runtime/src/buffer.rs b/crates/metal2vulkan-runtime/src/buffer.rs
+index 5fe3ff9b..e46f0c38 100644
+--- a/crates/metal2vulkan-runtime/src/buffer.rs
++++ b/crates/metal2vulkan-runtime/src/buffer.rs
+@@ -240,6 +240,9 @@ impl Device {
+             }));
+         }
+         let block = self.placed(block, offset, length)?;
++        if block.memory.read_only && zero_from.is_some_and(|from| from < length) {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         // A block the host does not map (Private, or an imported dma-buf) is zeroed by a GPU fill.
+         if block.memory.mapping.is_none() && zero_from.is_some_and(|from| from < length) {
+             crate::command::not_in_scheduled_handler()?;
+@@ -333,6 +336,9 @@ impl Device {
+         }
+         let (block, offset) = bytes;
+         let block = self.placed(block, offset, length)?;
++        if block.memory.read_only {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         if block.memory.class == MemoryClass::Private {
+             return Err(Error::Refused(Refusal::ManagedBlockPrivate {
+                 block: block.memory.id,
+@@ -417,6 +423,9 @@ impl Device {
+                 length,
+                 block_len,
+             }))?;
++        if block.memory.read_only && length > 0 {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         if block.memory.class != MemoryClass::Private {
+             return Err(Error::Refused(Refusal::ZeroRangeShared {
+                 block: block.memory.id,
+@@ -529,6 +538,11 @@ impl Buffer {
+         BufferObject::contents(self)
+     }
+ 
++    /// Whether the buffer lies in a read-only imported host-memory block.
++    pub fn is_read_only(&self) -> bool {
++        BufferObject::is_read_only(self)
++    }
++
+     /// No Metal counterpart: the block the buffer is in.
+     pub fn block(&self) -> BlockId {
+         self.inner.block.memory.id
+@@ -569,6 +583,9 @@ pub(crate) trait BufferObject {
+     /// [`Buffer::did_modify_range`].
+     fn did_modify_range(&self, start: u64, length: u64) -> Result<(), Error> {
+         let inner = self.object();
++        if inner.block.memory.read_only {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         let end = (start.checked_add(length))
+             .filter(|&end| end <= inner.length)
+             .ok_or(Error::Refused(Refusal::ModifiedRange {
+@@ -592,6 +609,11 @@ pub(crate) trait BufferObject {
+         self.object().contents.map(Mapping::get)
+     }
+ 
++    /// Whether the buffer lies in a read-only imported host-memory block.
++    fn is_read_only(&self) -> bool {
++        self.object().block.memory.read_only
++    }
++
+     /// Whether shaders reach the buffer in Shared memory, which the host reads.
+     fn is_shared(&self) -> bool {
+         let inner = self.object();
+diff --git a/crates/metal2vulkan-runtime/src/encoder.rs b/crates/metal2vulkan-runtime/src/encoder.rs
+index bda77446..649fb593 100644
+--- a/crates/metal2vulkan-runtime/src/encoder.rs
++++ b/crates/metal2vulkan-runtime/src/encoder.rs
+@@ -734,12 +734,16 @@ impl ComputeCommandEncoder {
+         resource: Resource<'_>,
+         usage: ResourceUsage,
+     ) -> Result<(), Error> {
++        let writes = usage.access().is_some_and(Access::writes);
+         let building = self.building();
+         let (id, shared, unstored, texture, span) = match resource {
+             Resource::Buffer(buffer) => {
+                 if !buffer.is_of(building.device.core()) {
+                     return Err(Error::Refused(Refusal::OtherDevice));
+                 }
++                if writes && buffer.is_read_only() {
++                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++                }
+                 building.keep(buffer);
+                 (
+                     [buffer.id(), buffer.tracked_id()],
+@@ -753,6 +757,9 @@ impl ComputeCommandEncoder {
+                 if !texture.is_of(building.device.core()) {
+                     return Err(Error::Refused(Refusal::OtherDevice));
+                 }
++                if writes && texture.is_over_read_only_buffer() {
++                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++                }
+                 // SAFETY: the encoder's declarations hold the borrow, and they end before its
+                 // command buffer commits.
+                 let lent = unsafe { building.lend_texture(texture) };
+diff --git a/crates/metal2vulkan-runtime/src/error.rs b/crates/metal2vulkan-runtime/src/error.rs
+index a5689014..45f62b61 100644
+--- a/crates/metal2vulkan-runtime/src/error.rs
++++ b/crates/metal2vulkan-runtime/src/error.rs
+@@ -102,6 +102,11 @@ pub enum Refusal {
+     ///
+     /// Basis: metal-measured (an Apple M3 Max: newBufferWithLength:0 answers nil).
+     EmptyBuffer,
++    /// A write, zero, or writable view requested on a block or buffer imported via
++    /// [`Device::import_read_only_host_memory`](crate::Device::import_read_only_host_memory).
++    ///
++    /// Basis: ours (read-only host pages cannot be written through runtime write paths).
++    ReadOnlyBuffer,
+     /// A buffer longer than [`MAX_BUFFER_LENGTH`](crate::MAX_BUFFER_LENGTH)
+     /// ([`Device::new_buffer`](crate::Device::new_buffer)): a shader reaches a buffer argument's
+     /// bytes by 32-bit offsets from its bind address, which the translator may read as signed.
+@@ -2218,6 +2223,7 @@ impl fmt::Display for Refusal {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+             Refusal::EmptyBuffer => f.write_str("Metal makes no buffer of length 0"),
++            Refusal::ReadOnlyBuffer => f.write_str("cannot write to a read-only host-memory buffer"),
+             Refusal::BufferTooLong { length, max } => {
+                 write!(f, "a buffer of {length} bytes is longer than {max}")
+             }
+diff --git a/crates/metal2vulkan-runtime/src/error/basis.rs b/crates/metal2vulkan-runtime/src/error/basis.rs
+index 525d52f2..a9a0d117 100644
+--- a/crates/metal2vulkan-runtime/src/error/basis.rs
++++ b/crates/metal2vulkan-runtime/src/error/basis.rs
+@@ -9,6 +9,7 @@ impl Refusal {
+     pub fn basis(self) -> RefusalBasis {
+         match self {
+             Refusal::EmptyBuffer => RefusalBasis::MetalMeasured,
++            Refusal::ReadOnlyBuffer => RefusalBasis::Ours,
+             Refusal::BufferTooLong { .. } => RefusalBasis::Ours,
+             Refusal::BufferPastBlock { .. } => RefusalBasis::MetalMeasured,
+             Refusal::HeapBufferPlace { .. } => RefusalBasis::MetalMeasured,
+diff --git a/crates/metal2vulkan-runtime/src/import.rs b/crates/metal2vulkan-runtime/src/import.rs
+index 4f43da91..000f1136 100644
+--- a/crates/metal2vulkan-runtime/src/import.rs
++++ b/crates/metal2vulkan-runtime/src/import.rs
+@@ -517,7 +517,7 @@ impl Device {
+             handle,
+             memory_type: index,
+         };
+-        match unsafe { memory::import(core, &info, handle.vk(), None, own) } {
++        match unsafe { memory::import(core, &info, handle.vk(), None, false, own) } {
+             Ok(memory) => Ok((claim(core, memory, release), index)),
+             Err(ImportFailed::Before(error)) => {
+                 // Nothing was imported, so the fd is still ours: closed, where it is still the
+@@ -803,6 +803,40 @@ impl Device {
+         pointer: NonNull<u8>,
+         len: u64,
+         release: Option<Box<dyn FnOnce() + Send>>,
++    ) -> Result<(Block, u32), Error> {
++        // SAFETY: the caller guarantees `pointer` is mapped readable and writable until `release` runs.
++        unsafe { self.import_host_memory_inner(pointer, len, false, release) }
++    }
++
++    /// Like [`Device::import_host_memory`], for host pages that are mapped readable only.
++    ///
++    /// The returned block carries no runtime host mapping (`Buffer::contents` returns `None`),
++    /// and runtime write paths (zeroing, Managed placement, `did_modify_range`, blit writes,
++    /// writable textures over the buffer, visibility result writes, and encoder `WRITE` usage)
++    /// refuse the block with [`Refusal::ReadOnlyBuffer`](crate::Refusal::ReadOnlyBuffer).
++    ///
++    /// # Safety
++    ///
++    /// The `len` bytes at `pointer` are host memory mapped readable (they need not be writable),
++    /// and stay mapped, and not mapped anew, until `release` runs; where the call returns `Err`,
++    /// they are the consumer's again at once. Shaders bound to buffers placed in this block
++    /// must only read from it.
++    pub unsafe fn import_read_only_host_memory(
++        &self,
++        pointer: NonNull<u8>,
++        len: u64,
++        release: Option<Box<dyn FnOnce() + Send>>,
++    ) -> Result<(Block, u32), Error> {
++        // SAFETY: the caller guarantees `pointer` is mapped readable until `release` runs.
++        unsafe { self.import_host_memory_inner(pointer, len, true, release) }
++    }
++
++    unsafe fn import_host_memory_inner(
++        &self,
++        pointer: NonNull<u8>,
++        len: u64,
++        read_only: bool,
++        release: Option<Box<dyn FnOnce() + Send>>,
+     ) -> Result<(Block, u32), Error> {
+         let core = self.core();
+         let handle = ImportHandle::HostMemory;
+@@ -856,12 +890,14 @@ impl Device {
+             .push_next(&mut flags);
+         // SAFETY: an import of the caller's memory, at the device's alignment, into a type its
+         // query offered and its buffers can use.
++        let mapping = (!read_only).then(|| Mapping::new(pointer));
+         let memory = unsafe {
+             memory::import(
+                 core,
+                 &info,
+                 handle.vk(),
+-                Some(Mapping::new(pointer)),
++                mapping,
++                read_only,
+                 Own::Import {
+                     handle,
+                     memory_type: index,
+@@ -925,7 +961,7 @@ pub(crate) fn surface_import(
+     let own = Own::Surface { import: true };
+     // SAFETY: an import of the dma-buf into a type its query offered, its buffers list and its
+     // planes' imports took, of at least the buffer's size.
+-    match unsafe { memory::import(core, &info, handle.vk(), None, own) } {
++    match unsafe { memory::import(core, &info, handle.vk(), None, false, own) } {
+         Ok(memory) => Ok(memory::Block::new(memory, Arc::clone(core))),
+         Err(ImportFailed::Before(error)) => {
+             // Nothing was imported, so the duplicate is still ours: closed, where it is still
+diff --git a/crates/metal2vulkan-runtime/src/memory.rs b/crates/metal2vulkan-runtime/src/memory.rs
+index 4d578e38..f15cf557 100644
+--- a/crates/metal2vulkan-runtime/src/memory.rs
++++ b/crates/metal2vulkan-runtime/src/memory.rs
+@@ -341,6 +341,7 @@ pub(crate) struct Memory {
+     /// The device address of the block's first byte.
+     pub(crate) address: u64,
+     pub(crate) mapping: Option<Mapping>,
++    pub(crate) read_only: bool,
+     /// Its memory type is device-local.
+     device_local: bool,
+     /// A Private block in another memory type than the Private one, which was out of memory.
+@@ -869,6 +870,7 @@ impl Carve {
+             buffer: self.buffer,
+             address: self.address,
+             mapping: self.mapping,
++            read_only: false,
+             device_local: self.device_local,
+             spilled: self.spilled,
+             own: None,
+@@ -2109,6 +2111,7 @@ pub(crate) unsafe fn import(
+     info: &vk::MemoryAllocateInfo<'_>,
+     handle: vk::ExternalMemoryHandleTypeFlags,
+     mapping: Option<Mapping>,
++    read_only: bool,
+     own: Own,
+ ) -> Result<Memory, ImportFailed> {
+     let device = &core.device;
+@@ -2179,6 +2182,7 @@ pub(crate) unsafe fn import(
+         buffer,
+         address,
+         mapping,
++        read_only,
+         device_local: core.device_local & (1 << info.memory_type_index) != 0,
+         spilled: false,
+         own: Some(own),
+@@ -2306,6 +2310,7 @@ pub(crate) fn sparse_block(
+             buffer,
+             address,
+             mapping: None,
++            read_only: false,
+             device_local,
+             spilled: false,
+             own: Some(own),
+@@ -2435,6 +2440,7 @@ pub(crate) unsafe fn export(
+         buffer,
+         address,
+         mapping: None,
++        read_only: false,
+         device_local: core.device_local & (1 << index) != 0,
+         spilled: false,
+         own: Some(Own::Export {
+@@ -2502,6 +2508,7 @@ pub(crate) unsafe fn export_surface(
+         buffer: vk::Buffer::null(),
+         address: 0,
+         mapping: None,
++        read_only: false,
+         device_local: core.device_local & (1 << index) != 0,
+         spilled: false,
+         own: Some(Own::Export { handle, bytes: len }),
+@@ -2593,6 +2600,7 @@ pub(crate) unsafe fn surface_view(
+         buffer,
+         address,
+         mapping: None,
++        read_only: false,
+         device_local: under.memory.device_local,
+         spilled: false,
+         own: Some(Own::Surface { import: false }),
+diff --git a/crates/metal2vulkan-runtime/src/render_encoder.rs b/crates/metal2vulkan-runtime/src/render_encoder.rs
+index 4d1e36af..c1a693a2 100644
+--- a/crates/metal2vulkan-runtime/src/render_encoder.rs
++++ b/crates/metal2vulkan-runtime/src/render_encoder.rs
+@@ -793,6 +793,15 @@ fn begin(
+     descriptor: &RenderPassDescriptor,
+ ) -> Result<(Pass, vk::CommandBuffer, Option<Visibility>), Error> {
+     let pass = Pass::check(core, descriptor)?;
++    if descriptor
++        .visibility_result_buffer
++        .as_ref()
++        .is_some_and(|b| b.is_read_only())
++        || pass.targets().any(|t| t.texture.is_over_read_only_buffer())
++        || (pass.resolving && pass.resolves().any(|r| r.texture.is_over_read_only_buffer()))
++    {
++        return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++    }
+     // The attachments, and where the pass resolves the resolve textures, which the pass writes:
+     // a pass that resolves nothing walks no resolve.
+     let resolves = || {
+@@ -1891,12 +1900,16 @@ impl RenderCommandEncoder {
+         resource: Resource<'_>,
+         usage: ResourceUsage,
+     ) -> Result<(), Error> {
++        let writes = usage.access().is_some_and(Access::writes);
+         let building = self.building();
+         let (id, host, unstored, texture, span) = match resource {
+             Resource::Buffer(buffer) => {
+                 if !buffer.is_of(building.device.core()) {
+                     return Err(Error::Refused(Refusal::OtherDevice));
+                 }
++                if writes && buffer.is_read_only() {
++                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++                }
+                 building.keep(buffer);
+                 let id = [buffer.id(), buffer.tracked_id()];
+                 (id, buffer.is_shared(), None, None, Some(buffer.span()))
+@@ -1905,6 +1918,9 @@ impl RenderCommandEncoder {
+                 if !texture.is_of(building.device.core()) {
+                     return Err(Error::Refused(Refusal::OtherDevice));
+                 }
++                if writes && texture.is_over_read_only_buffer() {
++                    return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++                }
+                 // SAFETY: the encoder's declarations hold the borrow, and they end before its
+                 // command buffer commits.
+                 let lent = unsafe { building.lend_texture(texture) };
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index 7101adc1..8a112e53 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -4027,6 +4027,10 @@ impl Texture {
+     /// returns.
+     ///
+     /// [`Metrics::bytes_copied`]: crate::Metrics::bytes_copied
++    pub(crate) fn is_over_read_only_buffer(&self) -> bool {
++        self.inner.over().is_some_and(|b| b.is_read_only())
++    }
++
+     pub fn replace_region(
+         &self,
+         region: Region,
+@@ -4037,6 +4041,9 @@ impl Texture {
+         bytes_per_image: u64,
+     ) -> Result<(), Error> {
+         crate::command::not_in_scheduled_handler()?;
++        if self.is_over_read_only_buffer() {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         let inner = &self.inner;
+         let len = bytes.len() as u64;
+         let Some(copy) = inner.copy(region, level, slice, len, bytes_per_row, bytes_per_image)?
+@@ -4829,6 +4836,11 @@ pub(crate) trait TextureObject {
+         }
+     }
+ 
++    /// Whether it is a texture backed by a read-only imported host-memory buffer.
++    fn is_over_read_only_buffer(&self) -> bool {
++        self.object().over().is_some_and(|b| b.is_read_only())
++    }
++
+     /// Whether it is a texture over a buffer of no device copy in an image of its own, which the
+     /// submissions copy into and back by the Shared rules (`crate::over`): its form and its
+     /// buffer's, read, nothing worked out.
+@@ -5054,6 +5066,13 @@ impl Buffer {
+         offset: u64,
+         bytes_per_row: u64,
+     ) -> Result<Texture, Error> {
++        if self.is_read_only()
++            && descriptor
++                .usage
++                .intersects(TextureUsage::SHADER_WRITE | TextureUsage::RENDER_TARGET)
++        {
++            return Err(Error::Refused(Refusal::ReadOnlyBuffer));
++        }
+         let mut d = *descriptor;
+         d.storage_mode = match self.held() {
+             (_, Some(_)) => StorageMode::Managed,

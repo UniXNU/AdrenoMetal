@@ -290,9 +290,16 @@ impl Buffer {
                 callback();
             }
         });
-        // SAFETY: the ABI caller owns the mapping until the runtime releases its import.
-        let (block, _) = unsafe { device.import_host_memory(imported, length, Some(callback)) }
-            .map_err(|e| format!("host-page import: {e:?}"))?;
+        let read_only = !mapping.is_writable() || requested_read_only;
+        let (block, _) = if read_only {
+            // SAFETY: the ABI caller keeps these readable pages mapped until release runs;
+            // runtime write paths refuse writes and the kernel pins the pages read-only.
+            unsafe { device.import_read_only_host_memory(imported, length, Some(callback)) }
+        } else {
+            // SAFETY: the ABI caller keeps these readable and writable pages mapped until release runs.
+            unsafe { device.import_host_memory(imported, length, Some(callback)) }
+        }
+        .map_err(|e| format!("host-page import: {e:?}"))?;
         let mut blocks = vec![block];
         let raw = if options.storage_mode() == StorageMode::Managed {
             let copy = if device.has_unified_memory() {
