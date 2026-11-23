@@ -1040,8 +1040,13 @@ static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeabl
  return before;
 }
 
-@implementation NBObject
+static std::atomic<uint64_t> gNextTraceObjectID{1};
+@implementation NBObject { uint64_t _traceObjectID; }
 - (id<MTLDevice>)device {return gDeviceObject;}
+- (uint64_t)globalTraceObjectID {
+ if(!_traceObjectID)_traceObjectID=gNextTraceObjectID.fetch_add(1,std::memory_order_relaxed);
+ return _traceObjectID;
+}
 - (BOOL)purgeHold:(BOOL)hold {(void)hold;return NO;}
 - (BOOL)keepForCommand:(NmbCommandBuffer *)command {(void)command;return YES;}
 - (NSMethodSignature *)methodSignatureForSelector:(SEL)selector {
@@ -1425,7 +1430,7 @@ NB_RESOURCE_SPI
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);[view countUse];}
+ if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);view.surfacePlane=_surfacePlane;[view countUse];}
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
@@ -1806,8 +1811,12 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
   journal(head+std::string(name.UTF8String?:"?")+" k="+text+(handle?std::string():" err="+std::string(lastError().UTF8String?:"?"))+" | "+quartzCoreCallers());
  }
  if(!handle){
-  noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
-  if(error)*error=functionLookupError(self,name,[NSString stringWithFormat:@"specialized function: %@",lastError()]);
+  NSString *detail=[NSString stringWithFormat:@"specialized function: %@",lastError()];
+  NSError *lookupErr=functionLookupError(self,name,detail);
+  if(!(lookupErr.domain==MTLLibraryErrorDomain && lookupErr.code==MTLLibraryErrorFunctionNotFound)) {
+   noteProblem([NSString stringWithFormat:@"specialized function %@: %@",name,lastError()]);
+  }
+  if(error)*error=lookupErr;
   return nil;
  }
  NBFunction *function=[NBFunction new];function.handle=handle;function.name=name;function.sourceName=name;function.functionType=(MTLFunctionType)nmb_function_type(handle);

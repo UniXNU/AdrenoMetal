@@ -144,10 +144,9 @@ impl Texture {
         }
     }
     pub fn make_aliasable(&self) -> Result<(), String> {
-        self.lease
-            .as_ref()
-            .ok_or("only heap resources can be made aliasable")?
-            .make_aliasable();
+        if let Some(lease) = &self.lease {
+            lease.make_aliasable();
+        }
         Ok(())
     }
     pub fn is_aliasable(&self) -> bool {

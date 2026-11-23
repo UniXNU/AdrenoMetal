@@ -2388,13 +2388,34 @@ pub struct NmbSamplerDescriptor {
     pub lod_max: f32,
 }
 
+/// Turnip has no VK_EXT_filter_cubic and supportsFloat16BCubicFiltering is false;
+/// map cubic sampler requests to linear so CoreImage/Dock clients never abort on nil samplers.
+fn resolve_sampler_filter(filter: SamplerMinMagFilter) -> SamplerMinMagFilter {
+    match filter {
+        SamplerMinMagFilter::Cubic => SamplerMinMagFilter::Linear,
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod sampler_filter_tests {
+    use super::*;
+
+    #[test]
+    fn cubic_sampler_filter_falls_back_to_linear() {
+        assert_eq!(resolve_sampler_filter(SamplerMinMagFilter::Nearest), SamplerMinMagFilter::Nearest);
+        assert_eq!(resolve_sampler_filter(SamplerMinMagFilter::Linear), SamplerMinMagFilter::Linear);
+        assert_eq!(resolve_sampler_filter(SamplerMinMagFilter::Cubic), SamplerMinMagFilter::Linear);
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_sampler_new(device: *mut NmbDevice, descriptor: *const NmbSamplerDescriptor) -> *mut NmbSampler {
     guard(std::ptr::null_mut(), || {
         let d = get(descriptor)?;
         let mut out = SamplerDescriptor::new();
-        out.min_filter = raw::<SamplerMinMagFilter>(d.min_filter, "min filter")?;
-        out.mag_filter = raw::<SamplerMinMagFilter>(d.mag_filter, "mag filter")?;
+        out.min_filter = resolve_sampler_filter(raw::<SamplerMinMagFilter>(d.min_filter, "min filter")?);
+        out.mag_filter = resolve_sampler_filter(raw::<SamplerMinMagFilter>(d.mag_filter, "mag filter")?);
         out.mip_filter = raw::<SamplerMipFilter>(d.mip_filter, "mip filter")?;
         out.s_address_mode = raw::<SamplerAddressMode>(d.s_address, "address mode")?;
         out.t_address_mode = raw::<SamplerAddressMode>(d.t_address, "address mode")?;
