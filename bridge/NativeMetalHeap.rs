@@ -143,6 +143,13 @@ impl Drop for Lease {
 #[derive(Clone)]
 pub struct Heap(Arc<Inner>);
 impl Heap {
+    pub(crate) fn block_id_on(&self, device: &rt::Device) -> Result<rt::BlockId, String> {
+        if !std::ptr::eq(self.0.device.raw().device, device.raw().device) {
+            return Err("heap belongs to another runtime device".into());
+        }
+        Ok(self.0.block.id)
+    }
+
     pub fn new(device: &rt::Device, descriptor: &HeapDescriptor) -> Result<Self, String> {
         if descriptor.kind == HeapType::Sparse || descriptor.size == 0 {
             return Err("sparse or empty heap is not supported".into());

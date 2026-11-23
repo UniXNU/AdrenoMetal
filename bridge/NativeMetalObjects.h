@@ -350,6 +350,7 @@ bool nmb_command_buffer_on_completed(NmbCommandBuffer *, void (*handler)(void *c
  * The caller keeps context alive until completion (or a refused commit). */
 bool nmb_command_buffer_on_scheduled(NmbCommandBuffer *, void (*handler)(void *context), void *context);
 bool nmb_command_buffer_commit(NmbCommandBuffer *);
+bool nmb_command_buffer_enqueue(NmbCommandBuffer *);
 /* Wait for scheduling and scheduled handlers only; false on a refused wait. */
 bool nmb_command_buffer_wait_scheduled(NmbCommandBuffer *);
 /* 0 completed in time, 1 timed out (timeout_ms 0 waits without a bound). */
@@ -379,6 +380,12 @@ bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 
 NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
+NmbEncoder *nmb_compute_encoder_with_dispatch(NmbCommandBuffer *, uint64_t dispatch_type);
+bool nmb_encoder_use_resource(NmbEncoder *, const NmbBuffer *, const NmbTexture *, uint64_t usage, uint64_t stages);
+bool nmb_encoder_use_heap(NmbEncoder *, const NmbCommandBuffer *, const NmbHeap *, uint64_t stages);
+bool nmb_heap_hold(const NmbHeap *);
+void nmb_heap_unhold(const NmbHeap *);
+bool nmb_encoder_memory_barrier(NmbEncoder *, uint64_t after_stages, uint64_t before_stages);
 NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
 struct NmbPassAttachment {
     NmbTexture *texture;

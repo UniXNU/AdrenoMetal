@@ -20,7 +20,7 @@ use metal2vulkan::pipeline::{
 use metal2vulkan_runtime::{
     BlitCommandEncoder, ClearColor, CommandBuffer, CommandQueue, ComputeCommandEncoder,
     DepthStencilState, Device, Event, Fence, LoadAction,
-    Region, RenderCommandEncoder, RenderPassDescriptor,
+    Region, RenderCommandEncoder, RenderPassDescriptor, Resource as RuntimeResource, ResourceUsage,
     SamplerState, ScissorRect, SharedEvent, StoreAction, Viewport, VisibilityResultMode,
 };
 use crate::purge::{Cause, Purge, Resource};
@@ -615,6 +615,16 @@ pub extern "C" fn nmb_texture_hold(texture: *const NmbTexture) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_texture_unhold(texture: *const NmbTexture) {
     guard((), || Ok(get(texture)?.0.unhold()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_heap_hold(heap: *const NmbHeap) -> bool {
+    guard(false, || Ok(get(heap)?.0.hold()))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_heap_unhold(heap: *const NmbHeap) {
+    guard((), || Ok(get(heap)?.0.unhold()))
 }
 
 /// The call stacks that allocated device memory of 4 MiB or more (bridge patch 0020), most bytes first, into the caller's `max` records
@@ -2520,6 +2530,14 @@ pub extern "C" fn nmb_command_buffer_wait_scheduled(command_buffer: *mut NmbComm
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn nmb_command_buffer_enqueue(command_buffer: *mut NmbCommandBuffer) -> bool {
+    guard(false, || {
+        get(command_buffer)?.0.enqueue().map_err(e("enqueue"))?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn nmb_command_buffer_commit(command_buffer: *mut NmbCommandBuffer) -> bool {
     let began = TIMING_LOG.get().map(|_| std::time::Instant::now());
     let result = guard(false, || {
@@ -2768,8 +2786,18 @@ pub enum NmbEncoder {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_compute_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
+    nmb_compute_encoder_with_dispatch(command_buffer, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_compute_encoder_with_dispatch(command_buffer: *mut NmbCommandBuffer, dispatch: u64) -> *mut NmbEncoder {
     guard(std::ptr::null_mut(), || {
-        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder(metal2vulkan_runtime::DispatchType::Serial).map_err(e("compute encoder"))?)))
+        let dispatch = match dispatch {
+            0 => metal2vulkan_runtime::DispatchType::Serial,
+            1 => metal2vulkan_runtime::DispatchType::Concurrent,
+            _ => return Err("invalid compute dispatch type".into()),
+        };
+        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder(dispatch).map_err(e("compute encoder"))?)))
     })
 }
 
@@ -2920,6 +2948,91 @@ fn blit<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut BlitCommandEncoder, Stri
 
 fn optional<'a, T>(handle: *const T) -> Result<Option<&'a T>, String> {
     if handle.is_null() { Ok(None) } else { get(handle).map(Some) }
+}
+
+fn resource_usage(word: u64) -> Result<Option<ResourceUsage>, String> {
+    let bits = raw::<metal2vulkan::metal::ResourceUsage>(word, "resource usage")?.as_raw();
+    Ok([(1, ResourceUsage::READ), (2, ResourceUsage::WRITE), (4, ResourceUsage::SAMPLE)]
+        .into_iter().filter_map(|(bit, usage)| (bits & bit != 0).then_some(usage))
+        .reduce(|a, b| a | b))
+}
+
+#[cfg(test)]
+mod indirect_resource_usage_tests {
+    use super::*;
+    #[test]
+    fn combined_usage_preserves_sampling_and_writes() {
+        assert_eq!(resource_usage(0).unwrap(), None);
+        assert_eq!(resource_usage(7).unwrap(), Some(ResourceUsage::READ | ResourceUsage::WRITE | ResourceUsage::SAMPLE));
+        assert_eq!(resource_usage(6).unwrap(), Some(ResourceUsage::WRITE | ResourceUsage::SAMPLE));
+    }
+    #[test]
+    fn unknown_usage_bits_are_refused() {
+        assert!(resource_usage(8).is_err());
+        assert!(resource_usage(u64::MAX).is_err());
+    }
+}
+
+/// Declare indirect resources through the runtime's hazard tracking and retirement ownership.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_use_resource(encoder: *mut NmbEncoder, buffer: *const NmbBuffer,
+                                           texture: *const NmbTexture, usage: u64, stages: u64) -> bool {
+    guard(false, || {
+        let buffer = optional(buffer)?.map(|b| b.0.live()).transpose()?;
+        let texture = optional(texture)?.map(|t| t.0.live()).transpose()?;
+        let resource = match (buffer.as_deref(), texture.as_deref()) {
+            (Some(b), None) => RuntimeResource::Buffer(b),
+            (None, Some(t)) => RuntimeResource::Texture(t),
+            _ => return Err("expected one indirect resource".into()),
+        };
+        let usage = resource_usage(usage)?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => {
+                if let Some(usage) = usage { c.use_resource(resource, usage).map_err(e("use resource"))?; }
+            },
+            NmbEncoder::Render(r) => {
+                raw::<RenderStages>(stages, "render stages")?;
+                if let Some(usage) = usage { r.use_resource(resource, usage).map_err(e("use resource"))?; }
+            },
+            _ => return Err("indirect resources require a compute or render encoder".into()),
+        }
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_use_heap(encoder: *mut NmbEncoder, command: *const NmbCommandBuffer,
+                                      heap: *const NmbHeap, stages: u64) -> bool {
+    guard(false, || {
+        let heap = get(heap)?.0.live()?;
+        let block = heap.block_id_on(&get(command)?.1)?;
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.use_heap(block),
+            NmbEncoder::Render(r) => {
+                raw::<RenderStages>(stages, "render stages")?;
+                r.use_heap(block)
+            },
+            _ => return Err("heap declarations require a compute or render encoder".into()),
+        }.map_err(e("use heap"))?;
+        Ok(true)
+    })
+}
+
+/// Both Metal barrier forms map to the upstream global encoder barrier.
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_encoder_memory_barrier(encoder: *mut NmbEncoder, after: u64, before: u64) -> bool {
+    guard(false, || {
+        match get_mut(encoder)? {
+            NmbEncoder::Compute(c) => c.memory_barrier(),
+            NmbEncoder::Render(r) => {
+                raw::<RenderStages>(after, "render stages")?;
+                raw::<RenderStages>(before, "render stages")?;
+                r.memory_barrier().map_err(e("memory barrier"))?;
+            },
+            _ => return Err("memory barriers require a compute or render encoder".into()),
+        }
+        Ok(true)
+    })
 }
 
 const COMPUTE: u32 = 0;
@@ -3516,6 +3629,7 @@ pub extern "C" fn nmb_command_buffer_keep(command: *const NmbCommandBuffer, reso
             2 => get(resource.cast::<NmbSampler>())?.1.clone(),
             3 => get(resource.cast::<NmbComputePipeline>())?.0.ownership.clone(),
             4 => get(resource.cast::<NmbRenderPipeline>())?.0.ownership.clone(),
+            5 => Arc::new((*get(resource.cast::<NmbHeap>())?.0.live()?).clone()),
             _ => return Err("invalid consumer resource kind".into()),
         };
         get(command)?.3.lock().unwrap_or_else(|e| e.into_inner()).push(owner);

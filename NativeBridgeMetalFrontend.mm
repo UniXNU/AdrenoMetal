@@ -2119,6 +2119,12 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  }
  if(manifest)fclose(manifest);
 }
+@interface NBHeap : NBObject
+@property(nonatomic) NmbHeap *handle;
+@property(nonatomic) MTLResourceOptions options;
+@property(nonatomic) MTLHeapType heapType;
+@end
+
 @interface NBCommandBuffer : NBObject {
 @public
  EncodedWork encodedWork;   // the command buffer's single encoder thread, not global counter deltas
@@ -2515,6 +2521,67 @@ static uint64_t encodeCommandOf(id object) {
  if(!ok)[_commandBuffer refuse:[NSString stringWithFormat:@"%s: %@",what,lastError()]];
  return ok;
 }
+- (BOOL)holdIndirectResource:(id<MTLResource>)resource {
+ if(self.commandBuffer.committed){[self.commandBuffer refuse:@"resource declaration after commit"];return NO;}
+ if(![(id)resource isKindOfClass:[NBBuffer class]] && ![(id)resource isKindOfClass:[NBTexture class]]) {
+  [self.commandBuffer refuse:@"foreign or nil indirect resource"];return NO;
+ }
+ [self.commandBuffer own:resource];
+ if([(id)resource isKindOfClass:[NBTexture class]] && ((NBTexture *)resource).surface)
+  [self.commandBuffer.surfaces addObject:resource];
+ return YES;
+}
+- (void)declareResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ if(![self holdIndirectResource:resource])return;
+ NBBuffer *buffer=[(id)resource isKindOfClass:[NBBuffer class]]?(NBBuffer *)resource:nil;
+ NBTexture *texture=[(id)resource isKindOfClass:[NBTexture class]]?(NBTexture *)resource:nil;
+ ENCODE([self check:nmb_encoder_use_resource(self.handle,buffer.handle,texture.handle,usage,stages) what:"useResource"]);
+}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage {
+ [self declareResource:resource usage:usage stages:0];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count usage:(MTLResourceUsage)usage {
+ [self useResources:resources count:count usage:usage stages:0];
+}
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ [self declareResource:resource usage:usage stages:stages];
+}
+- (void)useResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count
+               usage:(MTLResourceUsage)usage stages:(MTLRenderStages)stages {
+ if(count && !resources){[self.commandBuffer refuse:@"nil resource array"];return;}
+ for(NSUInteger i=0;i<count;++i)[self declareResource:resources[i] usage:usage stages:stages];
+}
+- (void)useHeap:(id<MTLHeap>)heap {[self useHeap:heap stages:0];}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])heaps count:(NSUInteger)count {[self useHeaps:heaps count:count stages:0];}
+- (void)useHeap:(id<MTLHeap>)heap stages:(MTLRenderStages)stages {
+ if(self.commandBuffer.committed){[self.commandBuffer refuse:@"heap declaration after commit"];return;}
+ if(![(id)heap isKindOfClass:[NBHeap class]]){[self.commandBuffer refuse:@"foreign or nil heap"];return;}
+ [self.commandBuffer own:heap];
+ ENCODE([self check:nmb_encoder_use_heap(self.handle,self.commandBuffer.handle,[(NBHeap *)heap handle],stages) what:"useHeap"]);
+}
+- (void)useHeaps:(const id<MTLHeap> __unsafe_unretained [])heaps count:(NSUInteger)count stages:(MTLRenderStages)stages {
+ if(count && !heaps){[self.commandBuffer refuse:@"nil heap array"];return;}
+ for(NSUInteger i=0;i<count;++i)[self useHeap:heaps[i] stages:stages];
+}
+- (void)barrierAfter:(MTLRenderStages)after before:(MTLRenderStages)before {
+ ENCODE([self check:nmb_encoder_memory_barrier(self.handle,after,before) what:"memoryBarrier"]);
+}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope {[self memoryBarrierWithScope:scope afterStages:0 beforeStages:0];}
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
+ if(scope&~(MTLBarrierScopeBuffers|MTLBarrierScopeTextures|MTLBarrierScopeRenderTargets)) {
+  [self.commandBuffer refuse:@"invalid barrier scope"];return;
+ }
+ [self barrierAfter:after before:before];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count {
+ [self memoryBarrierWithResources:resources count:count afterStages:0 beforeStages:0];
+}
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])resources count:(NSUInteger)count
+                      afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before {
+ if(count && !resources){[self.commandBuffer refuse:@"nil barrier resource array"];return;}
+ for(NSUInteger i=0;i<count;++i)if(![self holdIndirectResource:resources[i]])return;
+ [self barrierAfter:after before:before];
+}
 - (void)endEncoding {
  if(self.label.length)for(NSMutableDictionary *entry in _dumpEntries)entry[@"encoder"]=self.label;
  if(_dumpDraws)dumpLine(_commandBuffer,[NSString stringWithFormat:@"pass %u: %u draws %@",_commandBuffer.dumpPasses,_dumpDraws,self.label?:@""]);
@@ -2653,12 +2720,12 @@ static uint64_t encodeCommandOf(id object) {
 @end
 
 @interface NBComputeEncoder : NBEncoder
+@property(nonatomic) MTLDispatchType dispatch;
 @end
 @implementation NBComputeEncoder
-- (MTLDispatchType)dispatchType {return MTLDispatchTypeSerial;}
+- (MTLDispatchType)dispatchType {return self.dispatch;}
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state {
  if(![(id)state isKindOfClass:[NBComputePipeline class]]){[self.commandBuffer refuse:@"foreign compute pipeline"];return;}
- [self.commandBuffer own:state];
  [self.commandBuffer own:state];
  ENCODE([self check:nmb_compute_set_pipeline(self.handle,[(NBComputePipeline *)state handle]) what:"setComputePipelineState"]);
 }
@@ -2697,8 +2764,6 @@ static uint64_t encodeCommandOf(id object) {
  const std::array<uint64_t,3> g={group.width,group.height,group.depth};
  ENCODE([self check:nmb_compute_dispatch_indirect(self.handle,[(NBBuffer *)buffer handle],offset,g.data()) what:"indirect dispatch"]);
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u {(void)r;(void)u;}
-- (void)memoryBarrierWithScope:(MTLBarrierScope)s {(void)s;}
 @end
 
 @interface NBRenderEncoder : NBEncoder {
@@ -2743,7 +2808,6 @@ static uint64_t encodeCommandOf(id object) {
  if(dumpRange().first)self.dumpPipeline=state;
  noteFormats(self.passKey|((uint64_t)((NBRenderPipeline *)state).stateFormat<<32));
  if(gDrawStats)[self noteState:kDSPipeline key:0 object:(__bridge const void *)state value:0];
- [self.commandBuffer own:state];
  [self.commandBuffer own:state];
  ENCODE([self check:nmb_render_set_pipeline(self.handle,[(NBRenderPipeline *)state handle]) what:"setRenderPipelineState"]);
 }
@@ -2973,7 +3037,6 @@ static uint64_t encodeCommandOf(id object) {
  if(!ci || !ib){[self.commandBuffer refuse:@"nil control point index or indirect buffer"];return;}
  [self patches:n start:0 count:0 patchIndex:pi offset:po points:ci offset:co instances:0 base:0 indirect:ib offset:io];
 }
-- (void)useResource:(id<MTLResource>)r usage:(MTLResourceUsage)u stages:(MTLRenderStages)s {(void)r;(void)u;(void)s;}
 - (void)updateFence:(id<MTLFence>)fence afterStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:true];}
 - (void)waitForFence:(id<MTLFence>)fence beforeStages:(MTLRenderStages)stages {[self fence:fence stages:stages update:false];}
 @end
@@ -3425,8 +3488,9 @@ static char kUserDictionaryKey;
  return [self encoder:[NBComputeEncoder new] make:^{return nmb_compute_encoder_new(handle);} what:@"computeCommandEncoder"];
 }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)type {
- if(type!=MTLDispatchTypeSerial){[self refuse:@"concurrent compute dispatch"];return nil;}
- return [self computeCommandEncoder];
+ NmbCommandBuffer *handle=_handle;
+ NBComputeEncoder *encoder=[NBComputeEncoder new];encoder.dispatch=type;
+ return [self encoder:encoder make:^{return nmb_compute_encoder_with_dispatch(handle,type);} what:@"computeCommandEncoderWithDispatchType"];
 }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder {
  gBlits++;encodedWork.blits++;
@@ -3570,7 +3634,11 @@ static char kUserDictionaryKey;
 // A drawable (RenderBox's CAMetalLayer path) is presented once the GPU has written it: this runtime's scheduling comes before completion.
 - (void)presentDrawable:(id<MTLDrawable>)drawable {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable present];}];}
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time {[self addCompletedHandler:^(id<MTLCommandBuffer>){[drawable presentAtTime:time];}];}
-- (void)enqueue {}
+- (void)enqueue {
+ if(self.committed){[self refuse:@"enqueue after commit"];return;}
+ encodeDrain();
+ if(!nmb_command_buffer_enqueue(_handle))[self refuse:[@"enqueue: " stringByAppendingString:lastError()]];
+}
 - (void)event:(id<MTLEvent>)event value:(uint64_t)value signal:(bool)signal {
  if(![(id)event isKindOfClass:[NBEvent class]]){[self refuse:@"foreign event"];return;}
  if(self.committed){[self refuse:@"event encoded after commit"];return;}
@@ -4380,14 +4448,11 @@ static bool dvmBlockFormat(MTLPixelFormat format, NSUInteger &bytes, NSUInteger 
 @end
 static char dvmMemoryReleaseKey;
 
-@interface NBHeap : NBObject
-@property(nonatomic) NmbHeap *handle;
-@property(nonatomic) MTLResourceOptions options;
-@property(nonatomic) MTLHeapType heapType;
-@end
 @implementation NBHeap {
  uint8_t _purgeCounted;   // as NBBuffer's
 }
+- (BOOL)keepForCommand:(NmbCommandBuffer *)command {return nmb_command_buffer_keep(command,_handle,5);}
+- (BOOL)purgeHold:(BOOL)hold {if(hold)return nmb_heap_hold(_handle);nmb_heap_unhold(_handle);return NO;}
 - (void)dealloc {DetailSpan timing(19,(uintptr_t)_handle);if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_heap_size(_handle));nmb_heap_release(_handle);}
 - (NSUInteger)size {return nmb_heap_size(_handle);}
 - (NSUInteger)usedSize {return nmb_heap_used_size(_handle);}
