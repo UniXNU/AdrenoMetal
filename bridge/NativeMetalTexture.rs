@@ -87,11 +87,13 @@ impl TextureDescriptor {
         d.array_length = narrow(self.array_length)?;
         d.usage = self.usage;
         d.swizzle = self.swizzle;
+        // Upstream runtime v2 refuses StorageMode::Memoryless (Gap::MemorylessTexture).
+        // Back memoryless descriptors with pooled Private storage while preserving Memoryless
+        // in Metal metadata; Private still refuses CPU get_bytes/replace_region access.
         d.storage_mode = match self.resource_options.storage_mode() {
             StorageMode::Shared => rt::StorageMode::Shared,
             StorageMode::Managed => rt::StorageMode::Managed,
-            StorageMode::Private => rt::StorageMode::Private,
-            StorageMode::Memoryless => rt::StorageMode::Memoryless,
+            StorageMode::Private | StorageMode::Memoryless => rt::StorageMode::Private,
         };
         Ok(d)
     }
@@ -333,4 +335,19 @@ fn allocation_size(device: &rt::Device, descriptor: &TextureDescriptor) -> u64 {
         pixel_format: descriptor.pixel_format.as_raw() as u64, width: descriptor.width, height: descriptor.height,
         depth: descriptor.depth, array_length: layers, level, planes: 0,
     }).bytes.saturating_mul(descriptor.sample_count)).fold(0, u64::saturating_add)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memoryless_descriptor_maps_to_private_runtime_storage() {
+        let mut desc = TextureDescriptor::texture_2d(PixelFormat::RG16Float, 46, 46, false);
+        desc.resource_options = ResourceOptions::from_raw(3 << 4).unwrap();
+        desc.usage = TextureUsage::RENDER_TARGET;
+        assert_eq!(desc.resource_options.storage_mode(), StorageMode::Memoryless);
+        let runtime = desc.runtime().unwrap();
+        assert_eq!(runtime.storage_mode, rt::StorageMode::Private);
+    }
 }
