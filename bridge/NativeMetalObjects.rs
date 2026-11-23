@@ -1283,10 +1283,15 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
 /// `newTextureWithDescriptor:iosurface:plane:` over a surface with planes: `offset` and `bytes_per_row` are the asked plane's, and a
 /// two-plane surface also gives its OSType, the asked plane, its size and plane 1's offset and rows (`chroma`, 0 and 0 for one plane),
 /// which a two-plane texture reads its second plane from.
+/// # Safety
+/// When `surface_seed` and `surface_context` are non-null, `surface_context` must remain valid
+/// for `surface_seed` for as long as `buffer` is alive.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_new_on_surface(device: *mut NmbDevice, buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor,
-                                             offset: u64, bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
-                                             chroma_offset: u64, chroma_bytes_per_row: u64, ycbcr_matrix: u32) -> *mut NmbTexture {
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn nmb_texture_new_on_surface(device: *mut NmbDevice, buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor,
+                                                    offset: u64, bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
+                                                    chroma_offset: u64, chroma_bytes_per_row: u64, ycbcr_matrix: u32,
+                                                    surface_seed: Option<crate::ycbcr::SurfaceSeedFn>, surface_context: *const c_void) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
@@ -1303,7 +1308,9 @@ pub extern "C" fn nmb_texture_new_on_surface(device: *mut NmbDevice, buffer: *mu
                 surface_height: height,
                 matrix: crate::ycbcr::YCbCrMatrix::from_raw(ycbcr_matrix),
             };
-            let source = crate::ycbcr::YCbCrSource::new(converter, (*buffer).clone(), layout);
+            // SAFETY: caller guarantees `surface_context` outlives `buffer`.
+            let seed = surface_seed.and_then(|f| unsafe { crate::ycbcr::SurfaceSeed::new(f, surface_context) });
+            let source = crate::ycbcr::YCbCrSource::new(converter, (*buffer).clone(), layout, seed);
             let texture = source.convert(&descriptor)?;
             return Ok(boxed(NmbTexture(Resource::tied(texture, tie))));
         }
@@ -1464,7 +1471,9 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts_mut(bytes as *mut u8, length as usize) };
-        get(texture)?.0.live()?.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, narrow(level)?, narrow(slice)?)
+        let texture = get(texture)?.0.live()?;
+        texture.refresh_ycbcr_for_use(0)?;
+        texture.get_bytes(bytes, bytes_per_row, bytes_per_image, region(region_words)?, narrow(level)?, narrow(slice)?)
             .map_err(e("get bytes"))?;
         Ok(true)
     })
@@ -2773,10 +2782,10 @@ pub extern "C" fn nmb_fence_release(fence: *mut NmbFence) {
 pub extern "C" fn nmb_encoder_update_fence(encoder: *mut NmbEncoder, fence: *mut NmbFence, stages: u64) -> bool {
     guard(false, || {
         let fence = &get(fence)?.0;
-        match get_mut(encoder)? {
-            NmbEncoder::Compute(c) => c.update_fence(fence),
-            NmbEncoder::Blit(b) => b.update_fence(fence),
-            NmbEncoder::Render(r) => {
+        match &mut get_mut(encoder)?.kind {
+            NmbEncoderKind::Compute(c) => c.update_fence(fence),
+            NmbEncoderKind::Blit(b) => b.update_fence(fence),
+            NmbEncoderKind::Render(r) => {
                 raw::<RenderStages>(stages, "render stages")?;
                 r.update_fence(fence)
             },
@@ -2790,10 +2799,10 @@ pub extern "C" fn nmb_encoder_update_fence(encoder: *mut NmbEncoder, fence: *mut
 pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut NmbFence, stages: u64) -> bool {
     guard(false, || {
         let fence = &get(fence)?.0;
-        match get_mut(encoder)? {
-            NmbEncoder::Compute(c) => c.wait_for_fence(fence),
-            NmbEncoder::Blit(b) => b.wait_for_fence(fence),
-            NmbEncoder::Render(r) => {
+        match &mut get_mut(encoder)?.kind {
+            NmbEncoderKind::Compute(c) => c.wait_for_fence(fence),
+            NmbEncoderKind::Blit(b) => b.wait_for_fence(fence),
+            NmbEncoderKind::Render(r) => {
                 raw::<RenderStages>(stages, "render stages")?;
                 r.wait_for_fence(fence)
             },
@@ -2805,7 +2814,12 @@ pub extern "C" fn nmb_encoder_wait_fence(encoder: *mut NmbEncoder, fence: *mut N
 
 // ---- encoders ----
 
-pub enum NmbEncoder {
+pub struct NmbEncoder {
+    command_buffer_id: u64,
+    kind: NmbEncoderKind,
+}
+
+enum NmbEncoderKind {
     Compute(ComputeCommandEncoder),
     Render(RenderCommandEncoder),
     Blit(BlitCommandEncoder),
@@ -2824,13 +2838,23 @@ pub extern "C" fn nmb_compute_encoder_with_dispatch(command_buffer: *mut NmbComm
             1 => metal2vulkan_runtime::DispatchType::Concurrent,
             _ => return Err("invalid compute dispatch type".into()),
         };
-        Ok(boxed(NmbEncoder::Compute(get(command_buffer)?.0.compute_command_encoder(dispatch).map_err(e("compute encoder"))?)))
+        let cb = get(command_buffer)?;
+        Ok(boxed(NmbEncoder {
+            command_buffer_id: cb.2,
+            kind: NmbEncoderKind::Compute(cb.0.compute_command_encoder(dispatch).map_err(e("compute encoder"))?),
+        }))
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_blit_encoder_new(command_buffer: *mut NmbCommandBuffer) -> *mut NmbEncoder {
-    guard(std::ptr::null_mut(), || Ok(boxed(NmbEncoder::Blit(get(command_buffer)?.0.blit_command_encoder().map_err(e("blit encoder"))?))))
+    guard(std::ptr::null_mut(), || {
+        let cb = get(command_buffer)?;
+        Ok(boxed(NmbEncoder {
+            command_buffer_id: cb.2,
+            kind: NmbEncoderKind::Blit(cb.0.blit_command_encoder().map_err(e("blit encoder"))?),
+        }))
+    })
 }
 
 #[repr(C)]
@@ -2925,8 +2949,12 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
         if !d.visibility.is_null() {
             pass.visibility_result_buffer = Some((**get(d.visibility)?.0.live()?).clone());
         }
-        let encoder = get(command_buffer)?.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
-        Ok(boxed(NmbEncoder::Render(encoder)))
+        let cb = get(command_buffer)?;
+        let encoder = cb.0.render_command_encoder(&pass).map_err(e("render encoder"))?;
+        Ok(boxed(NmbEncoder {
+            command_buffer_id: cb.2,
+            kind: NmbEncoderKind::Render(encoder),
+        }))
     })
 }
 
@@ -2938,10 +2966,10 @@ pub extern "C" fn nmb_encoder_end(encoder: *mut NmbEncoder) -> bool {
         }
         // SAFETY: from `boxed`; ending releases it.
         let encoder = unsafe { Box::from_raw(encoder) };
-        match *encoder {
-            NmbEncoder::Compute(c) => c.end_encoding(),
-            NmbEncoder::Render(r) => r.end_encoding(),
-            NmbEncoder::Blit(b) => b.end_encoding(),
+        match encoder.kind {
+            NmbEncoderKind::Compute(c) => c.end_encoding(),
+            NmbEncoderKind::Render(r) => r.end_encoding(),
+            NmbEncoderKind::Blit(b) => b.end_encoding(),
         };
         Ok(true)
     })
@@ -2953,22 +2981,22 @@ pub extern "C" fn nmb_encoder_discard(encoder: *mut NmbEncoder) {
 }
 
 fn compute<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut ComputeCommandEncoder, String> {
-    match get_mut(encoder)? {
-        NmbEncoder::Compute(c) => Ok(c),
+    match &mut get_mut(encoder)?.kind {
+        NmbEncoderKind::Compute(c) => Ok(c),
         _ => Err("not a compute encoder".into()),
     }
 }
 
 fn render<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut RenderCommandEncoder, String> {
-    match get_mut(encoder)? {
-        NmbEncoder::Render(r) => Ok(r),
+    match &mut get_mut(encoder)?.kind {
+        NmbEncoderKind::Render(r) => Ok(r),
         _ => Err("not a render encoder".into()),
     }
 }
 
 fn blit<'a>(encoder: *mut NmbEncoder) -> Result<&'a mut BlitCommandEncoder, String> {
-    match get_mut(encoder)? {
-        NmbEncoder::Blit(b) => Ok(b),
+    match &mut get_mut(encoder)?.kind {
+        NmbEncoderKind::Blit(b) => Ok(b),
         _ => Err("not a blit encoder".into()),
     }
 }
@@ -3005,19 +3033,23 @@ mod indirect_resource_usage_tests {
 pub extern "C" fn nmb_encoder_use_resource(encoder: *mut NmbEncoder, buffer: *const NmbBuffer,
                                            texture: *const NmbTexture, usage: u64, stages: u64) -> bool {
     guard(false, || {
+        let enc = get_mut(encoder)?;
         let buffer = optional(buffer)?.map(|b| b.0.live()).transpose()?;
         let texture = optional(texture)?.map(|t| t.0.live()).transpose()?;
+        if let Some(ref tex) = texture {
+            tex.refresh_ycbcr_for_use(enc.command_buffer_id)?;
+        }
         let resource = match (buffer.as_deref(), texture.as_deref()) {
             (Some(b), None) => RuntimeResource::Buffer(b),
             (None, Some(t)) => RuntimeResource::Texture(t),
             _ => return Err("expected one indirect resource".into()),
         };
         let usage = resource_usage(usage)?;
-        match get_mut(encoder)? {
-            NmbEncoder::Compute(c) => {
+        match &mut enc.kind {
+            NmbEncoderKind::Compute(c) => {
                 if let Some(usage) = usage { c.use_resource(resource, usage).map_err(e("use resource"))?; }
             },
-            NmbEncoder::Render(r) => {
+            NmbEncoderKind::Render(r) => {
                 raw::<RenderStages>(stages, "render stages")?;
                 if let Some(usage) = usage { r.use_resource(resource, usage).map_err(e("use resource"))?; }
             },
@@ -3033,9 +3065,9 @@ pub extern "C" fn nmb_encoder_use_heap(encoder: *mut NmbEncoder, command: *const
     guard(false, || {
         let heap = get(heap)?.0.live()?;
         let block = heap.block_id_on(&get(command)?.1)?;
-        match get_mut(encoder)? {
-            NmbEncoder::Compute(c) => c.use_heap(block),
-            NmbEncoder::Render(r) => {
+        match &mut get_mut(encoder)?.kind {
+            NmbEncoderKind::Compute(c) => c.use_heap(block),
+            NmbEncoderKind::Render(r) => {
                 raw::<RenderStages>(stages, "render stages")?;
                 r.use_heap(block)
             },
@@ -3049,9 +3081,9 @@ pub extern "C" fn nmb_encoder_use_heap(encoder: *mut NmbEncoder, command: *const
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_memory_barrier(encoder: *mut NmbEncoder, after: u64, before: u64) -> bool {
     guard(false, || {
-        match get_mut(encoder)? {
-            NmbEncoder::Compute(c) => c.memory_barrier(),
-            NmbEncoder::Render(r) => {
+        match &mut get_mut(encoder)?.kind {
+            NmbEncoderKind::Compute(c) => c.memory_barrier(),
+            NmbEncoderKind::Render(r) => {
                 raw::<RenderStages>(after, "render stages")?;
                 raw::<RenderStages>(before, "render stages")?;
                 r.memory_barrier().map_err(e("memory barrier"))?;
@@ -3077,11 +3109,11 @@ pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, b
     guard(false, || {
         let buffer = optional(buffer)?.map(|b| b.0.live()).transpose()?;
         let buffer = buffer.as_deref().map(|buffer| &**buffer);
-        match (get_mut(encoder)?, stage) {
-            (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer(buffer, offset, index),
-            (NmbEncoder::Render(r), VERTEX) => r.set_vertex_buffer(buffer, offset, index),
-            (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_buffer(buffer, offset, index),
-            (NmbEncoder::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
+        match (&mut get_mut(encoder)?.kind, stage) {
+            (NmbEncoderKind::Compute(c), COMPUTE) => c.set_buffer(buffer, offset, index),
+            (NmbEncoderKind::Render(r), VERTEX) => r.set_vertex_buffer(buffer, offset, index),
+            (NmbEncoderKind::Render(r), FRAGMENT) => r.set_fragment_buffer(buffer, offset, index),
+            (NmbEncoderKind::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set buffer"))?;
@@ -3092,11 +3124,11 @@ pub extern "C" fn nmb_encoder_set_buffer(encoder: *mut NmbEncoder, stage: u32, b
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_set_buffer_offset(encoder: *mut NmbEncoder, stage: u32, offset: u64, index: u32) -> bool {
     guard(false, || {
-        match (get_mut(encoder)?, stage) {
-            (NmbEncoder::Compute(c), COMPUTE) => c.set_buffer_offset(offset, index),
-            (NmbEncoder::Render(r), VERTEX) => r.set_vertex_buffer_offset(offset, index),
-            (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_buffer_offset(offset, index),
-            (NmbEncoder::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
+        match (&mut get_mut(encoder)?.kind, stage) {
+            (NmbEncoderKind::Compute(c), COMPUTE) => c.set_buffer_offset(offset, index),
+            (NmbEncoderKind::Render(r), VERTEX) => r.set_vertex_buffer_offset(offset, index),
+            (NmbEncoderKind::Render(r), FRAGMENT) => r.set_fragment_buffer_offset(offset, index),
+            (NmbEncoderKind::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set buffer offset"))?;
@@ -3115,11 +3147,11 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: 
         }
         // SAFETY: the caller's contract.
         let bytes = unsafe { std::slice::from_raw_parts(bytes as *const u8, length) };
-        match (get_mut(encoder)?, stage) {
-            (NmbEncoder::Compute(c), COMPUTE) => c.set_bytes(bytes, index),
-            (NmbEncoder::Render(r), VERTEX) => r.set_vertex_bytes(bytes, index),
-            (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_bytes(bytes, index),
-            (NmbEncoder::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
+        match (&mut get_mut(encoder)?.kind, stage) {
+            (NmbEncoderKind::Compute(c), COMPUTE) => c.set_bytes(bytes, index),
+            (NmbEncoderKind::Render(r), VERTEX) => r.set_vertex_bytes(bytes, index),
+            (NmbEncoderKind::Render(r), FRAGMENT) => r.set_fragment_bytes(bytes, index),
+            (NmbEncoderKind::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set bytes"))?;
@@ -3130,13 +3162,17 @@ pub unsafe extern "C" fn nmb_encoder_set_bytes(encoder: *mut NmbEncoder, stage: 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, texture: *mut NmbTexture, index: u32) -> bool {
     guard(false, || {
+        let enc = get_mut(encoder)?;
         let texture = optional(texture)?.map(|t| t.0.slot()).transpose()?;
+        if let Some(ref tex) = texture {
+            tex.refresh_ycbcr_for_use(enc.command_buffer_id)?;
+        }
         let texture = texture.as_deref().map(|texture| &**texture);
-        match (get_mut(encoder)?, stage) {
-            (NmbEncoder::Compute(c), COMPUTE) => c.set_texture(texture, index),
-            (NmbEncoder::Render(r), VERTEX) => r.set_vertex_texture(texture, index),
-            (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_texture(texture, index),
-            (NmbEncoder::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
+        match (&mut enc.kind, stage) {
+            (NmbEncoderKind::Compute(c), COMPUTE) => c.set_texture(texture, index),
+            (NmbEncoderKind::Render(r), VERTEX) => r.set_vertex_texture(texture, index),
+            (NmbEncoderKind::Render(r), FRAGMENT) => r.set_fragment_texture(texture, index),
+            (NmbEncoderKind::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set texture"))?;
@@ -3148,11 +3184,11 @@ pub extern "C" fn nmb_encoder_set_texture(encoder: *mut NmbEncoder, stage: u32, 
 pub extern "C" fn nmb_encoder_set_sampler(encoder: *mut NmbEncoder, stage: u32, sampler: *mut NmbSampler, index: u32) -> bool {
     guard(false, || {
         let sampler = optional(sampler)?.map(|s| &s.0);
-        match (get_mut(encoder)?, stage) {
-            (NmbEncoder::Compute(c), COMPUTE) => c.set_sampler_state(sampler, index),
-            (NmbEncoder::Render(r), VERTEX) => r.set_vertex_sampler_state(sampler, index),
-            (NmbEncoder::Render(r), FRAGMENT) => r.set_fragment_sampler_state(sampler, index),
-            (NmbEncoder::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
+        match (&mut get_mut(encoder)?.kind, stage) {
+            (NmbEncoderKind::Compute(c), COMPUTE) => c.set_sampler_state(sampler, index),
+            (NmbEncoderKind::Render(r), VERTEX) => r.set_vertex_sampler_state(sampler, index),
+            (NmbEncoderKind::Render(r), FRAGMENT) => r.set_fragment_sampler_state(sampler, index),
+            (NmbEncoderKind::Render(_), TILE) => return Err("upstream runtime does not implement tile shaders".into()),
             _ => return Err(bad_stage(stage)),
         }
         .map_err(e("set sampler"))?;
@@ -3397,9 +3433,13 @@ pub extern "C" fn nmb_blit_copy_texture(encoder: *mut NmbEncoder, source: *mut N
                                         source_origin: *const u64, extent: *const u64, destination: *mut NmbTexture,
                                         destination_slice: u64, destination_level: u64, destination_origin: *const u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_texture(&*get(source)?.0.live()?,
+        let use_tag = get(encoder)?.command_buffer_id;
+        let src = get(source)?.0.live()?;
+        src.refresh_ycbcr_for_use(use_tag)?;
+        let dst = get(destination)?.0.live()?;
+        blit(encoder)?.copy_from_texture(&*src,
             metal2vulkan_runtime::TexturePlace { slice: narrow(source_slice)?, level: narrow(source_level)?, origin: origin(source_origin)? },
-            size(extent)?, &*get(destination)?.0.live()?,
+            size(extent)?, &*dst,
             metal2vulkan_runtime::TexturePlace { slice: narrow(destination_slice)?, level: narrow(destination_level)?, origin: origin(destination_origin)? })
             .map_err(e("texture copy"))?;
         Ok(true)
@@ -3426,7 +3466,10 @@ pub extern "C" fn nmb_blit_texture_to_buffer(encoder: *mut NmbEncoder, source: *
                                              source_origin: *const u64, extent: *const u64, destination: *mut NmbBuffer, offset: u64,
                                              bytes_per_row: u64, bytes_per_image: u64) -> bool {
     guard(false, || {
-        blit(encoder)?.copy_from_texture_to_buffer(&*get(source)?.0.live()?,
+        let use_tag = get(encoder)?.command_buffer_id;
+        let src = get(source)?.0.live()?;
+        src.refresh_ycbcr_for_use(use_tag)?;
+        blit(encoder)?.copy_from_texture_to_buffer(&*src,
             metal2vulkan_runtime::TexturePlace { slice: narrow(slice)?, level: narrow(level)?, origin: origin(source_origin)? },
             size(extent)?, &*get(destination)?.0.live()?, metal2vulkan_runtime::BufferLayout { offset, bytes_per_row, bytes_per_image })
             .map_err(e("texture to buffer"))?;
@@ -3652,7 +3695,11 @@ pub extern "C" fn nmb_command_buffer_keep(command: *const NmbCommandBuffer, reso
     guard(false, || {
         let owner: Owner = match kind {
             0 => get(resource.cast::<NmbBuffer>())?.0.live()?.ownership.clone(),
-            1 => get(resource.cast::<NmbTexture>())?.0.live()?.ownership.clone(),
+            1 => {
+                let tex = get(resource.cast::<NmbTexture>())?.0.live()?;
+                tex.refresh_ycbcr_for_use(get(command)?.2)?;
+                tex.ownership.clone()
+            },
             2 => get(resource.cast::<NmbSampler>())?.1.clone(),
             3 => get(resource.cast::<NmbComputePipeline>())?.0.ownership.clone(),
             4 => get(resource.cast::<NmbRenderPipeline>())?.0.ownership.clone(),

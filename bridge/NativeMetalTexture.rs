@@ -109,7 +109,7 @@ pub struct Texture {
     pub(crate) ownership: Arc<crate::ownership::Ownership>,
     backing_size: u64,
     backing: Arc<crate::ownership::Ownership>,
-    ycbcr: Option<Arc<crate::ycbcr::YCbCrSource>>,
+    ycbcr: Option<Arc<crate::ycbcr::YCbCrRefresh>>,
 }
 impl Deref for Texture {
     type Target = rt::Texture;
@@ -168,11 +168,10 @@ impl Texture {
             ycbcr: None,
         })
     }
-    pub(crate) fn allocate_ycbcr_backing(
+    pub(crate) fn allocate_ycbcr_target(
         device: &rt::Device,
         descriptor: &TextureDescriptor,
-        ycbcr: Arc<crate::ycbcr::YCbCrSource>,
-    ) -> Result<Self, String> {
+    ) -> Result<(rt::Texture, Arc<crate::ownership::Ownership>, u64), String> {
         let mut backing_desc = TextureDescriptor::texture_2d(
             PixelFormat::RGBA16Float,
             descriptor.width,
@@ -188,19 +187,38 @@ impl Texture {
             .new_texture(&backing_desc.runtime()?, Some(index.index()))
             .map_err(|e| format!("ycbcr backing texture: {e:?}"))?;
         let backing_size = allocation_size(device, &backing_desc);
+        let ownership = crate::ownership::Ownership::new(vec![index.owner()]);
+        Ok((raw, ownership, backing_size))
+    }
+
+    pub(crate) fn from_ycbcr_backing(
+        device: &rt::Device,
+        descriptor: &TextureDescriptor,
+        raw: rt::Texture,
+        ownership: Arc<crate::ownership::Ownership>,
+        backing_size: u64,
+        ycbcr: Arc<crate::ycbcr::YCbCrRefresh>,
+    ) -> Self {
         let mut reported = descriptor.clone();
         reported.swizzle = TextureSwizzleChannels::DEFAULT;
-        Ok(Self {
+        Self {
             raw,
             descriptor: reported,
             device: device.clone(),
             state: Arc::new(AtomicU64::new(2)),
-            ownership: crate::ownership::Ownership::new(vec![index.owner()]),
-            backing: crate::ownership::Ownership::new(vec![]),
+            backing: ownership.clone(),
+            ownership,
             backing_size,
             lease: None,
             ycbcr: Some(ycbcr),
-        })
+        }
+    }
+
+    pub fn refresh_ycbcr_for_use(&self, use_tag: u64) -> Result<(), String> {
+        if let Some(ref ycbcr) = self.ycbcr {
+            ycbcr.refresh_for_use(use_tag)?;
+        }
+        Ok(())
     }
     pub fn over_buffer(
         buffer: &Buffer,
@@ -272,7 +290,7 @@ impl Texture {
                 let mut view_desc = self.descriptor.clone();
                 view_desc.pixel_format = format;
                 view_desc.swizzle = swizzle;
-                return ycbcr.convert(&view_desc);
+                return ycbcr.source().convert(&view_desc);
             }
         }
         let runtime_format = if self.ycbcr.is_some() && format == self.descriptor.pixel_format {

@@ -1547,6 +1547,9 @@ static uint32_t surfaceYCbCrMatrix(IOSurfaceRef surface) {
  CFRelease(value);
  return matrix;
 }
+static uint32_t surfaceSeed(const void *context) {
+ return context ? IOSurfaceGetSeed((IOSurfaceRef)context) : 0;
+}
 // A texture over a two-plane surface: the bridge converts two-plane YCbCr planes on GPU from the surface's own layout.
 static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,NSUInteger offset,NSUInteger row) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
@@ -1554,8 +1557,11 @@ static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSu
  uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
  size_t computed[4];   // myron: a 'b3a8' surface without plane rows
  if(!chromaRow && b3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
+ // Pass buffer.importedSurface (retained by the buffer's release callback), never the caller's temporary surface handle.
+ const void *seedContext=(const void *)buffer.importedSurface;
  NmbTexture *handle=nmb_texture_new_on_surface(gDevice,buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
-  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow,surfaceYCbCrMatrix(surface));
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow,surfaceYCbCrMatrix(surface),
+  seedContext ? surfaceSeed : nullptr, seedContext);
  if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;

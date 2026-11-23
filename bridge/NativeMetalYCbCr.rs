@@ -9,6 +9,7 @@ use metal2vulkan::metal::format::{ChromaSubsampling, YCbCrReads, ycbcr_format};
 use metal2vulkan::metal::{PixelFormat, TextureSwizzleChannels, TextureType};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -112,12 +113,117 @@ impl YCbCrConverter {
     }
 }
 
+pub type SurfaceSeedFn = unsafe extern "C" fn(*const c_void) -> u32;
+
+/// Callback reading the underlying IOSurface seed while the owning imported buffer stays alive.
+#[derive(Clone, Copy)]
+pub struct SurfaceSeed {
+    func: SurfaceSeedFn,
+    context: usize,
+}
+
+impl SurfaceSeed {
+    /// # Safety
+    /// `context` must stay valid for `func` for the entire lifetime of the owning `Buffer`.
+    pub unsafe fn new(func: SurfaceSeedFn, context: *const c_void) -> Option<Self> {
+        (!context.is_null()).then_some(Self {
+            func,
+            context: context as usize,
+        })
+    }
+
+    pub fn read(self) -> u32 {
+        // SAFETY: `YCbCrSource` retains the owning `Buffer` whose release callback retains the IOSurface.
+        unsafe { (self.func)(self.context as *const c_void) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RefreshState {
+    last_seed: Option<u32>,
+    last_use_tag: u64,
+    fresh_from_create: bool,
+}
+
+/// Pure refresh decision for a reused YCbCr texture backing.
+///
+/// - Any observed IOSurface seed change triggers immediate reconversion.
+/// - `use_tag == 0` (CPU readback) skips only the initial post-create read if seed is unchanged.
+/// - `use_tag != 0` (command buffer ID) skips the initial post-create bind and deduplicates
+///   repeated binds within the same command buffer, while still refreshing on subsequent command
+///   buffers in case a producer updated mapped surface bytes without bumping the IOSurface seed.
+fn decide_refresh(state: &RefreshState, current_seed: Option<u32>, use_tag: u64) -> (bool, RefreshState) {
+    let mut next = *state;
+    let seed_changed = match (state.last_seed, current_seed) {
+        (Some(prev), Some(curr)) => prev != curr,
+        _ => false,
+    };
+    if seed_changed {
+        next.last_seed = current_seed;
+        next.last_use_tag = use_tag;
+        next.fresh_from_create = false;
+        return (true, next);
+    }
+    if use_tag == 0 {
+        if state.fresh_from_create {
+            next.fresh_from_create = false;
+            return (false, next);
+        }
+        return (true, next);
+    }
+    if state.last_use_tag == use_tag {
+        return (false, next);
+    }
+    if state.fresh_from_create {
+        next.fresh_from_create = false;
+        next.last_use_tag = use_tag;
+        return (false, next);
+    }
+    next.last_use_tag = use_tag;
+    (true, next)
+}
+
+/// Refresh handle shared by a converted YCbCr backing texture and its same-format views.
+pub struct YCbCrRefresh {
+    source: Arc<YCbCrSource>,
+    backing_raw: rt::Texture,
+    backing_ownership: Arc<crate::ownership::Ownership>,
+    params: YCbCrParams,
+    state: Mutex<RefreshState>,
+}
+
+impl YCbCrRefresh {
+    pub fn source(&self) -> &Arc<YCbCrSource> {
+        &self.source
+    }
+
+    /// Re-dispatches YCbCr->RGBA conversion into the existing backing image when the surface
+    /// seed changed or the texture is reused in a new command buffer / CPU readback.
+    pub fn refresh_for_use(&self, use_tag: u64) -> Result<(), String> {
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let current_seed = self.source.seed.map(SurfaceSeed::read);
+        let (needs_refresh, next_state) = decide_refresh(&guard, current_seed, use_tag);
+        if needs_refresh {
+            let converter_state = self.source.converter.state(self.source.buffer.device())?;
+            self.source.dispatch_into(
+                &converter_state,
+                &self.backing_raw,
+                &self.backing_ownership,
+                self.params,
+            )?;
+        }
+        *guard = next_state;
+        Ok(())
+    }
+}
+
 /// Source surface metadata retained by converted YCbCr textures so views in sibling YCbCr formats can reconvert.
 #[derive(Clone)]
 pub struct YCbCrSource {
     converter: Arc<YCbCrConverter>,
     buffer: Buffer,
     layout: YCbCrSurfaceLayout,
+    seed: Option<SurfaceSeed>,
 }
 
 impl YCbCrSource {
@@ -125,20 +231,23 @@ impl YCbCrSource {
         converter: Arc<YCbCrConverter>,
         buffer: Buffer,
         layout: YCbCrSurfaceLayout,
+        seed: Option<SurfaceSeed>,
     ) -> Arc<Self> {
         Arc::new(Self {
             converter,
             buffer,
             layout,
+            seed,
         })
     }
 
-    pub fn convert(self: &Arc<Self>, descriptor: &TextureDescriptor) -> Result<Texture, String> {
-        let params = build_params(descriptor, &self.layout, self.buffer.length())?;
-        let device = self.buffer.device();
-        let state = self.converter.state(device)?;
-        let backing = Texture::allocate_ycbcr_backing(device, descriptor, Arc::clone(self))?;
-
+    fn dispatch_into(
+        &self,
+        state: &ConverterState,
+        target: &rt::Texture,
+        target_ownership: &Arc<crate::ownership::Ownership>,
+        params: YCbCrParams,
+    ) -> Result<(), String> {
         let command_buffer = state
             .queue
             .command_buffer()
@@ -156,7 +265,7 @@ impl YCbCrSource {
             .set_bytes(&params.to_le_bytes(), 1)
             .map_err(|e| format!("ycbcr params bind: {e:?}"))?;
         encoder
-            .set_texture(Some(&*backing), 0)
+            .set_texture(Some(target), 0)
             .map_err(|e| format!("ycbcr target bind: {e:?}"))?;
         encoder
             .dispatch_threads([params.width, params.height, 1], [16, 16, 1])
@@ -165,10 +274,10 @@ impl YCbCrSource {
 
         // Keep source pages, target image, and pipeline alive until the GPU conversion finishes.
         // Runtime v2 orders submissions across queues on the same device by commit order and inserts
-        // the image write-to-read barrier automatically before any subsequent draw reads `backing`.
+        // the image write-to-read barrier automatically before any subsequent draw reads `target`.
         let owners = vec![
             self.buffer.ownership.clone(),
-            backing.ownership.clone(),
+            target_ownership.clone(),
             state.pipeline.ownership.clone(),
         ];
         command_buffer
@@ -178,6 +287,36 @@ impl YCbCrSource {
             .commit()
             .map_err(|e| format!("ycbcr commit: {e:?}"))?;
         self.converter.converted.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn convert(self: &Arc<Self>, descriptor: &TextureDescriptor) -> Result<Texture, String> {
+        let params = build_params(descriptor, &self.layout, self.buffer.length())?;
+        let device = self.buffer.device();
+        let state = self.converter.state(device)?;
+        let (raw, ownership, backing_size) = Texture::allocate_ycbcr_target(device, descriptor)?;
+        let initial_seed = self.seed.map(SurfaceSeed::read);
+        self.dispatch_into(&state, &raw, &ownership, params)?;
+
+        let refresh = Arc::new(YCbCrRefresh {
+            source: Arc::clone(self),
+            backing_raw: raw.clone(),
+            backing_ownership: ownership.clone(),
+            params,
+            state: Mutex::new(RefreshState {
+                last_seed: initial_seed,
+                last_use_tag: 0,
+                fresh_from_create: true,
+            }),
+        });
+        let backing = Texture::from_ycbcr_backing(
+            device,
+            descriptor,
+            raw,
+            ownership,
+            backing_size,
+            refresh,
+        );
 
         if descriptor.swizzle != TextureSwizzleChannels::DEFAULT {
             backing.new_texture_view_with_swizzle(
@@ -481,5 +620,42 @@ mod tests {
         assert_eq!(YCbCrRange::from_surface_format(0x78663230), YCbCrRange::Full); // xf20
         assert_eq!(YCbCrRange::from_surface_format(0x78343230), YCbCrRange::Video); // x420
         assert_eq!(YCbCrRange::from_surface_format(0x34323076), YCbCrRange::Video); // 420v
+    }
+
+    #[test]
+    fn refresh_policy_handles_create_dedup_seed_bump_and_reuse() {
+        let s0 = RefreshState {
+            last_seed: Some(10),
+            last_use_tag: 0,
+            fresh_from_create: true,
+        };
+        // First bind in CB 1 with unchanged seed skips redundant conversion.
+        let (go, s1) = decide_refresh(&s0, Some(10), 1);
+        assert!(!go);
+        assert!(!s1.fresh_from_create);
+        assert_eq!(s1.last_use_tag, 1);
+        // Repeated bind in same CB 1 with unchanged seed is deduplicated.
+        let (go, s2) = decide_refresh(&s1, Some(10), 1);
+        assert!(!go);
+        assert_eq!(s2, s1);
+        // Seed bump even within same CB 1 triggers immediate reconversion.
+        let (go, s3) = decide_refresh(&s2, Some(11), 1);
+        assert!(go);
+        assert_eq!(s3.last_seed, Some(11));
+        // Reuse in CB 2 refreshes even when producer did not bump IOSurface seed.
+        let (go, s4) = decide_refresh(&s3, Some(11), 2);
+        assert!(go);
+        assert_eq!(s4.last_use_tag, 2);
+        // Second bind in CB 2 is deduplicated.
+        let (go, _) = decide_refresh(&s4, Some(11), 2);
+        assert!(!go);
+        // CPU get_bytes right after create skips if seed unchanged, then refreshes on subsequent calls.
+        let (go, g1) = decide_refresh(&s0, Some(10), 0);
+        assert!(!go);
+        let (go, _) = decide_refresh(&g1, Some(10), 0);
+        assert!(go);
+        // CPU get_bytes after seed bump refreshes even immediately after create.
+        let (go, _) = decide_refresh(&s0, Some(12), 0);
+        assert!(go);
     }
 }
