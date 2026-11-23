@@ -1041,11 +1041,15 @@ static MTLPurgeableState notePurgeable(unsigned kind,uint64_t answer,MTLPurgeabl
 }
 
 static std::atomic<uint64_t> gNextTraceObjectID{1};
-@implementation NBObject { uint64_t _traceObjectID; }
+@implementation NBObject { std::atomic<uint64_t> _traceObjectID; }
 - (id<MTLDevice>)device {return gDeviceObject;}
 - (uint64_t)globalTraceObjectID {
- if(!_traceObjectID)_traceObjectID=gNextTraceObjectID.fetch_add(1,std::memory_order_relaxed);
- return _traceObjectID;
+ uint64_t current=_traceObjectID.load(std::memory_order_relaxed);
+ if(current)return current;
+ uint64_t allocated=gNextTraceObjectID.fetch_add(1,std::memory_order_relaxed);
+ if(!allocated)allocated=gNextTraceObjectID.fetch_add(1,std::memory_order_relaxed);
+ uint64_t expected=0;
+ return _traceObjectID.compare_exchange_strong(expected,allocated,std::memory_order_relaxed)?allocated:expected;
 }
 - (BOOL)purgeHold:(BOOL)hold {(void)hold;return NO;}
 - (BOOL)keepForCommand:(NmbCommandBuffer *)command {(void)command;return YES;}
