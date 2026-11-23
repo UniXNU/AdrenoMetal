@@ -201,10 +201,11 @@ bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, u
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
-// A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size and plane 1's offset and rows.
-NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
-                                       uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
-                                       uint64_t chroma_bytes_per_row);
+// A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size, plane 1's offset and rows,
+// and its YCbCr matrix (0 = BT.601/default, 1 = BT.709, 2 = BT.2020).
+NmbTexture *nmb_texture_new_on_surface(NmbDevice *, NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset,
+                                       uint64_t bytes_per_row, uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height,
+                                       uint64_t chroma_offset, uint64_t chroma_bytes_per_row, uint32_t ycbcr_matrix);
 /* Two-plane YCbCr surface textures: made over their planes alone, made with their converted image, images made later at a slot
    binding, textures over their planes another call made whole, converted images alive and their bytes; then textures whose planes
    are read in place and those that keep their image alone by reason (device, layout, swizzle, offset, elements, reach, view). */

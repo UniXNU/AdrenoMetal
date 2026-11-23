@@ -44,6 +44,9 @@ pub mod heap;
 #[path = "NativeMetalTexture.rs"]
 pub mod texture;
 
+#[path = "NativeMetalYCbCr.rs"]
+pub mod ycbcr;
+
 #[path = "NativeMetalResources.rs"]
 pub mod resources;
 

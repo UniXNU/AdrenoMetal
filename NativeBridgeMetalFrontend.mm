@@ -1536,15 +1536,26 @@ static bool b3a8Planes(IOSurfaceRef surface,size_t allocation,size_t planes[4]) 
  gSurfaceB3a8++;
  return true;
 }
-// A texture over a two-plane surface: the runtime reads plane 1 from the surface's own layout (two-plane RGB and YCbCr formats).
+static uint32_t surfaceYCbCrMatrix(IOSurfaceRef surface) {
+ CFTypeRef value=IOSurfaceCopyValue(surface,CFSTR("IOSurfaceYCbCrMatrix"));
+ if(!value)return 0;
+ uint32_t matrix=0;
+ if(CFGetTypeID(value)==CFStringGetTypeID()) {
+  if(CFEqual(value,CFSTR("ITU_R_709_2")))matrix=1;
+  else if(CFEqual(value,CFSTR("ITU_R_2020")))matrix=2;
+ }
+ CFRelease(value);
+ return matrix;
+}
+// A texture over a two-plane surface: the bridge converts two-plane YCbCr planes on GPU from the surface's own layout.
 static NBTexture *textureOnSurface(NBBuffer *buffer,MTLTextureDescriptor *d,IOSurfaceRef surface,NSUInteger plane,NSUInteger offset,NSUInteger row) {
  NmbTextureDescriptor descriptor;if(!buffer || !textureDescriptor(d,&descriptor))return nil;
  const uint64_t base=(uintptr_t)IOSurfaceGetBaseAddress(surface),chroma=(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,1);
  uint64_t chromaOffset=chroma>=base?chroma-base:0,chromaRow=IOSurfaceGetBytesPerRowOfPlane(surface,1);
  size_t computed[4];   // myron: a 'b3a8' surface without plane rows
  if(!chromaRow && b3a8Planes(surface,IOSurfaceGetAllocSize(surface),computed)){chromaOffset=computed[2];chromaRow=computed[3];}
- NmbTexture *handle=nmb_texture_new_on_surface(buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
-  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow);
+ NmbTexture *handle=nmb_texture_new_on_surface(gDevice,buffer.handle,&descriptor,offset,row,IOSurfaceGetPixelFormat(surface),plane,
+  IOSurfaceGetWidth(surface),IOSurfaceGetHeight(surface),chromaOffset,chromaRow,surfaceYCbCrMatrix(surface));
  if(!handle){NBLOG(@"native-metal: texture over surface refused: %@",lastError());return nil;}
  NBTexture *texture=[NBTexture new];texture.handle=handle;nmb_texture_describe(handle,&descriptor);texture.descriptor=descriptor;
  texture.buffer=buffer;texture.offset=offset;texture.rowBytes=row;return texture;

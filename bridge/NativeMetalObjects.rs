@@ -172,7 +172,7 @@ pub unsafe extern "C" fn nmb_function_constant_air(length: *mut usize) -> *const
 
 // ---- device ----
 
-pub struct NmbDevice(Device, std::sync::Arc<crate::archive::Registry>, std::sync::Mutex<NoCopyPages>, std::sync::Arc<Purge>);
+pub struct NmbDevice(Device, std::sync::Arc<crate::archive::Registry>, std::sync::Mutex<NoCopyPages>, std::sync::Arc<Purge>, std::sync::Arc<crate::ycbcr::YCbCrConverter>);
 
 /// # Safety
 /// `loader` and `cache` are C strings.
@@ -197,7 +197,8 @@ pub unsafe extern "C" fn nmb_device_open(loader: *const c_char, cache: *const c_
         };
         write_runtime_policy(&device);
         let purge = Purge::new(&device);
-        Ok(boxed(NmbDevice(device, registry, std::sync::Mutex::default(), purge)))
+        let ycbcr = Arc::new(crate::ycbcr::YCbCrConverter::new());
+        Ok(boxed(NmbDevice(device, registry, std::sync::Mutex::default(), purge, ycbcr)))
     })
 }
 
@@ -1283,15 +1284,29 @@ pub extern "C" fn nmb_texture_new_on_buffer(buffer: *mut NmbBuffer, descriptor: 
 /// two-plane surface also gives its OSType, the asked plane, its size and plane 1's offset and rows (`chroma`, 0 and 0 for one plane),
 /// which a two-plane texture reads its second plane from.
 #[unsafe(no_mangle)]
-pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor, offset: u64,
-                                             bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
-                                             chroma_offset: u64, chroma_bytes_per_row: u64) -> *mut NmbTexture {
+pub extern "C" fn nmb_texture_new_on_surface(device: *mut NmbDevice, buffer: *mut NmbBuffer, descriptor: *const NmbTextureDescriptor,
+                                             offset: u64, bytes_per_row: u64, pixel_format: u32, plane: u64, width: u64, height: u64,
+                                             chroma_offset: u64, chroma_bytes_per_row: u64, ycbcr_matrix: u32) -> *mut NmbTexture {
     guard(std::ptr::null_mut(), || {
         let descriptor = texture_descriptor(descriptor)?;
-        if metal2vulkan::metal::format::ycbcr(descriptor.pixel_format) {
-            return Err(format!("upstream runtime-v2 has no YCbCr surface conversion: format={pixel_format:#x} plane={plane} surface={width}x{height} chroma={chroma_offset}/{chroma_bytes_per_row}"));
-        }
         let (tie, buffer) = (get(buffer)?.0.tie(), get(buffer)?.0.live()?);
+        if crate::ycbcr::is_ycbcr_pixel_format(descriptor.pixel_format) {
+            let converter = Arc::clone(&get(device)?.4);
+            let layout = crate::ycbcr::YCbCrSurfaceLayout {
+                luma_offset: offset,
+                luma_bytes_per_row: bytes_per_row,
+                chroma_offset,
+                chroma_bytes_per_row,
+                ostype: pixel_format,
+                plane,
+                surface_width: width,
+                surface_height: height,
+                matrix: crate::ycbcr::YCbCrMatrix::from_raw(ycbcr_matrix),
+            };
+            let source = crate::ycbcr::YCbCrSource::new(converter, (*buffer).clone(), layout);
+            let texture = source.convert(&descriptor)?;
+            return Ok(boxed(NmbTexture(Resource::tied(texture, tie))));
+        }
         let texture = buffer.new_texture(&descriptor, offset, bytes_per_row)?;
         Ok(boxed(NmbTexture(Resource::tied(texture, tie))))
     })
@@ -1305,9 +1320,13 @@ pub extern "C" fn nmb_texture_new_on_surface(buffer: *mut NmbBuffer, descriptor:
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_ycbcr_surface_counts(device: *const NmbDevice, out: *mut u64) -> bool {
     guard(false, || {
-        get(device)?;
-        if out.is_null() { return Err("null legacy statistics output".into()); }
-        Err("runtime-v1 statistics schema is unavailable; use runtime-v2 memory and metrics snapshots".into())
+        let device = get(device)?;
+        if out.is_null() { return Err("null YCbCr statistics output".into()); }
+        // SAFETY: the header's fourteen words.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 14) };
+        out.fill(0);
+        out[1] = device.4.converted_count();
+        Ok(true)
     })
 }
 

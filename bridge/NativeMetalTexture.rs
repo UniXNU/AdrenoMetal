@@ -109,6 +109,7 @@ pub struct Texture {
     pub(crate) ownership: Arc<crate::ownership::Ownership>,
     backing_size: u64,
     backing: Arc<crate::ownership::Ownership>,
+    ycbcr: Option<Arc<crate::ycbcr::YCbCrSource>>,
 }
 impl Deref for Texture {
     type Target = rt::Texture;
@@ -135,6 +136,7 @@ impl Texture {
             backing,
             backing_size,
             lease: Some(lease),
+            ycbcr: None,
         }
     }
     pub fn make_aliasable(&self) -> Result<(), String> {
@@ -163,6 +165,41 @@ impl Texture {
             backing: crate::ownership::Ownership::new(vec![]),
             backing_size: allocation_size(device, descriptor),
             lease: None,
+            ycbcr: None,
+        })
+    }
+    pub(crate) fn allocate_ycbcr_backing(
+        device: &rt::Device,
+        descriptor: &TextureDescriptor,
+        ycbcr: Arc<crate::ycbcr::YCbCrSource>,
+    ) -> Result<Self, String> {
+        let mut backing_desc = TextureDescriptor::texture_2d(
+            PixelFormat::RGBA16Float,
+            descriptor.width,
+            descriptor.height,
+            false,
+        );
+        backing_desc.resource_options = ResourceOptions::private();
+        backing_desc.usage = TextureUsage::SHADER_READ
+            | TextureUsage::SHADER_WRITE
+            | (descriptor.usage & TextureUsage::PIXEL_FORMAT_VIEW);
+        let index = crate::ownership::reserve(device, rt::IndexClass::Texture)?;
+        let raw = device
+            .new_texture(&backing_desc.runtime()?, Some(index.index()))
+            .map_err(|e| format!("ycbcr backing texture: {e:?}"))?;
+        let backing_size = allocation_size(device, &backing_desc);
+        let mut reported = descriptor.clone();
+        reported.swizzle = TextureSwizzleChannels::DEFAULT;
+        Ok(Self {
+            raw,
+            descriptor: reported,
+            device: device.clone(),
+            state: Arc::new(AtomicU64::new(2)),
+            ownership: crate::ownership::Ownership::new(vec![index.owner()]),
+            backing: crate::ownership::Ownership::new(vec![]),
+            backing_size,
+            lease: None,
+            ycbcr: Some(ycbcr),
         })
     }
     pub fn over_buffer(
@@ -190,6 +227,7 @@ impl Texture {
             backing_size: buffer.length(),
             backing: crate::ownership::Ownership::new(vec![buffer.ownership.clone()]),
             lease: None,
+            ycbcr: None,
         })
     }
     pub fn new_texture_view(&self, format: PixelFormat) -> Result<Self, String> {
@@ -225,12 +263,29 @@ impl Texture {
         slices: Range<u64>,
         swizzle: TextureSwizzleChannels,
     ) -> Result<Self, String> {
+        if let Some(ref ycbcr) = self.ycbcr {
+            if format != self.descriptor.pixel_format && crate::ycbcr::is_ycbcr_pixel_format(format)
+            {
+                if kind != TextureType::Type2D || levels != (0..1) || slices != (0..1) {
+                    return Err("YCbCr sibling views require whole single-level 2D range".into());
+                }
+                let mut view_desc = self.descriptor.clone();
+                view_desc.pixel_format = format;
+                view_desc.swizzle = swizzle;
+                return ycbcr.convert(&view_desc);
+            }
+        }
+        let runtime_format = if self.ycbcr.is_some() && format == self.descriptor.pixel_format {
+            PixelFormat::RGBA16Float
+        } else {
+            format
+        };
         let narrow = |v| u32::try_from(v).map_err(|_| "texture view range exceeds u32".to_owned());
         let index = crate::ownership::reserve(&self.device, rt::IndexClass::Texture)?;
         let raw = self
             .raw
             .new_texture_view_with_swizzle(
-                format,
+                runtime_format,
                 kind,
                 narrow(levels.start)?..narrow(levels.end)?,
                 narrow(slices.start)?..narrow(slices.end)?,
@@ -241,7 +296,12 @@ impl Texture {
         let runtime = raw.descriptor();
         let mut descriptor = self.descriptor.clone();
         descriptor.texture_type = runtime.texture_type;
-        descriptor.pixel_format = runtime.pixel_format;
+        descriptor.pixel_format = if self.ycbcr.is_some() && format == self.descriptor.pixel_format
+        {
+            format
+        } else {
+            runtime.pixel_format
+        };
         descriptor.width = runtime.width as u64;
         descriptor.height = runtime.height as u64;
         descriptor.depth = runtime.depth as u64;
@@ -257,6 +317,7 @@ impl Texture {
             backing: self.backing.clone(),
             backing_size: self.backing_size,
             lease: self.lease.clone(),
+            ycbcr: self.ycbcr.clone(),
         })
     }
     pub fn texture_type(&self) -> TextureType {
