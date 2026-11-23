@@ -68,7 +68,11 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
     let unsupported = || format!("runtime v2 has no device answer for {selector}");
     let narrow = |v| u32::try_from(v).map_err(|_| format!("device query argument {v} exceeds u32"));
     Ok(match selector {
-        "maxThreadgroupMemoryLength" => p.max_threadgroup_memory_length as u64,
+        "gpuCoreCount" => 1,
+        "maxVertexAmplificationCount" => 1,
+        "maxThreadgroupMemoryLength" | "maxComputeThreadgroupMemory" => {
+            p.max_threadgroup_memory_length as u64
+        }
         "argumentBuffersSupport" => device.argument_buffers_support().as_raw() as u64,
         "readWriteTextureSupport" => device.read_write_texture_support().as_raw() as u64,
         "maxColorAttachments" => l
@@ -138,7 +142,21 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
             .into_iter()
             .any(|n| device.supports_texture_sample_count(n))
             as u64,
+        "isLargeMRTSupported" => {
+            (l.max_color_attachments
+                .min(l.max_fragment_output_attachments)
+                >= 8) as u64
+        }
+        "supportsSamplerReductionMode" => profile
+            .enabled()
+            .features
+            .contains(&metal2vulkan::device::VkFeature::SamplerFilterMinmax)
+            as u64,
         "supportsSIMDGroup" => (p.simd.kernel.cross_lane != OpBits::NONE) as u64,
+        "supportsSIMDReduction" => p.simd.kernel.cross_lane.contains(OpBits::ARITHMETIC) as u64,
+        "supportsSIMDShuffleAndFill" => (p.simd.kernel.cross_lane.contains(OpBits::SHUFFLE)
+            && p.simd.kernel.cross_lane.contains(OpBits::SHUFFLE_RELATIVE))
+            as u64,
         "supportsPrimitiveType:" => (arg <= 4) as u64,
         "supportsTextureWriteRoundingMode:" => {
             metal2vulkan::metal::TextureWriteRoundingMode::from_raw(arg).is_ok() as u64
@@ -147,7 +165,8 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
         // Keep the frontend's existing OS compatibility families. No higher family is inferred from the Vulkan floor.
         "supportsFamily:" => [1001, 1002, 1003, 3001, 3002].contains(&arg) as u64,
         "isFramebufferReadSupported" => 1,
-        "supportsMemorylessRenderTargets"
+        "isRGB10A2GammaSupported"
+        | "supportsMemorylessRenderTargets"
         | "supportsTileShaders"
         | "supportsImageBlocks"
         | "supportsNonSquareTileShaders"
@@ -159,9 +178,49 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
         | "supportsProgrammableSamplePositions"
         | "supportsRasterizationRateMapWithLayerCount:"
         | "supportsCommandBufferJump"
+        | "supportsComputeCompressedTextureWrite"
+        | "supportsConditionalLoadStore"
+        | "supportsDynamicAttributeStride"
+        | "supportsMemoryOrderAtomics"
+        | "supportsResourceDetachBacking"
+        | "supportsSharedTextureHandles"
         | "supportsBufferWithAddressRanges"
         | "supportsBufferWithIOSurface"
         | "supportsHeapWithAddressRanges" => 0,
         _ => return Err(unsupported()),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_registered_selector_has_a_match_arm_in_answer() {
+        let source = include_str!("NativeMetalCapabilities.rs");
+        let answer_body = source
+            .split("pub fn answer(")
+            .nth(1)
+            .expect("answer function body");
+        let answer_body = answer_body
+            .split("#[cfg(test)]")
+            .next()
+            .expect("answer before tests");
+        let mut missing = Vec::new();
+        for selector in PRIVATE_COUNTS
+            .iter()
+            .chain(PRIVATE_FLAGS.iter())
+            .copied()
+            .chain(crate::objects::PUBLIC_ANSWERS.iter().map(|(s, _)| *s))
+        {
+            let needle = format!("\"{selector}\"");
+            if !answer_body.contains(&needle) {
+                missing.push(selector);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "registered selectors missing from capabilities::answer: {missing:?}"
+        );
+    }
 }

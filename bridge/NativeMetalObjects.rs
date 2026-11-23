@@ -709,7 +709,7 @@ pub extern "C" fn nmb_device_max_threads_per_threadgroup(device: *const NmbDevic
 
 /// The device selectors `nmb_device_answer` takes beyond Apple's private counts and flags: the selector and its kind
 /// (the header's NMB_ANSWER_* values).
-const PUBLIC_ANSWERS: &[(&str, u32)] = &[
+pub(crate) const PUBLIC_ANSWERS: &[(&str, u32)] = &[
     ("maxThreadgroupMemoryLength", 0),
     ("argumentBuffersSupport", 0),
     ("readWriteTextureSupport", 0),

@@ -1081,6 +1081,7 @@ static void waitForResource(id resource);
 @property(nonatomic) NmbTextureDescriptor descriptor;
 @property(nonatomic,strong) NBBuffer *buffer;
 @property(nonatomic) IOSurfaceRef surface;
+@property(nonatomic) NSUInteger surfacePlane;
 @property(nonatomic) NSUInteger offset,rowBytes;
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
@@ -1410,7 +1411,7 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (BOOL)isDrawable {return _descriptor.is_drawable!=0;}
 - (BOOL)allowGPUOptimizedContents {return _descriptor.allow_gpu_optimized_contents!=0;}
 - (IOSurfaceRef)iosurface {return _surface;}
-- (NSUInteger)iosurfacePlane {return 0;}
+- (NSUInteger)iosurfacePlane {return _surfacePlane;}
 - (id<MTLBuffer>)buffer {return _surface?nil:(id<MTLBuffer>)_buffer;}
 - (NSUInteger)bufferOffset {return _offset;}
 - (NSUInteger)bufferBytesPerRow {return _rowBytes;}
@@ -4800,6 +4801,7 @@ static void fillBaseLimits(id device);
  NBBuffer *buffer=[NBBuffer new];buffer.handle=handle;buffer.options=options;return (id<MTLBuffer>)buffer;
 }
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer length:(NSUInteger)length options:(MTLResourceOptions)options deallocator:(void (^)(void *,NSUInteger))deallocator {
+ if(!pointer)return nil;
  void *context=deallocator?(__bridge_retained void *)[deallocator copy]:nullptr;
  NmbBuffer *handle=nmb_buffer_new_no_copy_releasing(gDevice,pointer,length,options,context?releaseBlock:nullptr,context);
  if(!handle) {
@@ -4844,7 +4846,7 @@ static void fillBaseLimits(id device);
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);[texture countUse];return (id<MTLTexture>)texture;
+ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;[texture countUse];return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
