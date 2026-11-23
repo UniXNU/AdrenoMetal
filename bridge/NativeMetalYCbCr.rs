@@ -147,22 +147,21 @@ struct RefreshState {
 
 /// Pure refresh decision for a reused YCbCr texture backing.
 ///
-/// - Any observed IOSurface seed change triggers immediate reconversion.
-/// - `use_tag == 0` (CPU readback) skips only the initial post-create read if seed is unchanged.
-/// - `use_tag != 0` (command buffer ID) skips the initial post-create bind and deduplicates
-///   repeated binds within the same command buffer, while still refreshing on subsequent command
-///   buffers in case a producer updated mapped surface bytes without bumping the IOSurface seed.
+/// - When an IOSurface seed is tracked (`last_seed` and `current_seed` are both `Some`),
+///   reconversion runs only when the seed changes, avoiding redundant full-frame 4K compute
+///   dispatches across command buffers on static video/wallpaper surfaces.
+/// - When no seed callback is available (`None`), falls back to per-command-buffer refresh
+///   (skipping the initial post-create bind/read and deduplicating within the same CB).
 fn decide_refresh(state: &RefreshState, current_seed: Option<u32>, use_tag: u64) -> (bool, RefreshState) {
     let mut next = *state;
-    let seed_changed = match (state.last_seed, current_seed) {
-        (Some(prev), Some(curr)) => prev != curr,
-        _ => false,
-    };
-    if seed_changed {
-        next.last_seed = current_seed;
-        next.last_use_tag = use_tag;
+    if let (Some(prev), Some(curr)) = (state.last_seed, current_seed) {
         next.fresh_from_create = false;
-        return (true, next);
+        next.last_use_tag = use_tag;
+        if prev != curr {
+            next.last_seed = Some(curr);
+            return (true, next);
+        }
+        return (false, next);
     }
     if use_tag == 0 {
         if state.fresh_from_create {
@@ -629,33 +628,46 @@ mod tests {
             last_use_tag: 0,
             fresh_from_create: true,
         };
-        // First bind in CB 1 with unchanged seed skips redundant conversion.
+        // Unchanged IOSurface seed across CB1 -> CB2 -> CB3 triggers zero redundant conversions.
         let (go, s1) = decide_refresh(&s0, Some(10), 1);
         assert!(!go);
         assert!(!s1.fresh_from_create);
         assert_eq!(s1.last_use_tag, 1);
-        // Repeated bind in same CB 1 with unchanged seed is deduplicated.
-        let (go, s2) = decide_refresh(&s1, Some(10), 1);
+        let (go, s2) = decide_refresh(&s1, Some(10), 2);
         assert!(!go);
-        assert_eq!(s2, s1);
-        // Seed bump even within same CB 1 triggers immediate reconversion.
-        let (go, s3) = decide_refresh(&s2, Some(11), 1);
-        assert!(go);
-        assert_eq!(s3.last_seed, Some(11));
-        // Reuse in CB 2 refreshes even when producer did not bump IOSurface seed.
-        let (go, s4) = decide_refresh(&s3, Some(11), 2);
-        assert!(go);
-        assert_eq!(s4.last_use_tag, 2);
-        // Second bind in CB 2 is deduplicated.
-        let (go, _) = decide_refresh(&s4, Some(11), 2);
+        assert_eq!(s2.last_use_tag, 2);
+        let (go, s3) = decide_refresh(&s2, Some(10), 3);
         assert!(!go);
-        // CPU get_bytes right after create skips if seed unchanged, then refreshes on subsequent calls.
+        assert_eq!(s3.last_use_tag, 3);
+        // Seed bump triggers immediate reconversion even within the same CB.
+        let (go, s4) = decide_refresh(&s3, Some(11), 3);
+        assert!(go);
+        assert_eq!(s4.last_seed, Some(11));
+        // Subsequent CB with same new seed stays clean.
+        let (go, s5) = decide_refresh(&s4, Some(11), 4);
+        assert!(!go);
+        assert_eq!(s5.last_seed, Some(11));
+        // CPU get_bytes skips unchanged seed and refreshes immediately on seed bump.
         let (go, g1) = decide_refresh(&s0, Some(10), 0);
         assert!(!go);
         let (go, _) = decide_refresh(&g1, Some(10), 0);
-        assert!(go);
-        // CPU get_bytes after seed bump refreshes even immediately after create.
+        assert!(!go);
         let (go, _) = decide_refresh(&s0, Some(12), 0);
         assert!(go);
+
+        // Unseeded fallback keeps per-CB refresh and same-CB deduplication.
+        let u0 = RefreshState {
+            last_seed: None,
+            last_use_tag: 0,
+            fresh_from_create: true,
+        };
+        let (go, u1) = decide_refresh(&u0, None, 1);
+        assert!(!go);
+        let (go, u2) = decide_refresh(&u1, None, 1);
+        assert!(!go);
+        let (go, u3) = decide_refresh(&u2, None, 2);
+        assert!(go);
+        let (go, _) = decide_refresh(&u3, None, 2);
+        assert!(!go);
     }
 }
