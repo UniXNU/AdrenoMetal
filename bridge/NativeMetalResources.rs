@@ -283,6 +283,7 @@ impl Buffer {
             return Err("read-only host pages require Shared storage".into());
         }
         let imported = mapping.pointer();
+        let read_only = !mapping.is_writable() || requested_read_only;
         let callback = Box::new(move || {
             let callback = freed.lock().unwrap_or_else(|e| e.into_inner()).take();
             drop(mapping);
@@ -290,7 +291,6 @@ impl Buffer {
                 callback();
             }
         });
-        let read_only = !mapping.is_writable() || requested_read_only;
         let (block, _) = if read_only {
             // SAFETY: the ABI caller keeps these readable pages mapped until release runs;
             // runtime write paths refuse writes and the kernel pins the pages read-only.

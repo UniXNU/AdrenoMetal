@@ -384,20 +384,20 @@ index 4d1e36af..c1a693a2 100644
                  // command buffer commits.
                  let lent = unsafe { building.lend_texture(texture) };
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index 7101adc1..8a112e53 100644
+index 7101adc1..ecb4c685 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
-@@ -4027,6 +4027,10 @@ impl Texture {
-     /// returns.
-     ///
-     /// [`Metrics::bytes_copied`]: crate::Metrics::bytes_copied
+@@ -3657,6 +3657,10 @@ impl Texture {
+         self.view(pixel_format, texture_type, levels, slices, None, index)
+     }
+ 
 +    pub(crate) fn is_over_read_only_buffer(&self) -> bool {
 +        self.inner.over().is_some_and(|b| b.is_read_only())
 +    }
 +
-     pub fn replace_region(
-         &self,
-         region: Region,
+     /// `newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:`: the view
+     /// [`Texture::new_texture_view`] makes, its texels sampled and read through `swizzle`
+     /// combined with this texture's own, as Metal combines them: each channel the view takes from
 @@ -4037,6 +4041,9 @@ impl Texture {
          bytes_per_image: u64,
      ) -> Result<(), Error> {
@@ -408,19 +408,15 @@ index 7101adc1..8a112e53 100644
          let inner = &self.inner;
          let len = bytes.len() as u64;
          let Some(copy) = inner.copy(region, level, slice, len, bytes_per_row, bytes_per_image)?
-@@ -4829,6 +4836,11 @@ pub(crate) trait TextureObject {
+@@ -4829,6 +4836,7 @@ pub(crate) trait TextureObject {
          }
      }
  
-+    /// Whether it is a texture backed by a read-only imported host-memory buffer.
-+    fn is_over_read_only_buffer(&self) -> bool {
-+        self.object().over().is_some_and(|b| b.is_read_only())
-+    }
 +
      /// Whether it is a texture over a buffer of no device copy in an image of its own, which the
      /// submissions copy into and back by the Shared rules (`crate::over`): its form and its
      /// buffer's, read, nothing worked out.
-@@ -5054,6 +5066,13 @@ impl Buffer {
+@@ -5054,6 +5062,13 @@ impl Buffer {
          offset: u64,
          bytes_per_row: u64,
      ) -> Result<Texture, Error> {
