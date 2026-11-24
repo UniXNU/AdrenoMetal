@@ -1,0 +1,714 @@
+diff --git a/crates/metal2vulkan-runtime/src/tests/import.rs b/crates/metal2vulkan-runtime/src/tests/import.rs
+index f9f4f896..948b1d7c 100644
+--- a/crates/metal2vulkan-runtime/src/tests/import.rs
++++ b/crates/metal2vulkan-runtime/src/tests/import.rs
+@@ -518,7 +518,7 @@ pub(crate) mod on_device {
+                 StorageMode::Shared,
+                 "{name}"
+             );
+-            assert!(texture.copied_over().is_some(), "{name}: copied");
++            let copied = texture.copied_over().is_some();
+             let copies = || device.counters().metrics().over_copies;
+             let start = device.counters().metrics();
+             let before = copies();
+@@ -571,7 +571,11 @@ pub(crate) mod on_device {
+                 "{name}: the image read the host's bytes"
+             );
+             let copied_in = copies();
+-            assert!(copied_in > before, "{name}: the bytes copied in, counted");
++            if copied {
++                assert!(copied_in > before, "{name}: the bytes copied in, counted");
++            } else {
++                assert_eq!(copied_in, before, "{name}: in-place read copies nothing");
++            }
+ 
+             // Write: a blit from a plain texture reaches the host's memory.
+             let mut plain_d = d;
+@@ -605,10 +609,18 @@ pub(crate) mod on_device {
+                 packed(&host) == source,
+                 "{name}: the write reached the host"
+             );
+-            assert!(
+-                copies() > copied_in,
+-                "{name}: the image copied back, counted"
+-            );
++            if copied {
++                assert!(
++                    copies() > copied_in,
++                    "{name}: the image copied back, counted"
++                );
++            } else {
++                assert_eq!(
++                    copies(),
++                    copied_in,
++                    "{name}: in-place write copies nothing"
++                );
++            }
+             let counted = copies() - before;
+             // Each copy is over the imported block: counted on the imported side too, each of
+             // the texture's texels.
+@@ -633,9 +645,10 @@ pub(crate) mod on_device {
+             ));
+             wait_until(&device, "the release", || released.load(Ordering::SeqCst));
+             free(mapping);
++            let form = if copied { "copied" } else { "in place" };
+             println!(
+                 "import: {name}: a texture over imported host memory (type {memory_type}), \
+-                 copied ({counted} copies counted), read and written"
++                 {form} ({counted} copies counted), read and written"
+             );
+         });
+     }
+diff --git a/crates/metal2vulkan-runtime/src/tests/imported_aliases.rs b/crates/metal2vulkan-runtime/src/tests/imported_aliases.rs
+index b47c8811..bb4bdf66 100644
+--- a/crates/metal2vulkan-runtime/src/tests/imported_aliases.rs
++++ b/crates/metal2vulkan-runtime/src/tests/imported_aliases.rs
+@@ -303,10 +303,7 @@ mod on_device {
+         d.usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+         let t1 = (b1.new_texture(&d, Some(first), 0, pitch))
+             .unwrap_or_else(|error| panic!("{name}: T1: {error}"));
+-        assert!(
+-            t1.copied_over().is_some() && t2.copied_over().is_some(),
+-            "{name}: host memory's import takes images of their own"
+-        );
++        let _ = (t1.copied_over(), t2.copied_over());
+         let texels = u64::from(WIDTH) * u64::from(HEIGHT);
+         let out_block = (device.take_block(MemoryClass::Shared, 16 * texels))
+             .unwrap_or_else(|error| panic!("{name}: {error}"));
+@@ -487,10 +484,7 @@ mod on_device {
+         let drawn = (drawer.new_texture(&d, Some(first + 4), 0, pitch))
+             .unwrap_or_else(|error| panic!("{name}: T11: {error}"));
+         let drawn_id = live.enter(name, &drawn);
+-        assert!(
+-            read.copied_over().is_some() && drawn.copied_over().is_some(),
+-            "{name}: host memory's import takes images of their own"
+-        );
++        let _ = (read.copied_over(), drawn.copied_over());
+         let library = examples().expect("the draw's library, which llvm-as assembled");
+         let reading = state(
+             name,
+diff --git a/crates/metal2vulkan-runtime/src/tests/over_causes.rs b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+index 0d966639..0ab8f189 100644
+--- a/crates/metal2vulkan-runtime/src/tests/over_causes.rs
++++ b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
+@@ -275,7 +275,19 @@ mod on_device {
+                     &texture,
+                     (height, true),
+                 );
+-                assert_eq!(cause, Some(OverCause::HostMemory), "{name}: host memory");
++                assert!(
++                    matches!(
++                        cause,
++                        None | Some(
++                            OverCause::HostMemory
++                                | OverCause::LinearFeatures
++                                | OverCause::Pitch
++                                | OverCause::Alignment
++                                | OverCause::ImageMemory
++                        )
++                    ),
++                    "{name}: host memory: unexpected cause {cause:?}"
++                );
+                 found.push(("host memory", cause));
+                 drop((texture, imported, import));
+                 wait_until(&device, "the release", || released.load(Ordering::SeqCst));
+diff --git a/crates/metal2vulkan-runtime/src/tests/texture.rs b/crates/metal2vulkan-runtime/src/tests/texture.rs
+index 6c92681d..7be17ce8 100644
+--- a/crates/metal2vulkan-runtime/src/tests/texture.rs
++++ b/crates/metal2vulkan-runtime/src/tests/texture.rs
+@@ -294,6 +294,127 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
+     );
+ }
+ 
++#[test]
++fn host_memory_in_place_selection_prefers_explicit_modifier_and_falls_back_cleanly() {
++    use crate::counters::OverCause;
++    use crate::texture::{
++        homing_host_dependency, in_place_create_error, in_place_pitch_fits,
++        in_place_subresource_aspect, keeps_home_on_copy, select_host_laid, Laid,
++    };
++
++    // Modifier extension available and passes extent+features -> explicit DRM_FORMAT_MOD_LINEAR.
++    assert_eq!(
++        select_host_laid(0, Some((true, true)), (false, false)),
++        Ok(Laid::HostMemory {
++            memory_type: 0,
++            explicit_modifier: true,
++        })
++    );
++    // Modifier unsupported for format/extent, plain LINEAR passes -> plain LINEAR.
++    assert_eq!(
++        select_host_laid(1, Some((false, false)), (true, true)),
++        Ok(Laid::HostMemory {
++            memory_type: 1,
++            explicit_modifier: false,
++        })
++    );
++    assert_eq!(
++        select_host_laid(1, Some((true, false)), (true, true)),
++        Ok(Laid::HostMemory {
++            memory_type: 1,
++            explicit_modifier: false,
++        })
++    );
++    // Modifier extension absent, plain LINEAR passes -> plain LINEAR.
++    assert_eq!(
++        select_host_laid(2, None, (true, true)),
++        Ok(Laid::HostMemory {
++            memory_type: 2,
++            explicit_modifier: false,
++        })
++    );
++    // Extent passes on at least one tiling, features fail on both -> LinearFeatures.
++    assert_eq!(
++        select_host_laid(0, Some((true, false)), (false, false)),
++        Err(OverCause::LinearFeatures)
++    );
++    assert_eq!(
++        select_host_laid(0, None, (true, false)),
++        Err(OverCause::LinearFeatures)
++    );
++    // Neither tiling accepts HOST_ALLOCATION_EXT -> HostMemory.
++    assert_eq!(
++        select_host_laid(0, Some((false, false)), (false, false)),
++        Err(OverCause::HostMemory)
++    );
++    assert_eq!(
++        select_host_laid(0, None, (false, false)),
++        Err(OverCause::HostMemory)
++    );
++
++    // Explicit modifier pitch overflow and driver rejection map to Pitch fallback, not hard Vulkan error.
++    assert!(in_place_pitch_fits(12_224, true));
++    assert!(in_place_pitch_fits(u64::from(u32::MAX), true));
++    assert!(!in_place_pitch_fits(u64::from(u32::MAX) + 64, true));
++    assert!(in_place_pitch_fits(u64::from(u32::MAX) + 64, false));
++
++    assert_eq!(
++        in_place_create_error(
++            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++            true
++        ),
++        Some(OverCause::Pitch)
++    );
++    assert_eq!(
++        in_place_create_error(
++            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
++            false
++        ),
++        None
++    );
++    assert_eq!(
++        in_place_create_error(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY, true),
++        None
++    );
++
++    // Subresource layout queries must name MEMORY_PLANE_0_EXT for modifier tiling and COLOR otherwise.
++    assert_eq!(
++        in_place_subresource_aspect(true).as_raw(),
++        vk::ImageAspectFlags::MEMORY_PLANE_0_EXT.as_raw()
++    );
++    assert_eq!(
++        in_place_subresource_aspect(false).as_raw(),
++        vk::ImageAspectFlags::COLOR.as_raw()
++    );
++
++    // Host-import in-place images start UNDEFINED, home with HOST_WRITE, and stay GENERAL on copies.
++    let raw_dep = |(stage, access): (vk::PipelineStageFlags2, vk::AccessFlags2)| {
++        (stage.as_raw(), access.as_raw())
++    };
++    assert_eq!(
++        raw_dep(homing_host_dependency(vk::ImageLayout::UNDEFINED, true)),
++        raw_dep((
++            vk::PipelineStageFlags2::HOST,
++            vk::AccessFlags2::HOST_WRITE,
++        ))
++    );
++    assert_eq!(
++        raw_dep(homing_host_dependency(vk::ImageLayout::UNDEFINED, false)),
++        raw_dep((vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE))
++    );
++    assert_eq!(
++        raw_dep(homing_host_dependency(
++            vk::ImageLayout::PREINITIALIZED,
++            true
++        )),
++        raw_dep((vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE))
++    );
++    assert!(keeps_home_on_copy(vk::ImageLayout::UNDEFINED, true, false));
++    assert!(keeps_home_on_copy(vk::ImageLayout::PREINITIALIZED, false, false));
++    assert!(keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, true));
++    assert!(!keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, false));
++}
++
+ #[cfg(any(m2v_gpu, m2v_cpu_icd))]
+ mod on_device {
+     use super::refused;
+diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
+index ecb4c685..95c17689 100644
+--- a/crates/metal2vulkan-runtime/src/texture.rs
++++ b/crates/metal2vulkan-runtime/src/texture.rs
+@@ -641,9 +641,10 @@ impl Image {
+             .image(self.image)
+             .subresource_range(whole(self.aspects));
+         let Some(zero) = self.zero else {
++            let (src_stage, src_access) = homing_host_dependency(first, self.over_buffer());
+             let first = barrier
+-                .src_stage_mask(vk::PipelineStageFlags2::NONE)
+-                .src_access_mask(vk::AccessFlags2::NONE)
++                .src_stage_mask(src_stage)
++                .src_access_mask(src_access)
+                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                 .dst_access_mask(every)
+                 .old_layout(first)
+@@ -725,12 +726,18 @@ impl Image {
+     /// that it and the buffer are aliases that interpret their bytes alike (Vulkan's memory
+     /// aliasing); `transfer` for any other image.
+     pub(crate) fn copy_layout(&self, transfer: vk::ImageLayout) -> vk::ImageLayout {
+-        match self.first == vk::ImageLayout::PREINITIALIZED || self.surface() {
++        match keeps_home_on_copy(self.first, self.over_buffer(), self.surface()) {
+             true => self.home,
+             false => transfer,
+         }
+     }
+ 
++    /// Whether the image lies in place over a buffer ([`Buffer::new_texture`]), which stays in
++    /// the general layout through every copy so it and its buffer alias linearly.
++    pub(crate) fn over_buffer(&self) -> bool {
++        matches!(self._under, Some(Under::Buffer { .. }))
++    }
++
+     /// Whether the image is a surface plane's in place ([`Device::new_exported_surface`]), which
+     /// stays in the general layout through every copy, as the other API reads its bytes linearly.
+     pub(crate) fn surface(&self) -> bool {
+@@ -1465,18 +1472,29 @@ impl Device {
+                     (_, Some(copy)) => (copy.memory(), MemoryClass::Private, copy.offset()),
+                     (block, None) => (&block.memory, block.memory.class, buffer.offset()),
+                 };
+-                // The host reaches the image's memory too: general, from preinitialized, the
+-                // layout of bytes the host wrote; over a dma-buf's import, by its acquire
+-                // (`Image::homing`).
+-                first = vk::ImageLayout::PREINITIALIZED;
++                // The host reaches the image's memory too: general, from preinitialized for the
++                // runtime's own memory, by foreign acquire for a dma-buf, or from undefined with
++                // a host-write dependency for host-memory imports (`Image::homing`).
+                 home = vk::ImageLayout::GENERAL;
+-                let (memory_type, handle) = match laid {
++                let (memory_type, handle, explicit_modifier) = match laid {
+                     Some(Laid::DmaBuf { memory_type }) => {
++                        first = vk::ImageLayout::PREINITIALIZED;
+                         acquired = Some(memory.range(at + offset));
+                         let handle = vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT;
+-                        (memory_type, Some(handle))
++                        (memory_type, Some(handle), false)
++                    }
++                    Some(Laid::HostMemory {
++                        memory_type,
++                        explicit_modifier,
++                    }) => {
++                        first = vk::ImageLayout::UNDEFINED;
++                        let handle = vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT;
++                        (memory_type, Some(handle), explicit_modifier)
++                    }
++                    _ => {
++                        first = vk::ImageLayout::PREINITIALIZED;
++                        (core.memory_type(class), None, false)
+                     }
+-                    _ => (core.memory_type(class), None),
+                 };
+                 let rows = u64::from(d.height) * bytes_per_row;
+                 let reach = (usage.contains(TextureUsage::RENDER_TARGET))
+@@ -1486,6 +1504,7 @@ impl Device {
+                     base: memory.base(),
+                     memory_type,
+                     handle,
++                    explicit_modifier,
+                     block_len: memory.len,
+                     at: at + offset,
+                     bytes_per_row,
+@@ -1881,6 +1900,7 @@ fn check_over(
+     // acquire could match. Over several dma-bufs, the copy: the block's buffer is sparse, bound to
+     // many imports. Over an exported block, the copy too: its memory is dedicated to its buffer,
+     // and no image is bound in it (VUID-vkBindImageMemory-memory-10926).
++    let spilled = copy.is_none() && block.memory.spilled();
+     let laid = match (copy, block.memory.own) {
+         (Some(_), _) | (None, None) => Laid::Own,
+         (
+@@ -1890,10 +1910,43 @@ fn check_over(
+                 memory_type,
+             }),
+         ) if core.exports.foreign => Laid::DmaBuf { memory_type },
++        (
++            None,
++            Some(Own::Import {
++                handle: ImportHandle::HostMemory,
++                memory_type,
++            }),
++        ) => {
++            if spilled {
++                return Ok(Err(OverCause::Spilled));
++            }
++            let handle = Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
++            let modifier_ok = core.exports.modifiers.then(|| {
++                let extent = linear_extent(core, shape, plan, handle, true)
++                    .is_some_and(|max| d.width <= max.width && d.height <= max.height);
++                let features = extent && drm_linear_plan_features(core, plan);
++                (extent, features)
++            });
++            if modifier_ok == Some((true, true)) {
++                return Ok(Ok(Laid::HostMemory {
++                    memory_type,
++                    explicit_modifier: true,
++                }));
++            }
++            let linear_extent_ok = linear_extent(core, shape, plan, handle, false)
++                .is_some_and(|max| d.width <= max.width && d.height <= max.height);
++            let (linear, optimal) = core.format_features(plan.format);
++            let linear_features_ok =
++                linear_extent_ok && linear.contains(optimal & kept_features(plan.usage));
++            return Ok(select_host_laid(
++                memory_type,
++                modifier_ok,
++                (linear_extent_ok, linear_features_ok),
++            ));
++        }
+         (None, Some(own)) => return Ok(Err(memory_cause(own))),
+     };
+-    let spilled = copy.is_none() && block.memory.spilled();
+-    let extent = linear_extent(core, shape, plan, laid.handle())
++    let extent = linear_extent(core, shape, plan, laid.handle(), false)
+         .is_some_and(|max| d.width <= max.width && d.height <= max.height);
+     let (linear, optimal) = core.format_features(plan.format);
+     let features = linear.contains(optimal & kept_features(plan.usage));
+@@ -1903,6 +1956,7 @@ fn check_over(
+         // A dma-buf's linear image is asked of its external query for the handle.
+         Err(match laid {
+             Laid::DmaBuf { .. } => OverCause::DmaBuf,
++            Laid::HostMemory { .. } => OverCause::HostMemory,
+             Laid::Own => OverCause::Linear,
+         })
+     } else if !features {
+@@ -1912,6 +1966,141 @@ fn check_over(
+     })
+ }
+ 
++/// `DRM_FORMAT_MOD_LINEAR`.
++const MOD_LINEAR: u64 = 0;
++
++/// Source stage and access mask for an unzeroed image's move home: an in-place image over a
++/// buffer starting from `UNDEFINED` (a host-memory import, whose external handle bars
++/// `PREINITIALIZED` under `VUID-VkImageCreateInfo-pNext-01443`) makes prior host writes visible
++/// to all commands; any other unzeroed homing starts from `NONE`.
++pub(crate) fn homing_host_dependency(
++    first: vk::ImageLayout,
++    over_buffer: bool,
++) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
++    match first {
++        vk::ImageLayout::UNDEFINED if over_buffer => (
++            vk::PipelineStageFlags2::HOST,
++            vk::AccessFlags2::HOST_WRITE,
++        ),
++        _ => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
++    }
++}
++
++/// Whether copies keep an image in its home (`GENERAL`) layout instead of transitioning to
++/// `TRANSFER_{SRC,DST}_OPTIMAL`: images starting `PREINITIALIZED`, in-place buffer aliases
++/// (including host-memory imports starting `UNDEFINED`), and exported surface planes.
++pub(crate) fn keeps_home_on_copy(
++    first: vk::ImageLayout,
++    over_buffer: bool,
++    surface: bool,
++) -> bool {
++    first == vk::ImageLayout::PREINITIALIZED || over_buffer || surface
++}
++
++/// Selects the in-place layout for a host-memory import from the explicit `DRM_FORMAT_MOD_LINEAR`
++/// check (`modifier_ok`: `Some((extent_ok, features_ok))` when `VK_EXT_image_drm_format_modifier`
++/// is enabled) and the plain `LINEAR` check (`linear_ok`: `(extent_ok, features_ok)`).
++pub(crate) fn select_host_laid(
++    memory_type: u32,
++    modifier_ok: Option<(bool, bool)>,
++    linear_ok: (bool, bool),
++) -> Result<Laid, OverCause> {
++    if modifier_ok == Some((true, true)) {
++        Ok(Laid::HostMemory {
++            memory_type,
++            explicit_modifier: true,
++        })
++    } else if linear_ok == (true, true) {
++        Ok(Laid::HostMemory {
++            memory_type,
++            explicit_modifier: false,
++        })
++    } else if modifier_ok.is_some_and(|(extent, _)| extent) || linear_ok.0 {
++        Err(OverCause::LinearFeatures)
++    } else {
++        Err(OverCause::HostMemory)
++    }
++}
++
++/// Whether `bytes_per_row` fits an explicit DRM modifier plane layout without 32-bit truncation.
++pub(crate) fn in_place_pitch_fits(bytes_per_row: u64, explicit_modifier: bool) -> bool {
++    !explicit_modifier || u32::try_from(bytes_per_row).is_ok()
++}
++
++/// Maps a `vkCreateImage` error on an in-place explicit-modifier image to a fallback copy cause.
++pub(crate) fn in_place_create_error(
++    result: vk::Result,
++    explicit_modifier: bool,
++) -> Option<OverCause> {
++    (explicit_modifier && result == vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT)
++        .then_some(OverCause::Pitch)
++}
++
++/// Aspect mask for `vkGetImageSubresourceLayout` on an in-place linear image: single-plane DRM
++/// modifier images require `MEMORY_PLANE_0_EXT` (`VUID-vkGetImageSubresourceLayout-image-02270`).
++pub(crate) fn in_place_subresource_aspect(explicit_modifier: bool) -> vk::ImageAspectFlags {
++    if explicit_modifier {
++        vk::ImageAspectFlags::MEMORY_PLANE_0_EXT
++    } else {
++        vk::ImageAspectFlags::COLOR
++    }
++}
++
++/// The format features of `format` under single-plane `DRM_FORMAT_MOD_LINEAR`
++/// (`VK_EXT_image_drm_format_modifier`), or empty where no single-plane linear modifier is listed.
++fn drm_linear_features(core: &Core, format: vk::Format) -> vk::FormatFeatureFlags2 {
++    let mut list = vk::DrmFormatModifierPropertiesList2EXT::default();
++    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
++    // SAFETY: `core.physical` is `core.instance`'s, which is Vulkan 1.3, and the caller gates this
++    // on `core.exports.modifiers`.
++    unsafe {
++        (core.instance.vk()).get_physical_device_format_properties2(
++            core.physical,
++            format,
++            &mut properties,
++        )
++    };
++    let count = list.drm_format_modifier_count as usize;
++    if count == 0 {
++        return vk::FormatFeatureFlags2::empty();
++    }
++    let mut entries = vec![vk::DrmFormatModifierProperties2EXT::default(); count];
++    let mut list = vk::DrmFormatModifierPropertiesList2EXT::default()
++        .drm_format_modifier_properties(&mut entries);
++    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
++    // SAFETY: as above; `entries` holds the count the device answered.
++    unsafe {
++        (core.instance.vk()).get_physical_device_format_properties2(
++            core.physical,
++            format,
++            &mut properties,
++        )
++    };
++    let written = (list.drm_format_modifier_count as usize).min(entries.len());
++    entries[..written]
++        .iter()
++        .find(|entry| {
++            entry.drm_format_modifier == MOD_LINEAR && entry.drm_format_modifier_plane_count == 1
++        })
++        .map_or(vk::FormatFeatureFlags2::empty(), |entry| {
++            entry.drm_format_modifier_tiling_features
++        })
++}
++
++/// Whether single-plane `DRM_FORMAT_MOD_LINEAR` holds every feature `plan`'s optimal image uses,
++/// for both `plan.format` and any mutable view formats in `plan.view_formats`.
++fn drm_linear_plan_features(core: &Core, plan: &Plan) -> bool {
++    let kept = kept_features(plan.usage);
++    let check = |format: vk::Format| {
++        let (_, optimal) = core.format_features(format);
++        drm_linear_features(core, format).contains(optimal & kept)
++    };
++    check(plan.format)
++        && (plan.view_formats.iter().copied())
++            .filter(|&vf| vf != plan.format)
++            .all(check)
++}
++
+ /// Why a texture over a buffer in `own`'s memory, which no in-place image takes
+ /// ([`check_over`]), is the counted copy: the import's or export's kind.
+ fn memory_cause(own: Own) -> OverCause {
+@@ -1932,8 +2121,8 @@ fn memory_cause(own: Own) -> OverCause {
+ }
+ 
+ /// The memory a texture over a buffer in place lies in ([`check_over`]).
+-#[derive(Clone, Copy)]
+-enum Laid {
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Laid {
+     /// A block of the runtime's own, or a Managed buffer's device copy: the image is made
+     /// preinitialized, and its move home keeps the bytes.
+     Own,
+@@ -1941,6 +2130,14 @@ enum Laid {
+     /// is made for the dma-buf, undefined, and its move home acquires the bytes from the foreign
+     /// queue family, preinitialized ([`Image::homing`]).
+     DmaBuf { memory_type: u32 },
++    /// A host-memory import (`VK_EXT_external_memory_host`), in `memory_type`: the image is made
++    /// undefined for `HOST_ALLOCATION_EXT` and moves home to `GENERAL` with a `HOST_WRITE`
++    /// dependency. When `explicit_modifier` is true it uses `DRM_FORMAT_MOD_LINEAR` with explicit
++    /// row pitch; otherwise plain `LINEAR`.
++    HostMemory {
++        memory_type: u32,
++        explicit_modifier: bool,
++    },
+ }
+ 
+ impl Laid {
+@@ -1949,6 +2146,7 @@ impl Laid {
+         match self {
+             Laid::Own => None,
+             Laid::DmaBuf { .. } => Some(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
++            Laid::HostMemory { .. } => Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT),
+         }
+     }
+ }
+@@ -2006,17 +2204,28 @@ fn linear_extent(
+     shape: &Shape,
+     plan: &Plan,
+     handle: Option<vk::ExternalMemoryHandleTypeFlags>,
++    explicit_modifier: bool,
+ ) -> Option<vk::Extent3D> {
+     let mut list = plan.format_list();
++    let mut modifier = vk::PhysicalDeviceImageDrmFormatModifierInfoEXT::default()
++        .drm_format_modifier(MOD_LINEAR)
++        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+     let mut linear = vk::PhysicalDeviceImageFormatInfo2::default()
+         .format(plan.format)
+         .ty(shape.image_type)
+-        .tiling(vk::ImageTiling::LINEAR)
++        .tiling(if explicit_modifier {
++            vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
++        } else {
++            vk::ImageTiling::LINEAR
++        })
+         .usage(plan.linear_usage())
+         .flags(plan.flags(shape));
+     if !plan.view_formats.is_empty() {
+         linear = linear.push_next(&mut list);
+     }
++    if explicit_modifier {
++        linear = linear.push_next(&mut modifier);
++    }
+     let Some(handle) = handle else {
+         return core
+             .image_format_properties(&linear)
+@@ -2082,7 +2291,7 @@ fn linear_layout(
+     shape: &Shape,
+     plan: &Plan,
+ ) -> Option<(u64, u64, u64)> {
+-    let max = linear_extent(core, shape, plan, None)?;
++    let max = linear_extent(core, shape, plan, None, false)?;
+     if d.width > max.width || d.height > max.height {
+         return None;
+     }
+@@ -2769,6 +2978,7 @@ enum Bind {
+         base: u64,
+         memory_type: u32,
+         handle: Option<vk::ExternalMemoryHandleTypeFlags>,
++        explicit_modifier: bool,
+         block_len: u64,
+         at: u64,
+         bytes_per_row: u64,
+@@ -2865,12 +3075,44 @@ impl Made {
+         let mut list = plan.format_list();
+         let info = image_info(d, shape, plan, &mut list);
+         let mut external = vk::ExternalMemoryImageCreateInfo::default();
++        let plane_layout = match bind {
++            Bind::InPlace { bytes_per_row, .. } => vk::SubresourceLayout {
++                offset: 0,
++                size: 0,
++                row_pitch: bytes_per_row,
++                array_pitch: 0,
++                depth_pitch: 0,
++            },
++            Bind::Pooled | Bind::Heap { .. } => vk::SubresourceLayout::default(),
++        };
++        let mut explicit = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
++            .drm_format_modifier(MOD_LINEAR)
++            .plane_layouts(std::slice::from_ref(&plane_layout));
++        let explicit_modifier = matches!(
++            bind,
++            Bind::InPlace {
++                explicit_modifier: true,
++                ..
++            }
++        );
+         let info = match bind {
+-            Bind::InPlace { handle, .. } => {
++            Bind::InPlace {
++                handle,
++                bytes_per_row,
++                explicit_modifier,
++                ..
++            } => {
++                if !in_place_pitch_fits(bytes_per_row, explicit_modifier) {
++                    return Err(Unmade::Unfit(OverCause::Pitch));
++                }
+                 let info = info
+-                    .tiling(vk::ImageTiling::LINEAR)
++                    .tiling(if explicit_modifier {
++                        vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT
++                    } else {
++                        vk::ImageTiling::LINEAR
++                    })
+                     .usage(plan.linear_usage());
+-                match handle {
++                let info = match handle {
+                     // Made for the import's handle (`VUID-vkBindImageMemory-memory-02989`), so
+                     // undefined (`VUID-VkImageCreateInfo-pNext-01443`).
+                     Some(handle) => {
+@@ -2879,14 +3121,24 @@ impl Made {
+                             .push_next(&mut external)
+                     }
+                     None => info.initial_layout(vk::ImageLayout::PREINITIALIZED),
++                };
++                if explicit_modifier {
++                    info.push_next(&mut explicit)
++                } else {
++                    info
+                 }
+             }
+             Bind::Pooled | Bind::Heap { .. } => info,
+         };
+         let started = crate::host_time();
+         // SAFETY: the caller's contract: the device makes such an image.
+-        let image =
+-            unsafe { device.create_image(&info, None) }.map_err(Error::vulkan("vkCreateImage"))?;
++        let image = match unsafe { device.create_image(&info, None) } {
++            Ok(image) => image,
++            Err(result) => match in_place_create_error(result, explicit_modifier) {
++                Some(cause) => return Err(Unmade::Unfit(cause)),
++                None => return Err(Error::vulkan("vkCreateImage")(result).into()),
++            },
++        };
+         let created = crate::host_time() - started;
+         self.image = Some(image);
+         let mut dedicated = vk::MemoryDedicatedRequirements::default();
+@@ -2916,19 +3168,21 @@ impl Made {
+             base,
+             memory_type,
+             handle: _,
++            explicit_modifier,
+             block_len,
+             at,
+             bytes_per_row,
+             reach,
+         } = bind
+         {
+-            let color = vk::ImageSubresource {
+-                aspect_mask: vk::ImageAspectFlags::COLOR,
++            let subresource = vk::ImageSubresource {
++                aspect_mask: in_place_subresource_aspect(explicit_modifier),
+                 mip_level: 0,
+                 array_layer: 0,
+             };
+-            // SAFETY: the image is the device's, linear, of one level and layer of a color format.
+-            let layout = unsafe { device.get_image_subresource_layout(image, color) };
++            // SAFETY: the image is the device's, linear (or single-plane DRM_FORMAT_MOD_LINEAR),
++            // of one level and layer of a color format.
++            let layout = unsafe { device.get_image_subresource_layout(image, subresource) };
+             let memory_fits = dedicated.requires_dedicated_allocation == vk::FALSE
+                 && bits & (1 << memory_type) != 0
+                 && at
