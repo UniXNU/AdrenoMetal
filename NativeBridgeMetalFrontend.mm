@@ -684,6 +684,19 @@ static void onLargeStack(void (^body)(void)) {
 // its Metal cache directory but not Library/Caches: with the replies only there it kept none, and each of its launches compiled
 // every request again.
 static std::string gCacheRoot;   // the pipeline cache directory the device opened with (native_bridge_metal_open)
+#if !TARGET_OS_OSX
+extern "C" bool native_bridge_metal_cache_matches(id<MTLDevice> device, const char *root) {
+ return device && device==gDeviceObject && root && gCacheRoot==root;
+}
+extern "C" bool nmb_device_publish_pipeline_cache(const NmbDevice *);
+extern "C" bool nmb_device_merge_pipeline_cache(const NmbDevice *);
+extern "C" bool native_bridge_publish_pipeline_cache(void) {
+ return gDevice && nmb_device_publish_pipeline_cache(gDevice);
+}
+extern "C" bool native_bridge_merge_pipeline_cache(void) {
+ return gDevice && nmb_device_merge_pipeline_cache(gDevice);
+}
+#endif
 // The system shader cache as this process uses it (native_bridge_metal_system_cache): 0 not named, 1 read as a layer, 2 filled by
 // this process, 3 refused; its directory or the refusal's reason; and the compiler replies the layer answered.
 static int gSystemCacheState;
@@ -1636,9 +1649,10 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLDataType type;
 @property(nonatomic) NSUInteger index;
-@property(nonatomic,getter=isRequired) BOOL required;
+@property(nonatomic) BOOL required;
 @end
 @implementation NBFunctionConstant
+- (BOOL)isRequired {return self.required;}
 @end
 @interface NBFunctionAttribute : NSObject
 @property(nonatomic,copy) NSString *name;
@@ -1854,14 +1868,19 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
-  char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
+  const size_t length=nmb_library_function_name(_handle,i,nullptr,0);
+  if(!length)continue;
+  std::vector<char> bytes(length+1);
+  nmb_library_function_name(_handle,i,bytes.data(),bytes.size());
+  if(NSString *name=[NSString stringWithUTF8String:bytes.data()])[names addObject:name];
  }
  return names;
 }
 - (NSArray<NSString *> *)nb_primeFunctionNames {
  NSMutableArray<NSString *> *names=[NSMutableArray array];
  if(!forEachLibraryEntry(self,[&](const std::string &entry,int type) {
-  if((type==0 || type==2) && !entry.empty())[names addObject:@(entry.c_str())];
+  if((type==0 || type==2) && !entry.empty())
+   if(NSString *name=@(entry.c_str()))[names addObject:name];
   return true;
  }))return self.functionNames;
  return names;

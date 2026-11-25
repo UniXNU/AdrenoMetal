@@ -677,6 +677,21 @@ pub extern "C" fn nmb_device_release(device: *mut NmbDevice) {
     release(device)
 }
 
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_publish_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || Ok(get(device)?.0.publish_pipeline_cache()))
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_merge_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || {
+        let device = get(device)?;
+        Ok(device.1.merge_system_pipeline_cache(&device.0))
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_name(device: *const NmbDevice, out: *mut c_char, size: usize) -> usize {
     guard(0, || {

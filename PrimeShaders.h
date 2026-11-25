@@ -15,16 +15,19 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <errno.h>
 #include <unistd.h>
 #include <set>
 #include <string>
 #include <vector>
 #include <functional>
+#include <map>
 
 extern "C" unsigned native_bridge_metal_recent_commits(uint64_t windowUs);
 
 @interface NSObject (NBPrimeZeroConstants)
 - (id<MTLFunction>)nb_newFunctionWithZeroConstants:(NSString *)name;
+- (id<MTLFunction>)nb_newFunctionForPriming:(NSString *)name requiredOnly:(BOOL)requiredOnly oneIndex:(uint32_t)index;
 - (NSArray<NSString *> *)nb_primeFunctionNames;
 @end
 
@@ -43,6 +46,8 @@ extern "C" void native_bridge_metal_quiet_problems(bool);
 namespace prime {
 static std::function<void(const std::string &, const std::string &)> progress;
 static std::function<bool()> cancelled;
+static std::function<void()> beforeFirstAttempt;
+static unsigned unopenedLibraries, deferredInventory;
 static bool stopping() {return cancelled && cancelled();}
 static void report(const std::string &library = {}, const std::string &function = {}) {
     if (progress) progress(library, function);
@@ -57,11 +62,12 @@ static const char *const kRoots[] = {"/System/Library", "/Applications", "/Syste
 static std::set<std::string> readLines(const std::string &path) {
     std::set<std::string> lines;
     if (FILE *f = fopen(path.c_str(), "r")) {
-        char line[1024];
-        while (fgets(line, sizeof line, f)) {
-            line[strcspn(line, "\n")] = 0;
-            if (line[0]) lines.insert(line);
-        }
+        char *line = nullptr;
+        size_t capacity = 0;
+        ssize_t size;
+        while ((size = getline(&line, &capacity, f)) > 0)
+            if (size > 1 && line[size - 1] == '\n') lines.emplace(line, size - 1);
+        free(line);
         fclose(f);
     }
     return lines;
@@ -90,6 +96,33 @@ static void appendLine(const std::string &path, const std::string &line) {
 static void writeCurrent(const std::string &path, const std::string &line) {
     if (FILE *f = fopen(path.c_str(), "w")) {fprintf(f, "%s\n", line.c_str()); fflush(f); fsync(fileno(f)); fclose(f);}
 }
+struct Checkpoints {
+    std::vector<std::string> functions, libraries, partialLibraries;
+    unsigned attempts = 0;
+};
+#if !TARGET_OS_OSX
+// Save functions before the terminal library records that depend on them.
+static bool saveCheckpoints(const std::string &path, const std::vector<std::string> &pending) {
+    if (pending.empty()) return true;
+    auto lines = readLines(path);
+    lines.insert(pending.begin(), pending.end());
+    std::string temp = path + ".XXXXXX";
+    const int fd = mkstemp(temp.data());
+    if (fd < 0) return false;
+    FILE *file = fdopen(fd, "w");
+    bool ok = file != nullptr;
+    if (file) {
+        for (const auto &line : lines) {
+            if (fprintf(file, "%s\n", line.c_str()) < 0) {ok = false; break;}
+        }
+        ok = ok && fflush(file) == 0 && fsync(fd) == 0;
+        if (fclose(file) != 0) ok = false;
+    } else close(fd);
+    if (ok && rename(temp.c_str(), path.c_str()) == 0) return true;
+    unlink(temp.c_str());
+    return false;
+}
+#endif
 static uint64_t nowMs() {return clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000000;}
 
 static std::string bootSession() {
@@ -114,25 +147,42 @@ static std::vector<std::string> libraries(const std::string &listPath, std::stri
     const char *source = listPath.empty() ? "(none)" : listPath.c_str();
     if (list.empty()) {list = embeddedLines(); source = "embedded";}
     const bool inventory = !list.empty();
-    for (const std::string &path : list) {
+    for (const auto &entry : list) {
+        if (stopping()) break;
+        std::string path = entry;
         ++lines;
         struct stat st = {};
         if (path.empty() || path[0] != '/') {++invalid; continue;}
-        if (stat(path.c_str(), &st) != 0) {++failed; lastErrno = errno; continue;}
+        if (stat(path.c_str(), &st) != 0) {
+            lastErrno = errno;
+#if !TARGET_OS_OSX
+            static constexpr char staged[] = "/private/var/staged_system_apps/";
+            if (lastErrno == ENOENT && path.compare(0, sizeof staged - 1, staged) == 0) {
+                path = "/Applications/" + path.substr(sizeof staged - 1);
+                if (stat(path.c_str(), &st) != 0) {
+                    lastErrno = errno;
+                    if (lastErrno == ENOENT) {++deferredInventory; continue;}
+                }
+            }
+#endif
+            if (!S_ISREG(st.st_mode)) {++failed; continue;}
+        }
         if (!S_ISREG(st.st_mode)) {++invalid; continue;}
         if (seen.insert({st.st_dev, st.st_ino}).second) found.push_back(path);
     }
     char line[200];
-    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d invalid=%u inventory=%u", source, lines,
-             found.size(), failed, lastErrno, invalid, inventory ? 1u : 0u);
+    snprintf(line, sizeof line, "list %s lines=%u kept=%zu stat-failed=%u errno=%d invalid=%u inventory=%u deferred=%u", source, lines,
+             found.size(), failed, lastErrno, invalid, inventory ? 1u : 0u, deferredInventory);
     note = line;
     native_prime_inventory_failed = failed + invalid + (inventory ? 0u : 1u);
     for (const char *root : kRoots) {
-        if (!found.empty()) break;
+        if (!found.empty() || stopping()) break;
         char *paths[] = {const_cast<char *>(root), nullptr};
         FTS *fts = fts_open(paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nullptr);
         if (!fts) continue;
-        while (FTSENT *e = fts_read(fts)) {
+        while (!stopping()) {
+            FTSENT *e = fts_read(fts);
+            if (!e) break;
             if (e->fts_info != FTS_F || e->fts_namelen < 9 || strcmp(e->fts_name + e->fts_namelen - 9, ".metallib")) continue;
             if (seen.insert({e->fts_statp->st_dev, e->fts_statp->st_ino}).second) found.push_back(e->fts_path);
         }
@@ -166,7 +216,7 @@ static uint64_t waitForQuiet() {
         const uint64_t now = nowMs();
         const unsigned commits = native_bridge_metal_recent_commits(250000);
         if (commits > native_prime_rate) native_prime_rate = commits;
-        if (now - began >= 10000) return now - began;
+        if (stopping() || now - began >= 10000) return now - began;
         if (commits > kQuietCommits) {busy = true; quietSince = 0; native_prime_compiling = 2;}
         else if (!busy) return 0;
         else if (!quietSince) quietSince = now;
@@ -275,7 +325,7 @@ static std::string buildId() {
 static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunction> kernel, NSError **error) {
     NSMutableArray<id<MTLFunction>> *linked = [NSMutableArray array];
     NSMutableSet<NSString *> *symbols = [NSMutableSet set];
-    for (unsigned round = 0; round < 16; ++round) {
+    for (unsigned round = 0; round < 16 && !stopping(); ++round) {
         NSString *why = (*error).localizedDescription;
         NSRange at = [why rangeOfString:@"LinkedFunction { symbol: \""];
         if (at.location == NSNotFound) return false;
@@ -304,11 +354,57 @@ static bool linkedKernel(id<MTLDevice> device, id<MTLLibrary> lib, id<MTLFunctio
 
 static id<MTLFunction> defaultFunction(id<MTLLibrary> lib, NSString *name, unsigned &zeroed) {
     id<MTLFunction> function = [lib newFunctionWithName:name];
+#if !TARGET_OS_OSX
+    if (function.functionConstantsDictionary.count &&
+        [lib respondsToSelector:@selector(nb_newFunctionForPriming:requiredOnly:oneIndex:)]) {
+        function = [(NSObject *)lib nb_newFunctionForPriming:name requiredOnly:YES oneIndex:UINT32_MAX];
+        if (function) ++zeroed;
+    }
+#else
     if (function.functionConstantsDictionary.count && [lib respondsToSelector:@selector(nb_newFunctionWithZeroConstants:)]) {
         function = [(NSObject *)lib nb_newFunctionWithZeroConstants:name];
         if (function) ++zeroed;
     }
+#endif
     return function;
+}
+
+#if !TARGET_OS_OSX
+static id<MTLFunction> primingMPSBatch(id<MTLLibrary> library, NSString *name, NSError *error) {
+    if (![error.localizedDescription containsString:@"InvalidDescriptor(OverlappingArgument"] ||
+        ![library respondsToSelector:@selector(nb_newFunctionForPriming:requiredOnly:oneIndex:)] || stopping()) return nil;
+    MTLFunctionConstant *batch = [library newFunctionWithName:name].functionConstantsDictionary[@"MPSMaxBatchSize"];
+    if (!batch.required || batch.index >= UINT32_MAX) return nil;
+    return [(NSObject *)library nb_newFunctionForPriming:name requiredOnly:YES oneIndex:(uint32_t)batch.index];
+}
+#endif
+
+static bool buildPrimeRender(id<MTLDevice> device, MTLRenderPipelineDescriptor *descriptor,
+                             MTLPixelFormat format, NSError **error) {
+    *error = nil;
+    if ([device newRenderPipelineStateWithDescriptor:descriptor error:error]) return true;
+#if !TARGET_OS_OSX
+    // QuartzCore's auxiliary attachment must remain single-channel in both target formats.
+    for (unsigned retry = 0; retry < 16 && !stopping(); ++retry) {
+        NSString *why = (*error).localizedDescription;
+        if (!why) return false;
+        const NSRange prefix = [why rangeOfString:@"InvalidDescriptor(ColorAttachment { index: "];
+        if (prefix.location == NSNotFound) return false;
+        NSScanner *scan = [NSScanner scannerWithString:[why substringFromIndex:NSMaxRange(prefix)]];
+        int index = -1;
+        if (![scan scanInt:&index] || ![scan scanString:@", metal: NilWithError }" intoString:nil] || index < 0 || index >= 8)
+            return false;
+        auto *attachment = descriptor.colorAttachments[index];
+        if (attachment.pixelFormat == MTLPixelFormatInvalid) attachment.pixelFormat = format;
+        else if (attachment.pixelFormat == format) attachment.pixelFormat = MTLPixelFormatR8Unorm;
+        else return false;
+        *error = nil;
+        if ([device newRenderPipelineStateWithDescriptor:descriptor error:error]) return true;
+    }
+#else
+    (void)format;
+#endif
+    return false;
 }
 
 // Canonical packed inputs follow the function's reflected scalar type and lane count.
@@ -349,7 +445,8 @@ static MTLVertexDescriptor *vertexInputs(id<MTLFunction> function) {
 static std::string library(id<MTLDevice> device, const std::string &path, const std::string &current, const std::set<std::string> &bad,
                            const std::string &functionsPath, const std::set<std::string> &functionsDone,
                            const std::string &refusedPath, const std::set<std::string> &refusedDone,
-                           const std::string &build, bool &complete) {
+                           const std::string &build, const std::string &revision,
+                           bool &complete, bool &loaded, Checkpoints *checkpoints) {
     complete = false;
     unsigned kernels = 0, renders = 0, made = 0, refused = 0, skipped = 0, zeroed = 0, linkedMade = 0, halfMade = 0;
     const unsigned earlierRefusals = native_prime_functions_refused;
@@ -360,10 +457,12 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
         NSError *error = nil;
         // Reading and parsing a library is work too: not during an animation either.
         waited += waitForQuiet();
+        if (stopping()) return path + " paused before loading";
         native_prime_compiling = 3;
         id<MTLLibrary> lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@(path.c_str())] error:&error];
         native_prime_compiling = 0;
         if (!lib) return path + " library refused: " + (error ? error.localizedDescription.UTF8String : "no error");
+        loaded = true;
         NSArray<NSString *> *names = lib.functionNames;
         NSArray<NSString *> *entries = [lib respondsToSelector:@selector(nb_primeFunctionNames)] ? [(NSObject *)lib nb_primeFunctionNames] : names;
         for (NSString *name in entries) {
@@ -372,24 +471,43 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                 native_prime_functions_refused = earlierRefusals + refused;
                 report(path, name.UTF8String);
                 const std::string key = path + "\t" + name.UTF8String;
-                const std::string doneKey = key + "\t" + build;
+                const std::string doneKey = key + revision + "\t" + build;
                 native_prime_compiling = 3;
+                if (functionsDone.count(doneKey)) {++made; continue;}
                 if (bad.count(doneKey)) {++skipped; continue;}
                 const std::string attemptKey = doneKey + "-inputs3";
                 if (refusedDone.count(attemptKey)) {++refused; continue;}
-                if (functionsDone.count(doneKey)) {++made; continue;}
-                id<MTLFunction> function = defaultFunction(lib, name, zeroed);
-                if (!function) {++refused; native_prime_functions_refused = earlierRefusals + refused; appendLine(refusedPath, attemptKey); report(path, name.UTF8String); continue;}
-                const MTLFunctionType type = function.functionType;
-                if (type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) continue;
                 waited += waitForQuiet();
+                if (stopping()) break;
+                if (beforeFirstAttempt) {beforeFirstAttempt(); beforeFirstAttempt = {};}
+                if (stopping()) break;
                 writeCurrent(current, doneKey);
-                native_prime_compiling = 1;
+                error = nil;
                 bool ok = false;
                 @try {
-                    if (type == MTLFunctionTypeKernel) {
+                    id<MTLFunction> function = defaultFunction(lib, name, zeroed);
+                    const MTLFunctionType type = function.functionType;
+                    if (function && type != MTLFunctionTypeKernel && type != MTLFunctionTypeVertex) {
+                        unlink(current.c_str());
+                        continue;
+                    }
+                    native_prime_compiling = 1;
+                    if (!function) {
+                        ok = false;
+                    } else if (type == MTLFunctionTypeKernel) {
                         ++kernels;
                         ok = [device newComputePipelineStateWithFunction:function error:&error] != nil;
+#if !TARGET_OS_OSX
+                        if (!ok) {
+                            id<MTLFunction> variant = primingMPSBatch(lib, name, error);
+                            if (variant) {
+                                ++zeroed;
+                                function = variant;
+                                error = nil;
+                                ok = [device newComputePipelineStateWithFunction:function error:&error] != nil;
+                            }
+                        }
+#endif
                         if (!ok && [error.localizedDescription containsString:@"LinkedFunction"]) {
                             ok = linkedKernel(device, lib, function, &error);
                             if (ok) ++linkedMade;
@@ -411,18 +529,23 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                                 if (d.fragmentFunction) break;
                             }
                         }
-                        ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                        ok = buildPrimeRender(device, d, MTLPixelFormatBGRA8Unorm, &error);
                         if (!ok && [error.localizedDescription containsString:@"RasterizedVoidVertex"]) {
                             d.rasterizationEnabled = NO;
-                            error = nil;
-                            ok = [device newRenderPipelineStateWithDescriptor:d error:&error] != nil;
+                            ok = buildPrimeRender(device, d, MTLPixelFormatBGRA8Unorm, &error);
                         }
                         // The render server's framebuffer is half-float (RGhA) on this board: its pipelines draw into RGBA16Float, a state
                         // of its own to Turnip, so the same pair is made for it too.
                         if (ok) {
+#if !TARGET_OS_OSX
+                            for (NSUInteger i = 0; i < 8; ++i)
+                                if (d.colorAttachments[i].pixelFormat == MTLPixelFormatBGRA8Unorm)
+                                    d.colorAttachments[i].pixelFormat = MTLPixelFormatRGBA16Float;
+#else
                             d.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA16Float;
+#endif
                             NSError *half = nil;
-                            if ([device newRenderPipelineStateWithDescriptor:d error:&half]) ++halfMade;
+                            if (buildPrimeRender(device, d, MTLPixelFormatRGBA16Float, &half)) ++halfMade;
                             else {ok = false; error = half;}
                         }
                     }
@@ -430,7 +553,11 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
                     ok = false;
                 }
                 native_prime_compiling = 0;
-                appendLine(ok ? functionsPath : refusedPath, ok ? doneKey : attemptKey);
+                if (!ok && stopping()) break;
+                if (checkpoints) ++checkpoints->attempts;
+                if (ok && checkpoints) checkpoints->functions.push_back(doneKey);
+                else appendLine(ok ? functionsPath : refusedPath, ok ? doneKey : attemptKey);
+                unlink(current.c_str());
                 ok ? ++made : ++refused;
                 if (ok) native_prime_made = native_prime_made + 1;
                 if (!ok && firstRefusal.empty()) {
@@ -450,7 +577,7 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
     unlink(current.c_str());
     native_prime_functions_refused = earlierRefusals + refused;
     native_prime_functions_skipped = native_prime_functions_skipped + skipped;
-    complete = refused == 0 && skipped == 0;
+    complete = !stopping() && refused == 0 && skipped == 0;
     char line[200];
     snprintf(line, sizeof line, " kernels=%u renders=%u made=%u half=%u zeroed=%u linked=%u refused=%u skipped=%u ms=%llu waited=%llu", kernels, renders,
              made, halfMade, zeroed, linkedMade, refused, skipped, (unsigned long long)(nowMs() - began), (unsigned long long)waited);
@@ -461,9 +588,16 @@ static std::string library(id<MTLDevice> device, const std::string &path, const 
 // `wholeSystem` (macOS): this process fills the system shader cache (SharedShaderCache.h), which every process reads, so every
 // library of the list is primed but those of other GPUs' driver bundles; without it only the libraries of bundles loaded here are,
 // since the cache then serves this process alone.
-static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath, bool wholeSystem) {
+static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, const std::string &listPath, bool wholeSystem,
+                Checkpoints *checkpoints = nullptr) {
     pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
     native_bridge_metal_quiet_problems(true);
+    native_prime_compiling = native_prime_libraries_done = native_prime_libraries_total = 0;
+    native_prime_made = native_prime_rate = native_prime_functions_resumed = 0;
+    native_prime_libraries_primed = native_prime_libraries_skipped = native_prime_scope = 0;
+    native_prime_pass_complete = native_prime_libraries_failed = native_prime_functions_refused = 0;
+    native_prime_functions_skipped = native_prime_inventory_failed = 0;
+    unopenedLibraries = deferredInventory = 0;
     while (root.size() > 1 && root.back() == '/') root.pop_back();
     const std::string donePath = root + "/prime-done", badPath = root + "/prime-bad", current = root + "/prime-current",
                       logPath = root + "/prime.log";
@@ -481,6 +615,18 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     const std::set<std::string> bad = readLines(badPath);
 #endif
     std::set<std::string> done = readLines(donePath);
+    std::map<std::string, std::pair<unsigned, unsigned>> partial;
+    if (checkpoints) {
+        for (const auto &line : readLines(root + "/prime-visited")) {
+            const auto counts = line.rfind('\t');
+            unsigned refused, skipped;
+            int read = 0;
+            if (counts != std::string::npos &&
+                sscanf(line.c_str() + counts + 1, "%u,%u%n", &refused, &skipped, &read) == 2 &&
+                counts + 1 + static_cast<size_t>(read) == line.size())
+                partial.emplace(line.substr(0, counts), std::make_pair(refused, skipped));
+        }
+    }
     const std::string functionsPath = root + "/prime-fn2", refusedPath = root + "/prime-refused2";
     const std::set<std::string> functionsDone = readLines(functionsPath);
 #if TARGET_OS_OSX
@@ -492,7 +638,7 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     unsigned libs = 0, finished = 0, foreign = 0;
     std::string note;
     const std::vector<std::string> paths = libraries(listPath, note);
-    const std::string build = buildId() + "-prime2";
+    const std::string build = buildId() + (checkpoints ? "-prime-ios4" : "-prime2");
     const std::string boot = bootSession();
 #if TARGET_OS_OSX
     const unsigned scope = wholeSystem ? 2 : 1;
@@ -520,17 +666,22 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
     std::set<std::string> eligiblePaths;
     for (const std::string &path : paths) if (selected(path)) {
         ++eligible;
-        eligiblePaths.insert(path);
         struct stat st = {};
         if (stat(path.c_str(), &st) != 0) continue;
-        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
+        const std::string revision = "\t" + std::to_string(st.st_size) + "\t" + std::to_string(st.st_mtimespec.tv_sec);
+        const auto libraryRevision = checkpoints ? revision + "." + std::to_string(st.st_mtimespec.tv_nsec) : revision;
+        eligiblePaths.insert(checkpoints ? path + libraryRevision : path);
+        const std::string id = path + libraryRevision + "\t" + build;
         if (done.count(id)) ++finished;
     }
     const std::string suffix = "\t" + build;
     unsigned resumed = 0;
-    for (const std::string &key : functionsDone)
-        if (key.size() >= suffix.size() && key.compare(key.size() - suffix.size(), suffix.size(), suffix) == 0 &&
-            eligiblePaths.count(key.substr(0, key.find('\t')))) ++resumed;
+    for (const std::string &key : functionsDone) {
+        if (key.size() < suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+        const size_t name = key.find('\t'), revision = key.find('\t', name + 1), end = key.size() - suffix.size();
+        if (name == std::string::npos || revision > end) continue;
+        if (eligiblePaths.count(key.substr(0, name) + (checkpoints ? key.substr(revision, end - revision) : ""))) ++resumed;
+    }
     native_prime_functions_resumed = resumed;
     native_prime_libraries_done = finished;
     native_prime_libraries_total = eligible;
@@ -542,25 +693,45 @@ static void run(id<MTLDevice> device, std::string root, unsigned delaySeconds, c
         native_prime_libraries_done = finished;
         report(path);
         struct stat st = {};
-        if (stat(path.c_str(), &st) != 0) {native_prime_libraries_failed = native_prime_libraries_failed + 1; continue;}
+        if (stat(path.c_str(), &st) != 0) {
+            native_prime_libraries_failed = native_prime_libraries_failed + 1;
+            ++unopenedLibraries;
+            continue;
+        }
         if (!selected(path)) {
             ++foreign;
             native_prime_libraries_skipped = foreign;
             continue;
         }
         // The runtime's and Turnip's builds end the id: a newer one primes every library again (buildId()).
-        const std::string id = path + "\t" + std::to_string((long long)st.st_size) + "\t" + std::to_string((long long)st.st_mtimespec.tv_sec) + "\t" + build;
+        const std::string revision = "\t" + std::to_string(st.st_size) + "\t" + std::to_string(st.st_mtimespec.tv_sec);
+        const auto libraryRevision = checkpoints ? revision + "." + std::to_string(st.st_mtimespec.tv_nsec) : revision;
+        const std::string id = path + libraryRevision + "\t" + build;
         if (done.count(id)) continue;
-        bool complete = false;
-        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, refusedPath, refusedDone, build, complete));
+        if (auto visited = partial.find(id); visited != partial.end()) {
+            native_prime_libraries_failed = native_prime_libraries_failed + 1;
+            native_prime_functions_refused = native_prime_functions_refused + visited->second.first;
+            native_prime_functions_skipped = native_prime_functions_skipped + visited->second.second;
+            continue;
+        }
+        const auto earlierRefusals = native_prime_functions_refused, earlierSkips = native_prime_functions_skipped;
+        bool complete = false, loaded = false;
+        appendLine(logPath, library(device, path, current, bad, functionsPath, functionsDone, refusedPath, refusedDone,
+                                   build, checkpoints ? libraryRevision : "", complete, loaded, checkpoints));
         if (stopping()) break;
         native_prime_libraries_primed = native_prime_libraries_primed + 1;
         if (complete) {
-            appendLine(donePath, id);
+            if (checkpoints) checkpoints->libraries.push_back(id);
+            else appendLine(donePath, id);
             done.insert(id);
             ++finished;
         } else {
             native_prime_libraries_failed = native_prime_libraries_failed + 1;
+            if (!loaded) ++unopenedLibraries;
+            if (checkpoints && loaded)
+                checkpoints->partialLibraries.push_back(id + "\t" +
+                    std::to_string(native_prime_functions_refused - earlierRefusals) + "," +
+                    std::to_string(native_prime_functions_skipped - earlierSkips));
         }
     }
     native_prime_libraries_done = finished;

@@ -35,6 +35,11 @@
 #include "CacheExport.h"
 #if !TARGET_OS_OSX
 #include "PrimeShaders.h"
+#include "ShaderCache/PrimeMemoryBudget.h"
+#include "ShaderCache/ShaderCacheIOS.h"
+#include <fcntl.h>
+#include <malloc/malloc.h>
+#include <sys/file.h>
 #endif
 #include "ExceptionDiag.h"
 
@@ -91,7 +96,6 @@ static Gpu *makeGpu(unsigned port) {
     return gpu;
 }
 static std::string gCacheDirectory;   // the runtime's cache directory (the one that opened the device), exported by CacheExport.h
-static bool gFillsSystemCache;        // the render server opened its device in the system shader cache's directory (SharedShaderCache.h)
 // Progress markers 0x68xx (GPU6): 6800 entered, 6801 Turnip found, 6802 device made, 6803 returned to the discovery, 68f1 no Turnip, 68f2 no device.
 static unsigned gDiagBits;
 // Reads of the render server's own state for the framebuffer-format question (diagnostic only, for the exact QuartzCore of the target image; a read
@@ -216,6 +220,48 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
             }
     }
 }
+#if !TARGET_OS_OSX
+static bool isShaderCacheWorker() {
+    return strcmp(getprogname(), NBShaderCacheWorker) == 0;
+}
+
+static std::string shaderCacheWorkerDirectory() {
+    const std::string shared = sharedShaderCacheDirectory();
+    if (shared.empty()) return {};
+    const std::string root = shared + "/ShaderCache";
+    const char *path = root.c_str();
+    if (mkdir(path, 0700) && errno != EEXIST) return {};
+    struct stat st = {};
+    if (lstat(path, &st) || !S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+        (st.st_mode & 0022) || access(path, W_OK)) return {};
+    return path;
+}
+
+static std::string gPrimerLayer;
+extern "C" bool native_bridge_merge_pipeline_cache(void);
+
+static void *mergePublishedCache(void *) {
+    const auto marker = gPrimerLayer + "/published";
+    ino_t lastInode = 0;
+    timespec lastModified = {};
+    for (;;) {
+        sleep(2);
+        struct stat st = {};
+        if (lstat(marker.c_str(), &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+            (st.st_mode & 0022)) continue;
+        const auto modified = st.st_mtimespec;
+        if (lastInode == st.st_ino && lastModified.tv_sec == modified.tv_sec &&
+            lastModified.tv_nsec == modified.tv_nsec) continue;
+        if (native_bridge_merge_pipeline_cache()) {
+            lastInode = st.st_ino;
+            lastModified = modified;
+            os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal: merged the published shader pipeline cache");
+        }
+    }
+    return nullptr;
+}
+#endif
+
 static id clientDevice(unsigned port) {
     char turnip[1024];
     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
@@ -232,6 +278,11 @@ static id clientDevice(unsigned port) {
         if (root.empty()) return nil;
         native_bridge_metal_system_cache(nullptr, nullptr, 0, true);
         return native_bridge_metal_open(turnip, root.c_str(), registryID, nullptr);
+    }
+#else
+    if (isShaderCacheWorker()) {
+        const auto root = shaderCacheWorkerDirectory();
+        return root.empty() ? nil : native_bridge_metal_open(turnip, root.c_str(), registryID, nullptr);
     }
 #endif
     char candidates[3][512] = {};
@@ -609,13 +660,25 @@ static id deviceForPort(unsigned port) {
                 if (imported) gpu->mark(0x6C00 | (imported < 0 ? 0xff : imported > 0xfe ? 0xfe : imported));
             }
             // What the device writes in the system cache's directory is readable by everyone; in any other, by this user alone.
+#if TARGET_OS_OSX
             native_bridge_metal_system_cache(nullptr, nullptr, 0, i == 6);
+#else
+            const uint32_t owner = getuid();
+            const std::string layer = bootArgSet("gpu-prime-system=0") ? std::string() :
+                                      shaderCacheWorkerDirectory();
+            if (!layer.empty() && native_bridge_metal_system_cache(layer.c_str(), &owner, 1, false))
+                gPrimerLayer = layer;
+            else {
+                gPrimerLayer.clear();
+                native_bridge_metal_system_cache(nullptr, nullptr, 0, false);
+            }
+#endif
             @try {
                 device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
             } @catch (NSException *exception) {
                 device = nil;
             }
-            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i]; gFillsSystemCache = i == 6;}   // which directory served
+            if (device) {gpu->mark(0x6810 + i); gCacheDirectory = candidates[i];}
         }
         if (!device) {
             gpu->mark(0x68f2);
@@ -658,17 +721,10 @@ static id deviceForPort(unsigned port) {
             }, gpu);
         }
 #if !TARGET_OS_OSX
-        // The iPadOS primer uses an 8 MiB stack for large translated functions.
-        pthread_attr_setstacksize(&attributes, 8u << 20);
-        pthread_t primer;
-        if (!bootArgSet("gpu-prime=0")) pthread_create(&primer, &attributes, [](void *) -> void * {
-                pthread_setname_np("native-metal-prime");   // a process sample and the telemetry's TH rows name its CPU time
-                char list[1024];
-                prime::run((id<MTLDevice>)device, gCacheDirectory, 90,
-                           requestedPath("NativeAdrenoMetal.primelist", list, sizeof list) ? std::string(list) : std::string(),
-                           gFillsSystemCache);
-                return nullptr;
-            }, nullptr);
+        if (!gPrimerLayer.empty()) {
+            pthread_t merger;
+            pthread_create(&merger, &attributes, mergePublishedCache, nullptr);
+        }
 #endif
         pthread_attr_destroy(&attributes);
         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
@@ -702,6 +758,131 @@ static id deviceForPort(unsigned port) {
     }
 }
 }  // namespace publish
+
+#if !TARGET_OS_OSX
+extern "C" bool native_bridge_metal_cache_matches(id<MTLDevice>, const char *);
+extern "C" bool native_bridge_publish_pipeline_cache(void);
+
+extern "C" __attribute__((visibility("default"))) NBPrimeResult native_adreno_run_shader_cache(
+    id<MTLDevice> device, NBPrimeProgress progress, NBPrimeCancelled cancelled, void *context) {
+    if (!device || !publish::isShaderCacheWorker() || publish::bootArgSet("gpu-prime=0"))
+        return NBPrimeResult::Unavailable;
+    const std::string root = publish::shaderCacheWorkerDirectory();
+    if (root.empty() || !native_bridge_metal_cache_matches(device, root.c_str()))
+        return NBPrimeResult::CacheUnavailable;
+    const std::string lockPath = root + "/prime-ios.lock";
+    const int lock = open(lockPath.c_str(), O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (lock < 0) return NBPrimeResult::CacheUnavailable;
+    if (flock(lock, LOCK_EX | LOCK_NB)) {
+        close(lock);
+        return NBPrimeResult::Busy;
+    }
+
+    task_vm_info_data_t baseline = {};
+    mach_msg_type_number_t length = TASK_VM_INFO_COUNT;
+    const bool measured = task_info(mach_task_self(), TASK_VM_INFO,
+        reinterpret_cast<task_info_t>(&baseline), &length) == KERN_SUCCESS &&
+        length >= TASK_VM_INFO_REV1_COUNT;
+    prime::Checkpoints checkpoints;
+    const char *rotation = nullptr;
+    const std::string logPath = root + "/prime.log";
+    const auto memorySample = [](const task_vm_info_data_t &info, mach_msg_type_number_t count) {
+        return prime::MemorySample{info.phys_footprint, info.resident_size,
+            count >= TASK_VM_INFO_REV4_COUNT ? info.limit_bytes_remaining : 0, info.region_count};
+    };
+    const auto startingMemory = memorySample(baseline, measured ? length : 0);
+    auto compileBaseline = startingMemory;
+    bool compileBaselineMeasured = measured;
+    const auto logMemory = [&](const char *event, const char *reason, const task_vm_info_data_t &sample, uint64_t headroom) {
+        malloc_statistics_t heap = {};
+        malloc_zone_statistics(nullptr, &heap);
+        char line[384];
+        snprintf(line, sizeof line, "worker %s pid=%d reason=%s attempts=%u footprint=%llu resident=%llu compressed=%llu regions=%d headroom=%llu heap-in-use=%zu heap-allocated=%zu",
+            event, getpid(), reason, checkpoints.attempts, (unsigned long long)sample.phys_footprint,
+            (unsigned long long)sample.resident_size, (unsigned long long)sample.compressed, sample.region_count,
+            (unsigned long long)headroom, heap.size_in_use, heap.size_allocated);
+        prime::appendLine(logPath, line);
+        os_log(OS_LOG_DEFAULT, "NativeAdrenoMetal shader cache: %{public}s", line);
+    };
+    logMemory("start", "start", baseline, measured && length >= TASK_VM_INFO_REV4_COUNT ? baseline.limit_bytes_remaining : 0);
+    prime::beforeFirstAttempt = [&] {
+        task_vm_info_data_t info = {};
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&info), &count) == KERN_SUCCESS &&
+            count >= TASK_VM_INFO_REV1_COUNT) {
+            compileBaseline = memorySample(info, count);
+            compileBaselineMeasured = true;
+            logMemory("ready", "first-attempt", info, compileBaseline.headroom);
+        }
+    };
+    uint64_t lastCheck = 0;
+    prime::cancelled = [&] {
+        if (cancelled && cancelled(context)) return true;
+        if (rotation) return true;
+        const uint64_t now = prime::nowMs();
+        const bool batch = checkpoints.attempts >= prime::kBatchAttempts;
+        if (!batch && now - lastCheck < 20) return false;
+        lastCheck = now;
+        task_vm_info_data_t current = {};
+        mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+        const bool sampled = task_info(mach_task_self(), TASK_VM_INFO, reinterpret_cast<task_info_t>(&current),
+                                      &count) == KERN_SUCCESS && count >= TASK_VM_INFO_REV1_COUNT;
+        const auto memory = memorySample(current, sampled ? count : 0);
+        rotation = prime::rotationReason(checkpoints.attempts, sampled ? &memory : nullptr,
+            compileBaselineMeasured ? &compileBaseline : nullptr);
+        if (!rotation) return false;
+        logMemory("rotation", rotation, current, memory.headroom);
+        return true;
+    };
+    prime::progress = [&](const std::string &library, const std::string &function) {
+        if (progress) progress(context, {
+            native_prime_libraries_done, native_prime_libraries_total, native_prime_made + native_prime_functions_resumed,
+            native_prime_functions_refused, native_prime_functions_skipped, prime::unopenedLibraries,
+            native_prime_inventory_failed, prime::deferredInventory,
+        }, library.c_str(), function.c_str());
+    };
+    NBPrimeResult result = NBPrimeResult::Incomplete;
+    @try {
+        pthread_setname_np("native-metal-prime");
+        char list[1024];
+        prime::run(device, root, 0, publish::requestedPath("NativeAdrenoMetal.primelist", list,
+            sizeof list) ? std::string(list) : std::string(), true, &checkpoints);
+        if (cancelled && cancelled(context)) result = NBPrimeResult::Stopped;
+        else if (rotation && strcmp(rotation, "batch") == 0) result = NBPrimeResult::NextBatch;
+        else if (rotation) result = checkpoints.attempts || !checkpoints.libraries.empty() || !checkpoints.partialLibraries.empty()
+            ? NBPrimeResult::MemoryLimit : NBPrimeResult::MemoryLimitNoProgress;
+        else if (prime::stopping()) result = NBPrimeResult::Stopped;
+        else if (native_prime_pass_complete == 1) result = NBPrimeResult::Complete;
+        if (!checkpoints.functions.empty()) {
+            const auto marker = root + "/published";
+            std::string pending = marker + ".XXXXXX";
+            const bool saved = native_bridge_publish_pipeline_cache();
+            const int descriptor = saved ? mkstemp(pending.data()) : -1;
+            if (descriptor >= 0) close(descriptor);
+            if (descriptor < 0 || rename(pending.c_str(), marker.c_str()) != 0) {
+                if (descriptor >= 0) unlink(pending.c_str());
+                result = NBPrimeResult::PublicationFailed;
+            }
+        }
+        if (result != NBPrimeResult::PublicationFailed &&
+            (!prime::saveCheckpoints(root + "/prime-fn2", checkpoints.functions) ||
+             !prime::saveCheckpoints(root + "/prime-done", checkpoints.libraries) ||
+             !prime::saveCheckpoints(root + "/prime-visited", checkpoints.partialLibraries)))
+            result = NBPrimeResult::PublicationFailed;
+    } @catch (NSException *) {
+        result = NBPrimeResult::Incomplete;
+    } @finally {
+        prime::appendLine(logPath, "worker finished pid=" + std::to_string(getpid()) +
+            " result=" + std::to_string(static_cast<int>(result)));
+        prime::progress = {};
+        prime::cancelled = {};
+        prime::beforeFirstAttempt = {};
+        native_bridge_metal_quiet_problems(false);
+        close(lock);
+    }
+    return result;
+}
+#endif
 
 @implementation NativeAdrenoMetalDevice
 - (id)initWithAcceleratorPort:(unsigned)port {
