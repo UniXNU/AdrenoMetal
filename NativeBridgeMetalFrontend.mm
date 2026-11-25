@@ -5438,6 +5438,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
+#if TARGET_OS_OSX
+ // The iPadOS render service sandbox forbids replacing its stderr descriptor.
  const bool renderStderr=diagOn() && nativeIsRenderServer();
  if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
   const std::string path=gCacheRoot+"/runtime-stderr.log";
@@ -5447,6 +5449,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
   }
  }
+#endif
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(diagOn() && loader) {
