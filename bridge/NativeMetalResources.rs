@@ -76,6 +76,7 @@ pub struct Buffer {
     // Claims keep placement IDs valid for views constructed after this call.
     _blocks: Arc<Vec<rt::Block>>,
     imported_pointer: Option<usize>,
+    imported_read_only: bool,
     lease: Option<Arc<crate::heap::Lease>>,
     pub(crate) ownership: Arc<crate::ownership::Ownership>,
 }
@@ -101,6 +102,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(Vec::new()),
             imported_pointer: None,
+            imported_read_only: false,
             ownership: crate::ownership::Ownership::new(vec![lease.clone()]),
             lease: Some(lease),
         }
@@ -163,6 +165,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: None,
+            imported_read_only: false,
             ownership: crate::ownership::Ownership::new(placements.into_iter().map(|p| p as crate::ownership::Owner).collect()),
             lease: None,
         };
@@ -278,7 +281,7 @@ impl Buffer {
         // virtual address the client gave. Read-only aliases stay read-only and are pinned
         // read-only by the kernel driver. This mapping is released after Vulkan frees the import.
         let mut min_align = 4096u64;
-        let (block, offset) = loop {
+        let (block, offset, read_only) = loop {
             let mapping =
                 unsafe { crate::host_mapping::HostMapping::alias(pointer, length, min_align) }?;
             if !mapping.is_writable() && options.storage_mode() == StorageMode::Managed {
@@ -307,7 +310,7 @@ impl Buffer {
                 unsafe { device.import_host_memory(imported, imported_len, Some(callback)) }
             };
             match attempt {
-                Ok((block, _)) => break (block, offset),
+                Ok((block, _)) => break (block, offset, read_only),
                 Err(rt::Error::Limit(rt::Limit::ImportAlignment { alignment, .. }))
                     if alignment > min_align && alignment.is_power_of_two() =>
                 {
@@ -350,6 +353,7 @@ impl Buffer {
             state: Arc::new(AtomicU64::new(2)),
             _blocks: Arc::new(blocks),
             imported_pointer: Some(pointer.as_ptr() as usize),
+            imported_read_only: read_only,
             ownership: crate::ownership::Ownership::new(vec![]),
             lease: None,
         })
@@ -365,6 +369,12 @@ impl Buffer {
     }
     pub fn resource_options(&self) -> ResourceOptions {
         self.options
+    }
+    pub(crate) fn writable_contents(&self) -> Option<NonNull<u8>> {
+        if self.imported_read_only {
+            return None;
+        }
+        self.contents()
     }
     pub fn device(&self) -> &rt::Device {
         &self.device

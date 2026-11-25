@@ -17,6 +17,7 @@ typedef struct NmbHeap NmbHeap;
 typedef struct NmbTexture NmbTexture;
 typedef struct NmbLibrary NmbLibrary;
 typedef struct NmbFunction NmbFunction;
+typedef struct NmbArgumentEncoder NmbArgumentEncoder;
 typedef struct NmbComputePipeline NmbComputePipeline;
 typedef struct NmbRenderPipeline NmbRenderPipeline;
 typedef struct NmbSampler NmbSampler;
@@ -262,6 +263,15 @@ NmbFunction *nmb_function_new_required_constants(NmbLibrary *, const char *name,
 /* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
 NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);
+NmbArgumentEncoder *nmb_function_new_argument_encoder(const NmbFunction *, uint64_t buffer_index);
+void nmb_argument_encoder_release(NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_encoded_length(const NmbArgumentEncoder *);
+uint64_t nmb_argument_encoder_alignment(const NmbArgumentEncoder *);
+bool nmb_argument_encoder_set_argument_buffer(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset);
+bool nmb_argument_encoder_set_buffer(NmbArgumentEncoder *, const NmbBuffer *, uint64_t offset, uint64_t index);
+bool nmb_argument_encoder_set_texture(NmbArgumentEncoder *, const NmbTexture *, uint64_t index);
+bool nmb_argument_encoder_set_sampler(NmbArgumentEncoder *, const NmbSampler *, uint64_t index);
+void *nmb_argument_encoder_constant_data(const NmbArgumentEncoder *, uint64_t index);
 bool nmb_function_set_specialized_name(NmbFunction *, const char *);
 /* Metal's MTLFunctionType (1 vertex, 2 fragment, 3 kernel, ...). */
 uint64_t nmb_function_type(const NmbFunction *);

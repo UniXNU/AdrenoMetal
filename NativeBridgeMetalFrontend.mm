@@ -1635,6 +1635,9 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error;
 @end
+@interface NBArgumentEncoder : NBObject
+@property(nonatomic) NmbArgumentEncoder *handle;
+@end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *sourceName;
@@ -1680,6 +1683,13 @@ static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) 
  }
 }
 @implementation NBFunction
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ NmbArgumentEncoder *handle=nmb_function_new_argument_encoder(_handle,index);
+ if(!handle){NBLOG(@"native-metal: argument encoder refused: %@",lastError());return nil;}
+ NBArgumentEncoder *encoder=[NBArgumentEncoder new];
+ encoder.handle=handle;
+ return (id<MTLArgumentEncoder>)encoder;
+}
 - (NSArray *)stageInputAttributes {
  if(!_handle)return nil;
  int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
@@ -2043,6 +2053,36 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
   NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=d;_clamped[key]=sampler;
   return sampler;
  }
+}
+@end
+@implementation NBArgumentEncoder
+- (void)dealloc {nmb_argument_encoder_release(_handle);}
+- (NSUInteger)encodedLength {return nmb_argument_encoder_encoded_length(_handle);}
+- (NSUInteger)alignment {return nmb_argument_encoder_alignment(_handle);}
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign argument buffer");return;}
+ if(!nmb_argument_encoder_set_argument_buffer(_handle,[(NBBuffer *)buffer handle],offset))
+  NBLOG(@"native-metal: setArgumentBuffer: %@",lastError());
+}
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign buffer argument");return;}
+ if(!nmb_argument_encoder_set_buffer(_handle,[(NBBuffer *)buffer handle],offset,index))
+  NBLOG(@"native-metal: encode buffer argument: %@",lastError());
+}
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
+ if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: foreign texture argument");return;}
+ if(!nmb_argument_encoder_set_texture(_handle,[(NBTexture *)texture handle],index))
+  NBLOG(@"native-metal: encode texture argument: %@",lastError());
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
+ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){NBLOG(@"native-metal: foreign sampler argument");return;}
+ if(!nmb_argument_encoder_set_sampler(_handle,[(NBSampler *)sampler handle],index))
+  NBLOG(@"native-metal: encode sampler argument: %@",lastError());
+}
+- (void *)constantDataAtIndex:(NSUInteger)index {
+ void *data=nmb_argument_encoder_constant_data(_handle,index);
+ if(!data)NBLOG(@"native-metal: constantDataAtIndex: %@",lastError());
+ return data;
 }
 @end
 @interface NBDepthStencil : NBObject
