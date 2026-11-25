@@ -71,7 +71,7 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
         "gpuCoreCount" => 1,
         "maxVertexAmplificationCount" => 1,
         "maxThreadgroupMemoryLength" | "maxComputeThreadgroupMemory" => {
-            p.max_threadgroup_memory_length as u64
+            device.max_threadgroup_memory_length() as u64
         }
         "argumentBuffersSupport" => device.argument_buffers_support().as_raw() as u64,
         "readWriteTextureSupport" => device.read_write_texture_support().as_raw() as u64,

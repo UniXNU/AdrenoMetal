@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/floor.rs b/crates/metal2vulkan-runtime/src/floor.rs
-index 65e66532..23b2a44d 100644
+index a8e040a4..f907ed19 100644
 --- a/crates/metal2vulkan-runtime/src/floor.rs
 +++ b/crates/metal2vulkan-runtime/src/floor.rs
-@@ -1067,9 +1067,24 @@ pub(crate) unsafe fn check(
+@@ -1105,9 +1105,24 @@ pub(crate) unsafe fn check(
      entry: &ash::Entry,
      instance: &ash::Instance,
      physical: vk::PhysicalDevice,
@@ -28,7 +28,7 @@ index 65e66532..23b2a44d 100644
  }
  
  /// Reads what [`decide`] needs. A device below Vulkan 1.3 gets its version read alone.
-@@ -1264,13 +1279,20 @@ unsafe fn query(
+@@ -1295,13 +1310,20 @@ unsafe fn query(
  
  /// Decides from what [`query`] read.
  pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
@@ -50,7 +50,7 @@ index 65e66532..23b2a44d 100644
          if !device
              .extensions
              .iter()
-@@ -1396,6 +1418,7 @@ pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
+@@ -1428,6 +1450,7 @@ pub(crate) fn decide(device: &Queried) -> Result<Capabilities, BelowFloor> {
          features,
          extensions: DEVICE_EXTENSIONS
              .iter()
@@ -154,10 +154,10 @@ index 86ea85bb..9dd320a8 100644
  
      /// The instance that listed it.
 diff --git a/crates/metal2vulkan-runtime/src/tests/floor.rs b/crates/metal2vulkan-runtime/src/tests/floor.rs
-index c77fef37..b3fac519 100644
+index 4e2c4a68..07c32041 100644
 --- a/crates/metal2vulkan-runtime/src/tests/floor.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/floor.rs
-@@ -2286,3 +2286,30 @@ fn a_device_that_does_not_calibrate_the_host_clock_is_below_the_floor() {
+@@ -2308,3 +2308,30 @@ fn a_device_that_does_not_calibrate_the_host_clock_is_below_the_floor() {
      );
      assert!(TIME_DOMAINS[1] == crate::HOST_DOMAIN);
  }

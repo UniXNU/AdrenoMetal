@@ -1,6 +1,6 @@
 # AdrenoMetal upstream-minimal experiment
 
-This branch uses metal2vulkan development `4e9aad67d5af604a64725e26f3070968dd15a618`. Runtime patch `0073` selects native presentation without requiring Vulkan surfaces or swapchains. Patch `0077` delays native display scheduling until the final driver submission, so the display driver captures the current frame's fence. Rendering and device capability requirements remain upstream implementations.
+This branch uses metal2vulkan development `0c9db4976504d3eba5898506098e7ec00b7418dc`. Runtime patch `0073` selects native presentation without requiring Vulkan surfaces or swapchains. Patch `0077` delays native display scheduling until the final driver submission, so the display driver captures the current frame's fence. Patch `0078` supports read-only host-memory imports. Patch `0079` enables zero-copy in-place linear textures (with attachment feedback loop support) over imported host memory. Rendering and device capability requirements remain upstream implementations.
 
 Indirect buffer and texture declarations, heap declarations, encoder barriers, concurrent compute and queue enqueueing use the upstream public APIs. Commands retain both Objective-C resource owners and consumer placement leases until real GPU completion. Native IOSurface writes are marked across render attachments, resolves, blits and shader-write bindings; ordinary commands keep upstream scheduling behavior.
 

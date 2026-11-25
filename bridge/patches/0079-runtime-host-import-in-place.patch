@@ -1,8 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/render_encoder.rs b/crates/metal2vulkan-runtime/src/render_encoder.rs
-index c1a693a2..748dc8f7 100644
+index 87b504b1..f4c584b6 100644
 --- a/crates/metal2vulkan-runtime/src/render_encoder.rs
 +++ b/crates/metal2vulkan-runtime/src/render_encoder.rs
-@@ -236,6 +236,9 @@ struct Shadowed {
+@@ -237,6 +237,9 @@ struct Shadowed {
      rendered: (u32, u32),
      layout: vk::ImageLayout,
      home: vk::ImageLayout,
@@ -12,7 +12,7 @@ index c1a693a2..748dc8f7 100644
      /// The bytes of a texel.
      texel: u64,
      held: Held,
-@@ -1760,6 +1763,9 @@ impl RenderCommandEncoder {
+@@ -1827,6 +1830,9 @@ impl RenderCommandEncoder {
                          rendered: (a.level, a.layer),
                          layout: target.layout,
                          home: a.home,
@@ -22,7 +22,7 @@ index c1a693a2..748dc8f7 100644
                          texel: target.texture.texel_bytes(),
                          held: Held::default(),
                          cleared: target.clear_color().filter(|_| same),
-@@ -1777,10 +1783,7 @@ impl RenderCommandEncoder {
+@@ -1844,10 +1850,7 @@ impl RenderCommandEncoder {
          if planned.iter().all(Vec::is_empty) {
              return Ok(());
          }
@@ -34,7 +34,7 @@ index c1a693a2..748dc8f7 100644
          let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
          let (mut away, mut back, mut copies) = (Vec::new(), Vec::new(), Vec::new());
          let mut clears = Vec::new();
-@@ -1814,14 +1817,17 @@ impl RenderCommandEncoder {
+@@ -1881,14 +1884,17 @@ impl RenderCommandEncoder {
              };
              let sources = shadow::ranges(&copied);
              let (rendered, rest) = shadow::parted(&sources, s.rendered);
@@ -56,7 +56,7 @@ index c1a693a2..748dc8f7 100644
              }
              for at in shadow::ranges(areas).into_iter().map(range) {
                  away.push(layout_barrier(s.shadow, at, read_only, destination));
-@@ -1837,7 +1843,7 @@ impl RenderCommandEncoder {
+@@ -1904,7 +1910,7 @@ impl RenderCommandEncoder {
              bytes += (copied.iter())
                  .map(|area| area.texels() * s.texel)
                  .sum::<u64>();
@@ -65,7 +65,7 @@ index c1a693a2..748dc8f7 100644
          }
          self.interrupt(|building, core| {
              let command = building.ordered_command()?;
-@@ -1847,9 +1853,9 @@ impl RenderCommandEncoder {
+@@ -1914,9 +1920,9 @@ impl RenderCommandEncoder {
              // it retires (its pass's attachment texture holds it, and it its shadow); each range
              // is in the layout it moves from: the rendered level and layer in the one the pass
              // renders it in, the rest of the image and the shadow at home; each region lies in
@@ -78,7 +78,7 @@ index c1a693a2..748dc8f7 100644
              unsafe {
                  device.cmd_pipeline_barrier2(
                      command,
-@@ -1860,8 +1866,8 @@ impl RenderCommandEncoder {
+@@ -1927,8 +1933,8 @@ impl RenderCommandEncoder {
                  for (shadow, color, range) in &clears {
                      device.cmd_clear_color_image(command, *shadow, destination, color, &[*range]);
                  }
@@ -90,7 +90,7 @@ index c1a693a2..748dc8f7 100644
                  device.cmd_pipeline_barrier2(
                      command,
 diff --git a/crates/metal2vulkan-runtime/src/tests/fetch.rs b/crates/metal2vulkan-runtime/src/tests/fetch.rs
-index ad923963..fb2fcf96 100644
+index a77caf19..6e5e1b23 100644
 --- a/crates/metal2vulkan-runtime/src/tests/fetch.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/fetch.rs
 @@ -718,4 +718,104 @@ mod on_device {
@@ -288,10 +288,10 @@ index b47c8811..bb4bdf66 100644
          let reading = state(
              name,
 diff --git a/crates/metal2vulkan-runtime/src/tests/over_causes.rs b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
-index 0d966639..0ab8f189 100644
+index ed90be95..afa57325 100644
 --- a/crates/metal2vulkan-runtime/src/tests/over_causes.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/over_causes.rs
-@@ -275,7 +275,19 @@ mod on_device {
+@@ -336,7 +336,19 @@ mod on_device {
                      &texture,
                      (height, true),
                  );
@@ -313,10 +313,10 @@ index 0d966639..0ab8f189 100644
                  drop((texture, imported, import));
                  wait_until(&device, "the release", || released.load(Ordering::SeqCst));
 diff --git a/crates/metal2vulkan-runtime/src/tests/texture.rs b/crates/metal2vulkan-runtime/src/tests/texture.rs
-index 6c92681d..7517d1ed 100644
+index 3da5b978..f0bf7fc6 100644
 --- a/crates/metal2vulkan-runtime/src/tests/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/texture.rs
-@@ -294,6 +294,177 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
+@@ -294,6 +294,182 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
      );
  }
  
@@ -392,34 +392,39 @@ index 6c92681d..7517d1ed 100644
 +    );
 +
 +    // Linear image usage preserves SAMPLED | ATTACHMENT_FEEDBACK_LOOP_EXT for in-place
-+    // framebuffer fetch / self-sampling when feedback is accepted, and strips them otherwise.
++    // framebuffer fetch / self-sampling when feedback is accepted, strips them otherwise,
++    // and keeps upstream COLOR_ATTACHMENT when linear_resolves is set.
 +    type U = vk::ImageUsageFlags;
 +    let transfer = U::TRANSFER_SRC | U::TRANSFER_DST;
 +    let rt_feedback = transfer | U::COLOR_ATTACHMENT | U::SAMPLED | U::ATTACHMENT_FEEDBACK_LOOP_EXT;
 +    assert_eq!(
-+        linear_image_usage(rt_feedback, false, true).as_raw(),
++        linear_image_usage(rt_feedback, false, false, true).as_raw(),
 +        rt_feedback.as_raw()
 +    );
 +    assert_eq!(
-+        linear_image_usage(rt_feedback, false, false).as_raw(),
++        linear_image_usage(rt_feedback, false, false, false).as_raw(),
 +        (transfer | U::COLOR_ATTACHMENT).as_raw()
 +    );
 +    assert_eq!(
-+        linear_image_usage(rt_feedback, true, false).as_raw(),
++        linear_image_usage(rt_feedback, true, false, false).as_raw(),
 +        (transfer | U::COLOR_ATTACHMENT | U::SAMPLED).as_raw()
 +    );
 +    // Without ATTACHMENT_FEEDBACK_LOOP_EXT in the plan (shadow-only device), feedback=true must
 +    // not keep SAMPLED on a RENDER_TARGET-only image.
 +    let rt_shadow_only = transfer | U::COLOR_ATTACHMENT | U::SAMPLED;
 +    assert_eq!(
-+        linear_image_usage(rt_shadow_only, false, true).as_raw(),
++        linear_image_usage(rt_shadow_only, false, false, true).as_raw(),
 +        (transfer | U::COLOR_ATTACHMENT).as_raw()
 +    );
-+    // ShaderRead-only texture never gains COLOR_ATTACHMENT for resolves.
++    // ShaderRead-only texture gains COLOR_ATTACHMENT only when linear_resolves is true.
 +    let read_only = transfer | U::SAMPLED;
 +    assert_eq!(
-+        linear_image_usage(read_only, true, true).as_raw(),
++        linear_image_usage(read_only, true, false, true).as_raw(),
 +        read_only.as_raw()
++    );
++    assert_eq!(
++        linear_image_usage(read_only, true, true, false).as_raw(),
++        (read_only | U::COLOR_ATTACHMENT).as_raw()
 +    );
 +
 +    // In-place attachment reads require either feedback loop or shadow fallback.
@@ -495,23 +500,27 @@ index 6c92681d..7517d1ed 100644
  mod on_device {
      use super::refused;
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index ecb4c685..986c46ac 100644
+index c1060f9c..8d0d6475 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
-@@ -641,9 +641,10 @@ impl Image {
+@@ -793,13 +793,14 @@ impl Image {
+             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
              .image(self.image)
              .subresource_range(whole(self.aspects));
+-        // Placed over another resource's bytes, after every earlier command's writes.
++        // Placed over another resource's bytes, after every earlier command's writes; over a
++        // host-memory import starting from UNDEFINED, after prior host writes.
+         let (stages, written) = match self.over {
+             true => (
+                 vk::PipelineStageFlags2::ALL_COMMANDS,
+                 vk::AccessFlags2::MEMORY_WRITE,
+             ),
+-            false => (vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE),
++            false => homing_host_dependency(first, self.over_buffer()),
+         };
          let Some(zero) = self.zero else {
-+            let (src_stage, src_access) = homing_host_dependency(first, self.over_buffer());
              let first = barrier
--                .src_stage_mask(vk::PipelineStageFlags2::NONE)
--                .src_access_mask(vk::AccessFlags2::NONE)
-+                .src_stage_mask(src_stage)
-+                .src_access_mask(src_access)
-                 .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
-                 .dst_access_mask(every)
-                 .old_layout(first)
-@@ -725,12 +726,18 @@ impl Image {
+@@ -886,12 +887,18 @@ impl Image {
      /// that it and the buffer are aliases that interpret their bytes alike (Vulkan's memory
      /// aliasing); `transfer` for any other image.
      pub(crate) fn copy_layout(&self, transfer: vk::ImageLayout) -> vk::ImageLayout {
@@ -531,15 +540,15 @@ index ecb4c685..986c46ac 100644
      /// Whether the image is a surface plane's in place ([`Device::new_exported_surface`]), which
      /// stays in the general layout through every copy, as the other API reads its bytes linearly.
      pub(crate) fn surface(&self) -> bool {
-@@ -1439,6 +1446,7 @@ impl Device {
-         let placed = matches!(source, Source::Plain | Source::Managed(..));
-         // Over a dma-buf's import in place, the import's buffer and the image's offset in it.
-         let mut acquired = None;
+@@ -1619,6 +1626,7 @@ impl Device {
+         // In place, where its linear image takes the attachment usage for resolves, the bytes
+         // from its first texel a resolve into it may reach (`render_reach`).
+         let mut resolve_reach = None;
 +        let in_place_usage = plan.linear_usage(laid.is_some_and(Laid::feedback));
          let (bind, mut block) = match source {
              Source::Plain | Source::Managed(..) => (Bind::Pooled, None),
              Source::Heap(block, heap, offset) => {
-@@ -1465,18 +1473,30 @@ impl Device {
+@@ -1645,18 +1653,30 @@ impl Device {
                      (_, Some(copy)) => (copy.memory(), MemoryClass::Private, copy.offset()),
                      (block, None) => (&block.memory, block.memory.class, buffer.offset()),
                  };
@@ -578,7 +587,7 @@ index ecb4c685..986c46ac 100644
                  };
                  let rows = u64::from(d.height) * bytes_per_row;
                  let reach = (usage.contains(TextureUsage::RENDER_TARGET))
-@@ -1486,6 +1506,8 @@ impl Device {
+@@ -1668,6 +1688,8 @@ impl Device {
                      base: memory.base(),
                      memory_type,
                      handle,
@@ -587,7 +596,7 @@ index ecb4c685..986c46ac 100644
                      block_len: memory.len,
                      at: at + offset,
                      bytes_per_row,
-@@ -1516,18 +1538,26 @@ impl Device {
+@@ -1698,36 +1720,54 @@ impl Device {
          core.counters.rise(Gauge::Textures);
          // A clear zeroes it in its move home.
          let zero = placed.then(|| Zero::of(&plan, d.mipmap_level_count, &shape));
@@ -598,10 +607,40 @@ index ecb4c685..986c46ac 100644
 +        // query accepted it, so framebuffer fetch and same-pass sampling run in place without
 +        // copies; otherwise a colour render target falls back to its shadow when offered.
          let laid_over = named.as_ref().is_some_and(|n| n.form == Form::InPlace);
+         // A pass resolves into a linear image in place where its subresource lies within its
+         // own rows and the buffer, as a resolve may write back any byte of it (Vulkan's
+         // multisample resolve operations); else it takes no attachment use, and stays in place.
+         let resolved = laid_over
+             && resolve_reach.is_some_and(|reach| {
+-                let color = vk::ImageSubresource {
+-                    aspect_mask: vk::ImageAspectFlags::COLOR,
++                let explicit = matches!(
++                    laid,
++                    Some(Laid::HostMemory {
++                        explicit_modifier: true,
++                        ..
++                    })
++                );
++                let subresource = vk::ImageSubresource {
++                    aspect_mask: in_place_subresource_aspect(explicit),
+                     mip_level: 0,
+                     array_layer: 0,
+                 };
+-                // SAFETY: the image is the device's, linear, of one level and layer of a colour
+-                // format.
+-                let layout = unsafe { core.device.get_image_subresource_layout(image, color) };
++                // SAFETY: the image is the device's, linear (or single-plane
++                // DRM_FORMAT_MOD_LINEAR), of one level and layer of a colour format.
++                let layout = unsafe { core.device.get_image_subresource_layout(image, subresource) };
+                 in_reach(layout.size, Some(reach))
+             });
 -        let attachment_reads = plan.attachment_reads && !laid_over;
 -        // On a device without the feedback loop, a draw reads such an image through its shadow.
--        let shadowing = (attachment_reads && core.feedback.is_none()).then(|| {
+-        let shadowing = (attachment_reads && !core.feedback_loop).then(|| {
 +        let image_usage = match laid_over {
++            true if plan.linear_resolves && !resolved => {
++                in_place_usage & !vk::ImageUsageFlags::COLOR_ATTACHMENT
++            }
 +            true => in_place_usage,
 +            false => plan.image_usage(),
 +        };
@@ -617,36 +656,47 @@ index ecb4c685..986c46ac 100644
          });
 +        let attachment_reads =
 +            in_place_attachment_reads(plan.attachment_reads, looped, shadowing.is_some());
-         let image = Arc::new(Image {
-             core: Arc::clone(core),
-             image,
-@@ -1541,11 +1571,9 @@ impl Device {
-             shadow: false,
+         // In place in the runtime's own memory with no attachment usage, where the plan's optimal
+         // image takes it, a pass resolves into such an image and copies it into the bytes.
+-        let own = laid_over && matches!(laid, Some(Laid::Own));
++        let own = laid_over && matches!(laid, Some(Laid::Own { .. }));
+         let resolving = (own && !resolved && plan.resolves).then(|| {
+             Box::new(Resolving {
+                 made: (d, shape, plan.resolved()),
+@@ -1758,13 +1798,10 @@ impl Device {
+             resolving,
              aspects: plan.aspects,
              format: plan.format,
--            // A linear image in place takes no attachment usage for a resolve alone.
--            usage: match laid_over {
--                true => plan.usage,
--                false => plan.image_usage(),
+-            // A linear image in place takes the attachment usage for its resolves where they stay
+-            // within reach.
+-            usage: match (laid_over, resolved) {
+-                (true, true) => plan.usage | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+-                (true, false) => plan.usage,
+-                (false, _) => plan.image_usage(),
 -            },
-+            // Record the exact usage the VkImage was made with (a linear image in place takes no
-+            // attachment usage for a resolve alone, and takes feedback usage only when accepted).
++            // Record the exact usage the VkImage was made with (keeping attachment usage for
++            // linear resolves only where they stay within reach, and feedback usage only when
++            // accepted).
 +            usage: image_usage,
              view_formats: plan.view_formats.clone(),
              cube: plan.cube,
              linear_attachment: false,
-@@ -1689,16 +1717,14 @@ impl Plan {
+@@ -1934,20 +1971,15 @@ impl Plan {
          }
      }
  
 -    /// The usage of a linear image of the plan, over a buffer in place: without the feedback
 -    /// usage, as no pass moves it to the feedback layout, and without the sampled usage where
 -    /// shaders do not read the texture, as a colour render target takes it for attachment reads
--    /// alone.
+-    /// alone; with the colour attachment usage where a pass resolves into it
+-    /// (`linear_resolves`).
 -    fn linear_usage(&self) -> vk::ImageUsageFlags {
 -        let mut usage = self.usage & !vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
 -        if !self.read {
 -            usage &= !vk::ImageUsageFlags::SAMPLED;
+-        }
+-        if self.linear_resolves {
+-            usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
 -        }
 -        usage
 +    /// The usage of a linear image of the plan, over a buffer in place.
@@ -654,13 +704,14 @@ index ecb4c685..986c46ac 100644
 +    /// When `feedback` is true and the plan carries `ATTACHMENT_FEEDBACK_LOOP_EXT`, keeps both
 +    /// `SAMPLED` and `ATTACHMENT_FEEDBACK_LOOP_EXT` so a render pass can fetch or sample the
 +    /// attachment in place through the feedback loop. Otherwise strips feedback usage (and
-+    /// `SAMPLED` where shaders do not read the texture directly); resolves remain excluded.
++    /// `SAMPLED` where shaders do not read the texture directly); keeps `COLOR_ATTACHMENT` where
++    /// a pass resolves into it (`linear_resolves`).
 +    fn linear_usage(&self, feedback: bool) -> vk::ImageUsageFlags {
-+        linear_image_usage(self.usage, self.read, feedback)
++        linear_image_usage(self.usage, self.read, self.linear_resolves, feedback)
      }
  
      /// Whether a draw may read an attachment of its own pass through a texture of the plan, where
-@@ -1871,47 +1897,267 @@ fn check_over(
+@@ -2198,77 +2230,346 @@ fn check_over(
      let (block, copy) = buffer.held();
      // An image bound in imported memory is made for the import's handle
      // (VUID-vkBindImageMemory-memory-02989), so in the undefined layout
@@ -684,21 +735,37 @@ index ecb4c685..986c46ac 100644
 +    // home (`HOST_WRITE -> ALL_COMMANDS`). Over several dma-bufs or an exported block, the copy:
 +    // sparse or dedicated-to-buffer memory cannot bind an image.
 +    let spilled = copy.is_none() && block.memory.spilled();
-+    let wants_feedback = plan.attachment_reads
-+        && plan
-+            .usage
-+            .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT);
-+    let probe = |handle: Option<vk::ExternalMemoryHandleTypeFlags>, explicit_modifier: bool| {
++    let fits = |max: Option<vk::Extent3D>| {
++        max.is_some_and(|max| d.width <= max.width && d.height <= max.height)
++    };
++    let probe = |plan: &Plan,
++                 handle: Option<vk::ExternalMemoryHandleTypeFlags>,
++                 explicit_modifier: bool| {
++        let wants_feedback = plan.attachment_reads
++            && plan
++                .usage
++                .contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT);
 +        let check_one = |feedback: bool| {
 +            let usage = plan.linear_usage(feedback);
-+            let extent = linear_extent(core, shape, plan, usage, handle, explicit_modifier)
-+                .is_some_and(|max| d.width <= max.width && d.height <= max.height);
++            let extent = fits(linear_extent(
++                core,
++                shape,
++                plan,
++                usage,
++                handle,
++                explicit_modifier,
++            ));
 +            let features = extent
 +                && if explicit_modifier {
 +                    drm_linear_plan_features(core, plan, usage)
 +                } else {
 +                    let (linear, optimal) = core.format_features(plan.format);
-+                    linear.contains(optimal & kept_features(usage))
++                    let stored = !plan.extended
++                        || (plan.view_formats.iter()).all(|&format| {
++                            let (linear, optimal) = core.format_features(format);
++                            linear.contains(optimal & kept_features(vk::ImageUsageFlags::STORAGE))
++                        });
++                    linear.contains(optimal & kept_features(usage)) && stored
 +                };
 +            (extent, features)
 +        };
@@ -738,7 +805,7 @@ index ecb4c685..986c46ac 100644
 +                return Ok(Err(OverCause::Spilled));
 +            }
 +            let handle = Some(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-+            let modifier = core.exports.modifiers.then(|| probe(handle, true));
++            let modifier = core.exports.modifiers.then(|| probe(plan, handle, true));
 +            if let Some((true, true, feedback)) = modifier {
 +                return Ok(Ok(Laid::HostMemory {
 +                    memory_type,
@@ -746,23 +813,94 @@ index ecb4c685..986c46ac 100644
 +                    feedback,
 +                }));
 +            }
-+            let linear = probe(handle, false);
++            let linear = probe(plan, handle, false);
++            if let (true, true, feedback) = linear {
++                return Ok(Ok(Laid::HostMemory {
++                    memory_type,
++                    explicit_modifier: false,
++                    feedback,
++                }));
++            }
++            if plan.extended {
++                let plain = plan.unextended();
++                let plain_mod = core.exports.modifiers.then(|| probe(&plain, handle, true));
++                if let Some((true, true, feedback)) = plain_mod {
++                    *plan = plain;
++                    return Ok(Ok(Laid::HostMemory {
++                        memory_type,
++                        explicit_modifier: true,
++                        feedback,
++                    }));
++                }
++                let plain_lin = probe(&plain, handle, false);
++                if let (true, true, feedback) = plain_lin {
++                    *plan = plain;
++                    return Ok(Ok(Laid::HostMemory {
++                        memory_type,
++                        explicit_modifier: false,
++                        feedback,
++                    }));
++                }
++            }
 +            return Ok(select_host_laid(memory_type, modifier, linear));
 +        }
          (None, Some(own)) => return Ok(Err(memory_cause(own))),
      };
 -    let spilled = copy.is_none() && block.memory.spilled();
--    let extent = linear_extent(core, shape, plan, laid.handle())
--        .is_some_and(|max| d.width <= max.width && d.height <= max.height);
+-    let fits = |max: Option<vk::Extent3D>| {
+-        max.is_some_and(|max| d.width <= max.width && d.height <= max.height)
+-    };
 -    let (linear, optimal) = core.format_features(plan.format);
--    let features = linear.contains(optimal & kept_features(plan.usage));
--    Ok(if spilled {
--        Err(OverCause::Spilled)
--    } else if !extent {
+-    // Its linear image's query, and its linear tiling's features of each use its optimal tiling
+-    // holds: its format's, and an extended plan's other formats' storage (`Plan::extended`).
+-    let held = |plan: &Plan| {
+-        let extent = fits(linear_extent(core, shape, plan, laid.handle()));
+-        let stored = !plan.extended
+-            || (plan.view_formats.iter()).all(|&format| {
+-                let (linear, optimal) = core.format_features(format);
+-                linear.contains(optimal & kept_features(vk::ImageUsageFlags::STORAGE))
+-            });
+-        let features = linear.contains(optimal & kept_features(plan.usage)) && stored;
+-        (extent, features)
+-    };
+-    let (mut extent, mut features) = held(plan);
 +    if spilled {
 +        return Ok(Err(OverCause::Spilled));
 +    }
-+    let (extent, features, feedback) = probe(handle, false);
++    let (mut extent, mut features, mut feedback) = probe(plan, handle, false);
+     // A linear image the device makes plain but not extended is made plain, in place: its views
+     // of another format have no storage element, and no copy is made for them.
+     if plan.extended && !(extent && features) {
+         let plain = plan.unextended();
+-        if held(&plain) == (true, true) {
+-            (extent, features) = (true, true);
++        let (plain_extent, plain_features, plain_feedback) = probe(&plain, handle, false);
++        if plain_extent && plain_features {
++            (extent, features, feedback) = (true, true, plain_feedback);
+             *plan = plain;
+         }
+     }
+     // In place in a block of the runtime's own, its linear image takes the colour attachment
+     // usage where the plan resolves, its tiling's features hold the attachment and the query
+     // makes the image with it; else it is made without it, and stays in place.
++    let (linear, _) = core.format_features(plan.format);
+     let attached = linear.contains(vk::FormatFeatureFlags2::COLOR_ATTACHMENT);
+-    if !spilled && extent && features && plan.resolves && attached && matches!(laid, Laid::Own) {
++    if extent
++        && features
++        && plan.resolves
++        && attached
++        && matches!(base_laid, Laid::Own { .. })
++    {
+         plan.linear_resolves = true;
+-        plan.linear_resolves = fits(linear_extent(core, shape, plan, None));
++        let resolve_usage = plan.linear_usage(false);
++        plan.linear_resolves =
++            fits(linear_extent(core, shape, plan, resolve_usage, None, false));
+     }
+-    Ok(if spilled {
+-        Err(OverCause::Spilled)
+-    } else if !extent {
 +    Ok(if !extent {
          // A dma-buf's linear image is asked of its external query for the handle.
 -        Err(match laid {
@@ -787,18 +925,27 @@ index ecb4c685..986c46ac 100644
 +///
 +/// Preserves `SAMPLED | ATTACHMENT_FEEDBACK_LOOP_EXT` when `feedback` is true and `plan_usage`
 +/// carries `ATTACHMENT_FEEDBACK_LOOP_EXT`; otherwise strips `ATTACHMENT_FEEDBACK_LOOP_EXT` (and
-+/// `SAMPLED` when shaders do not read the texture directly).
++/// `SAMPLED` when shaders do not read the texture directly). Adds `COLOR_ATTACHMENT` when
++/// `linear_resolves` is set.
 +pub(crate) fn linear_image_usage(
 +    plan_usage: vk::ImageUsageFlags,
 +    read: bool,
++    linear_resolves: bool,
 +    feedback: bool,
 +) -> vk::ImageUsageFlags {
-+    if feedback && plan_usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT) {
-+        return plan_usage;
-+    }
-+    let mut usage = plan_usage & !vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
-+    if !read {
-+        usage &= !vk::ImageUsageFlags::SAMPLED;
++    let mut usage = if feedback
++        && plan_usage.contains(vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT)
++    {
++        plan_usage
++    } else {
++        let mut usage = plan_usage & !vk::ImageUsageFlags::ATTACHMENT_FEEDBACK_LOOP_EXT;
++        if !read {
++            usage &= !vk::ImageUsageFlags::SAMPLED;
++        }
++        usage
++    };
++    if linear_resolves {
++        usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
 +    }
 +    usage
 +}
@@ -952,7 +1099,7 @@ index ecb4c685..986c46ac 100644
  /// Why a texture over a buffer in `own`'s memory, which no in-place image takes
  /// ([`check_over`]), is the counted copy: the import's or export's kind.
  fn memory_cause(own: Own) -> OverCause {
-@@ -1932,23 +2178,52 @@ fn memory_cause(own: Own) -> OverCause {
+@@ -2289,23 +2590,52 @@ fn memory_cause(own: Own) -> OverCause {
  }
  
  /// The memory a texture over a buffer in place lies in ([`check_over`]).
@@ -985,7 +1132,9 @@ index ecb4c685..986c46ac 100644
 -    fn handle(self) -> Option<vk::ExternalMemoryHandleTypeFlags> {
 +    /// Whether the linear image takes `ATTACHMENT_FEEDBACK_LOOP_EXT` for in-pass attachment reads.
 +    fn feedback(self) -> bool {
-+        match self {
+         match self {
+-            Laid::Own => None,
+-            Laid::DmaBuf { .. } => Some(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
 +            Laid::Own { feedback }
 +            | Laid::DmaBuf { feedback, .. }
 +            | Laid::HostMemory { feedback, .. } => feedback,
@@ -993,9 +1142,7 @@ index ecb4c685..986c46ac 100644
 +    }
 +
 +    fn with_feedback(self, feedback: bool) -> Laid {
-         match self {
--            Laid::Own => None,
--            Laid::DmaBuf { .. } => Some(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
++        match self {
 +            Laid::Own { .. } => Laid::Own { feedback },
 +            Laid::DmaBuf { memory_type, .. } => Laid::DmaBuf {
 +                memory_type,
@@ -1013,7 +1160,7 @@ index ecb4c685..986c46ac 100644
          }
      }
  }
-@@ -2005,18 +2280,30 @@ fn linear_extent(
+@@ -2362,18 +2692,30 @@ fn linear_extent(
      core: &Core,
      shape: &Shape,
      plan: &Plan,
@@ -1046,7 +1193,7 @@ index ecb4c685..986c46ac 100644
      let Some(handle) = handle else {
          return core
              .image_format_properties(&linear)
-@@ -2082,14 +2369,15 @@ fn linear_layout(
+@@ -2439,14 +2781,15 @@ fn linear_layout(
      shape: &Shape,
      plan: &Plan,
  ) -> Option<(u64, u64, u64)> {
@@ -1064,7 +1211,7 @@ index ecb4c685..986c46ac 100644
          .initial_layout(vk::ImageLayout::PREINITIALIZED);
      let device = &core.device;
      // SAFETY: the device is live, and makes a linear image of the format, usage and extent.
-@@ -2769,6 +3057,8 @@ enum Bind {
+@@ -3193,6 +3536,8 @@ enum Bind {
          base: u64,
          memory_type: u32,
          handle: Option<vk::ExternalMemoryHandleTypeFlags>,
@@ -1073,7 +1220,7 @@ index ecb4c685..986c46ac 100644
          block_len: u64,
          at: u64,
          bytes_per_row: u64,
-@@ -2865,12 +3155,45 @@ impl Made {
+@@ -3289,12 +3634,45 @@ impl Made {
          let mut list = plan.format_list();
          let info = image_info(d, shape, plan, &mut list);
          let mut external = vk::ExternalMemoryImageCreateInfo::default();
@@ -1123,7 +1270,7 @@ index ecb4c685..986c46ac 100644
                      // Made for the import's handle (`VUID-vkBindImageMemory-memory-02989`), so
                      // undefined (`VUID-VkImageCreateInfo-pNext-01443`).
                      Some(handle) => {
-@@ -2879,14 +3202,24 @@ impl Made {
+@@ -3303,14 +3681,24 @@ impl Made {
                              .push_next(&mut external)
                      }
                      None => info.initial_layout(vk::ImageLayout::PREINITIALIZED),
@@ -1150,7 +1297,7 @@ index ecb4c685..986c46ac 100644
          let created = crate::host_time() - started;
          self.image = Some(image);
          let mut dedicated = vk::MemoryDedicatedRequirements::default();
-@@ -2916,19 +3249,22 @@ impl Made {
+@@ -3340,19 +3728,22 @@ impl Made {
              base,
              memory_type,
              handle: _,
@@ -1177,19 +1324,19 @@ index ecb4c685..986c46ac 100644
              let memory_fits = dedicated.requires_dedicated_allocation == vk::FALSE
                  && bits & (1 << memory_type) != 0
                  && at
-@@ -5455,7 +5791,7 @@ impl Device {
+@@ -6252,7 +6643,7 @@ impl Device {
          let texel = over_texel(d, &plan)?;
          Ok(crate::surface::PlanePlan {
              format: plan.format,
 -            usage: plan.linear_usage(),
 +            usage: plan.linear_usage(false),
-             looped: plan.reads_attachments(self.core()) && self.core().feedback.is_some(),
+             looped: plan.reads_attachments(self.core()) && self.core().feedback_loop,
              view_formats: plan.view_formats.clone(),
              texel,
-@@ -5486,7 +5822,7 @@ impl Device {
-             if index.is_some() && !reached(d.pixel_format, usage) {
-                 return Err(Error::Refused(Refusal::TextureIndex { index }));
+@@ -6285,7 +6676,7 @@ impl Device {
              }
+             // The plane's image is made by the surface's rule ([`Device::plane_plan`]).
+             let plan = plan.unextended();
 -            let missing = plan.linear_usage() & !made.usage;
 +            let missing = plan.linear_usage(false) & !made.usage;
              if !missing.is_empty() {

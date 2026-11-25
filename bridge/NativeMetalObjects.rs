@@ -2929,7 +2929,7 @@ pub extern "C" fn nmb_render_encoder_new(command_buffer: *mut NmbCommandBuffer, 
             slot.resolve_depth_plane = narrow(a.resolve_depth_plane)?;
             slot.level = narrow(a.level)?;
             slot.slice = narrow(a.slice)?;
-            if a.depth_plane != 0 && slot.texture.as_ref().is_some_and(|texture| texture.descriptor().texture_type == TextureType::Type3D) { return Err("upstream runtime does not render into a 3D depth plane".into()); }
+            slot.depth_plane = narrow(a.depth_plane)?;
             slot.load_action = LoadAction::from_raw(a.load).map_err(e("load action"))?;
             slot.store_action = StoreAction::from_raw(a.store).map_err(e("store action"))?;
             slot.clear_color = ClearColor::new(a.clear[0], a.clear[1], a.clear[2], a.clear[3]);

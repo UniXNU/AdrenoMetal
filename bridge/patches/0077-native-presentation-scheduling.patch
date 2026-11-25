@@ -1,7 +1,8 @@
 diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-runtime/src/command.rs
+index e66d37a3..93a9b443 100644
 --- a/crates/metal2vulkan-runtime/src/command.rs
 +++ b/crates/metal2vulkan-runtime/src/command.rs
-@@ -263,6 +263,7 @@
+@@ -267,6 +267,7 @@ impl Pushed {
  /// What the GPU uses: the recorder, the segments, and the blocks kept until retirement.
  pub(crate) struct Gpu {
      pub(crate) recorder: Option<Recorder>,
@@ -9,7 +10,7 @@ diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-ru
      pub(crate) segments: Vec<Segment>,
      /// Each heap's block the commands use (`useHeap:`), once: a block released meanwhile is
      /// reused only after the command buffer retires.
-@@ -310,6 +311,10 @@
+@@ -314,6 +315,10 @@ impl Gpu {
      pub(crate) fn presents(&self) -> bool {
          (self.segments.last()).is_some_and(|segment| !segment.binary.is_empty())
      }
@@ -18,9 +19,9 @@ diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-ru
 +        self.native_presentation || self.presents()
 +    }
  }
-
+ 
  /// One submission's part of a command buffer: its waits, its commands and its signals.
-@@ -396,6 +401,7 @@
+@@ -408,6 +413,7 @@ impl CommandBuffer {
                          device,
                          gpu: Gpu {
                              recorder: None,
@@ -28,12 +29,10 @@ diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-ru
                              segments: vec![Segment::default()],
                              blocks: Vec::new(),
                              kept,
-@@ -435,6 +441,16 @@
-
-     fn state(&self) -> MutexGuard<'_, CbState> {
+@@ -450,6 +456,16 @@ impl CommandBuffer {
          lock(&self.inner.state)
-+    }
-+
+     }
+ 
 +    /// Delay scheduling until the final native display write has reached the driver.
 +    /// The consumer presents outside Vulkan and captures the driver's submitted fence
 +    /// from its scheduled handler or after `wait_until_scheduled` returns.
@@ -42,10 +41,12 @@ diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-ru
 +            building.gpu.native_presentation = true;
 +            Ok(())
 +        })
-     }
-
++    }
++
      /// Runs `f` on what is being recorded. Err: [`Refusal::Committed`];
-@@ -1672,6 +1688,7 @@
+     /// [`Refusal::EncoderOpen`].
+     fn building<R>(&self, f: impl FnOnce(&mut Building) -> Result<R, Error>) -> Result<R, Error> {
+@@ -1800,6 +1816,7 @@ pub(crate) fn retire(
          fences,
          executed,
          queries,
@@ -54,9 +55,10 @@ diff --git a/crates/metal2vulkan-runtime/src/command.rs b/crates/metal2vulkan-ru
      if let Some(recorder) = recorder {
          core.recorders.give_back(core, recorder);
 diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-runtime/src/submit.rs
+index b0177f28..f581ccdf 100644
 --- a/crates/metal2vulkan-runtime/src/submit.rs
 +++ b/crates/metal2vulkan-runtime/src/submit.rs
-@@ -1635,7 +1635,7 @@
+@@ -1714,7 +1714,7 @@ impl WorkState {
              return;
          };
          let empty = pending.gpu.is_empty() && !captured.waits_for(pending.seq);
@@ -65,7 +67,7 @@ diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-run
              fifo.send_through = fifo.send_through.max(entry.place);
              return;
          }
-@@ -1865,7 +1865,8 @@
+@@ -1963,7 +1963,8 @@ impl WorkState {
          else {
              return Step::Staged;
          };
@@ -75,7 +77,7 @@ diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-run
              let scheduled = std::mem::take(&mut pending.handlers.scheduled);
              cb.scheduled(now, !scheduled.is_empty());
              if !scheduled.is_empty() {
-@@ -1878,7 +1879,7 @@
+@@ -1976,7 +1977,7 @@ impl WorkState {
          // A command buffer held for room behind it joins it or, not taken, sends it first: with
          // room the two would have been staged together.
          let held_behind = (fifo.entries.front()).is_some_and(|entry| entry.held.is_some());
@@ -84,7 +86,7 @@ diff --git a/crates/metal2vulkan-runtime/src/submit.rs b/crates/metal2vulkan-run
              true => Step::Goes(index),
              false => Step::Staged,
          }
-@@ -2554,7 +2555,7 @@
+@@ -2751,7 +2752,7 @@ fn submit(core: &Core, value: u64, uploads: Vec<Upload>, batch: Batch) {
              // retires.
              let now = times::host_time();
              for (cb, pending, error) in &mut finished {

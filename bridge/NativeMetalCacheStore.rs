@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
 //! Imports into the pinned upstream cache file format, without changing the runtime.
-//! State framing/checksum follow steelbrain/metal2vulkan 4e9aad67 cache.rs.
+//! State framing/checksum follow steelbrain/metal2vulkan 0c9db497 cache.rs.
 use std::ffi::CString;
 use std::fs::File;
 use std::io;
