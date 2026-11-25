@@ -25,7 +25,7 @@ int main(int argc, char **argv) {
         id<MTLLibrary> library = native_bridge_metal_library_with_air(air, airBytes);
         id<MTLComputePipelineState> pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"scale_and_offset"] error:nil];
         if (!pipeline) return 2;
-        for (unsigned variant = 0; variant < 7; ++variant) {
+        for (unsigned variant = 0; variant < 11; ++variant) {
             auto state = std::make_shared<State>();
             const size_t page = (size_t)getpagesize();
             void *pages = mmap(nullptr, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
@@ -46,7 +46,33 @@ int main(int argc, char **argv) {
                 if (!buffer) return 2;
                 weakBuffer = buffer;
                 [commands encodeWaitForEvent:event value:1];
-                if (variant == 5) {
+                if (variant >= 7) {
+                    id<MTLResource> resource = buffer;
+                    if (variant >= 9) {
+                        auto d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:16 mipmapped:NO];
+                        d.storageMode=MTLStorageModeShared;d.usage=MTLTextureUsageShaderRead;
+                        resource=[buffer newTextureWithDescriptor:d offset:0 bytesPerRow:256];
+                    }
+                    if (variant == 7 || variant == 8) {
+                        auto compute=[commands computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+                        if(compute.dispatchType!=MTLDispatchTypeConcurrent)++failures;
+                        if(variant==7)[compute useResource:resource usage:MTLResourceUsageRead];
+                        else {id<MTLResource> resources[]={resource};[compute useResources:resources count:1 usage:MTLResourceUsageRead];}
+                        [compute memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                        id<MTLResource> resources[]={resource};[compute memoryBarrierWithResources:resources count:1];
+                        [compute endEncoding];
+                    } else {
+                        auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+                        d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget;
+                        auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=[device newTextureWithDescriptor:d];
+                        pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+                        auto render=[commands renderCommandEncoderWithDescriptor:pass];
+                        if(variant==9)[render useResource:resource usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+                        else {id<MTLResource> resources[]={resource};[render useResources:resources count:1 usage:MTLResourceUsageRead stages:MTLRenderStageFragment];}
+                        [render memoryBarrierWithScope:MTLBarrierScopeTextures afterStages:MTLRenderStageFragment beforeStages:MTLRenderStageFragment];
+                        [render endEncoding];
+                    }
+                } else if (variant == 5) {
                     id<MTLComputeCommandEncoder> compute = [commands computeCommandEncoder];
                     [compute setComputePipelineState:pipeline];
                     [compute setBuffer:buffer offset:0 atIndex:0];
@@ -86,6 +112,7 @@ int main(int argc, char **argv) {
                     [blit endEncoding];
                 }
             }
+            if(variant>=7){[commands enqueue];if(commands.status!=MTLCommandBufferStatusEnqueued)++failures;}
             const unsigned before = state->released.load();
             if (before || !weakBuffer) ++failures;
             unsigned pending = before;
@@ -105,7 +132,7 @@ int main(int argc, char **argv) {
                 event.signaledValue = 1;
                 if (!early && dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC))) return 1;
                 if (commands.status != (variant == 3 ? MTLCommandBufferStatusError : MTLCommandBufferStatusCompleted)) ++failures;
-                if (variant != 3) for (unsigned i = 0; i < (variant == 5 ? 256 : 1024); ++i) {
+                if (variant < 7 && variant != 3) for (unsigned i = 0; i < (variant == 5 ? 256 : 1024); ++i) {
                     const bool bad = variant == 5 ? ((const float *)output.contents)[i] != 3.0f*i
                         : variant == 6 ? ((const unsigned char *)pages)[(i / 64) * 256 + i % 64] != 0x5a
                         : ((const unsigned char *)output.contents)[i] != (variant == 2 ? 0x37 : 0x5a);
@@ -121,7 +148,36 @@ int main(int argc, char **argv) {
             std::printf("case %u before=%u pending=%u released=%u\n", variant, before, pending, state->released.load());
             munmap(pages, page);
         }
+        for(unsigned variant=0;variant<2;++variant) {
+            auto event=[device newSharedEvent];
+            auto commands=[[device newCommandQueue] commandBuffer];
+            [commands encodeWaitForEvent:event value:1];
+            __weak id weakHeap;
+            @autoreleasepool {
+                auto d=[MTLHeapDescriptor new];d.size=65536;d.storageMode=MTLStorageModePrivate;
+                auto heap=[device newHeapWithDescriptor:d];if(!heap)return 2;weakHeap=heap;
+                if(!variant) {
+                    auto encoder=[commands computeCommandEncoder];
+                    [encoder useHeap:heap];id<MTLHeap> heaps[]={heap};[encoder useHeaps:heaps count:1];[encoder endEncoding];
+                } else {
+                    auto d=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+                    d.storageMode=MTLStorageModePrivate;d.usage=MTLTextureUsageRenderTarget;
+                    auto pass=[MTLRenderPassDescriptor renderPassDescriptor];pass.colorAttachments[0].texture=[device newTextureWithDescriptor:d];
+                    pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;
+                    auto encoder=[commands renderCommandEncoderWithDescriptor:pass];
+                    [encoder useHeap:heap stages:MTLRenderStageFragment];
+                    id<MTLHeap> heaps[]={heap};[encoder useHeaps:heaps count:1 stages:MTLRenderStageFragment];[encoder endEncoding];
+                }
+            }
+            if(!weakHeap)++failures;
+            [commands commit];
+            usleep(100000);if(!weakHeap || commands.status==MTLCommandBufferStatusCompleted)++failures;
+            event.signaledValue=1;[commands waitUntilCompleted];
+            if(commands.status!=MTLCommandBufferStatusCompleted)++failures;
+            for(unsigned i=0;i<300 && weakHeap;++i)usleep(1000);
+            if(weakHeap)++failures;
+        }
         if (failures) {std::printf("FAIL: resource owner lifetime (%u checks)\n", failures);return 1;}
-        std::puts("PASS: no-copy owners/views survive encoding and gated GPU work, release once after completion/refusal/discard; actual GPU bytes match");
+        std::puts("PASS: no-copy owners/views and indirect resource declarations survive gated GPU work, release once after completion/refusal/discard; actual GPU bytes match");
     }
 }

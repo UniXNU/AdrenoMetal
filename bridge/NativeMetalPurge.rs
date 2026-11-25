@@ -1,53 +1,17 @@
 // SPDX-License-Identifier: MIT
-//! Purgeable memory: what `setPurgeableState:` promises of a buffer, a texture or a heap, kept by the bridge above the runtime.
+//! Consumer-owned purgeable state over runtime resources.
 //!
-//! Metal's contract. A resource whose state is Volatile may lose its contents. `setPurgeableState:` answers the state before the
-//! call, and Empty where the contents were discarded; the caller sets NonVolatile before it uses the resource again and makes the
-//! contents again when the answer is Empty. Apple's drivers do not discard at the call: the kernel purges volatile memory when it
-//! needs pages. RenderBox, QuartzCore, SkyLight and Core Image keep their recycled buffers, textures and heaps Volatile on that
-//! promise, so on a GPU whose memory is wired for life those caches cost their whole size.
-//!
-//! Where the discard is made. The runtime keeps a resource's state and never discards (its attributes.rs): a buffer's `VkBuffer`
-//! and placement and an image's `VkImage` and placement are the resource's own for its life (buffer.rs `FixedPages`, texture.rs
-//! `Owner::Runtime`; Vulkan binds memory once), and its views, copies and first moves rely on that. So the bridge discards with
-//! the two operations the runtime performs for every resource: it releases the runtime object and later makes one again from the
-//! same description. A release is safe by the runtime's own rules: a batch in flight and an encoder being recorded hold what they
-//! use, so the placement is returned only once nothing of the runtime's reads it, and a block with no placement left follows the
-//! pools' aging (kept empty blocks, spare blocks; bridge patches 0021, 0030, 0034). The handle the frontend holds stays the same
-//! box for the resource's life, so a call that still names it never reaches freed memory: it finds the resource placed, or places
-//! it again.
-//!
-//! What may be discarded ([`Resource::kept`]): a texture the device made of its own memory (`nmb_texture_new`, not a drawable), a
-//! buffer the device made (`nmb_buffer_new`), a heap (`nmb_heap_new`), where the runtime keeps a purgeable state for it. Never: a
-//! texture over a buffer or a surface, a no-copy buffer, a view, a resource placed in a heap, a drawable, and what the runtime
-//! makes for itself (it has no handle here and no caller that could declare it Volatile). Those are [`Resource::Fixed`], with no
-//! cell: their calls borrow the runtime object as before.
-//!
-//! When ([`Cell::sweep`]). A resource is discarded only while all of these hold, read under its lock:
-//! - its state is Volatile or Empty, by the runtime's own answer (which keeps the state only of a resource with an allocation of
-//!   its own: at least 16 KiB, not memoryless);
-//! - no command buffer that named it is being recorded or is in flight (`holds`: the frontend holds it from the call that names
-//!   it until the command buffer completed);
-//! - nothing made of it lives (`ties`: a view of a texture, a texture over a buffer, a resource placed in a heap), since those
-//!   share its memory and would not follow a new placement;
-//! - neither its CPU pointer nor its GPU address was ever handed out (`pinned`): Metal keeps both for a resource's life, and a
-//!   resource made again lies elsewhere;
-//! - no call is inside it (its lock is free).
-//! The triggers are the system's memory pressure signal ([`Cause::Pressure`]) and age ([`Cause::Age`]: Volatile or Empty and idle
-//! for the runtime's spare age), because pressure events are rare on this system while memory is short.
-//!
-//! After a discard the state is Empty. NonVolatile places the resource again before it answers Empty; a query answers Empty and
-//! places nothing (a query changes nothing in Metal, and placing for it would cost the memory again for a caller that only asks);
-//! Volatile leaves it Empty, as Metal does. Any other use of a discarded resource is the caller's error under the contract (it did
-//! not set NonVolatile first): the resource is placed again with new, zeroed memory, its state still Empty, as a GPU whose pages
-//! were purged shows emptied pages, and it may be discarded again once idle. Placing again fails as an allocation fails: the call
-//! that needed the resource fails with the allocation's error, `setPurgeableState:` still answers Empty, and the next use tries
-//! again.
-//!
-//! `NATIVE_METAL_PURGE=0` (the boot argument `gpu-purge=0`) makes every resource `Fixed`: the state is kept by the runtime alone
-//! and nothing is ever discarded, for a comparison on the same image.
+//! Idle Volatile or Empty buffers, textures and heaps can be released and recreated from
+//! their recipes. Frontend handles stay stable. Command holds, views and child resources
+//! prevent discards; handing out a CPU pointer or GPU address pins the placement.
+//! Pressure signals discard eligible resources immediately. Age sweeps use the runtime's
+//! 250 ms idle clock. A discarded resource answers Empty, including after its recreation.
+//! `NATIVE_METAL_PURGE=0` retains resource state without discarding allocations.
 
-use metal2vulkan_runtime::{Buffer, Device, Heap, HeapDescriptor, HeapType, PurgeableState, ResourceOptions, Texture, TextureDescriptor};
+use metal2vulkan_runtime::Device;
+use crate::texture::{Texture, TextureDescriptor};
+use crate::heap::{Heap, HeapDescriptor, HeapType};
+use crate::resources::{Buffer, PurgeableState, ResourceOptions};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError, Weak};
 use std::time::{Duration, Instant};
@@ -116,10 +80,9 @@ impl Purge {
         Arc::new(Purge { device: device.clone(), on: purge_on(), listed: Mutex::new(Vec::new()), counts: Counts::default(), start: Instant::now() })
     }
 
-    /// The age an idle Volatile or Empty resource goes at: the runtime's spare block age, so a resource and the block it emptied
-    /// go on one clock.
+    /// The runtime's 250 ms idle clock also bounds the consumer's volatile placements.
     pub fn age() -> Duration {
-        Device::spare_age()
+        Duration::from_millis(250)
     }
 
     fn now_ms(&self) -> u64 {
@@ -223,7 +186,7 @@ pub trait Kind: Clone + Send + Sync + 'static {
 impl Kind for Texture {
     type Recipe = TextureDescriptor;
     fn make(device: &Device, recipe: &TextureDescriptor) -> Result<Texture, String> {
-        device.new_texture(recipe).map_err(|error| format!("texture: {error:?}"))
+        Texture::allocate(device, recipe)
     }
     fn state(&self, state: PurgeableState) -> Result<PurgeableState, String> {
         self.set_purgeable_state(state).map_err(|error| format!("purgeable state: {error:?}"))
@@ -237,7 +200,7 @@ impl Kind for Buffer {
     /// The length and the options. A buffer made with bytes is made again without them: its contents were discarded.
     type Recipe = (u64, ResourceOptions);
     fn make(device: &Device, recipe: &(u64, ResourceOptions)) -> Result<Buffer, String> {
-        device.new_buffer(recipe.0, recipe.1).map_err(|error| format!("buffer: {error:?}"))
+        Buffer::allocate(device, recipe.0, recipe.1, None).map_err(|error| format!("buffer: {error:?}"))
     }
     fn state(&self, state: PurgeableState) -> Result<PurgeableState, String> {
         self.set_purgeable_state(state).map_err(|error| format!("purgeable state: {error:?}"))
@@ -251,7 +214,7 @@ impl Kind for Heap {
     /// The type, the size asked and the options.
     type Recipe = (HeapType, u64, ResourceOptions);
     fn make(device: &Device, recipe: &(HeapType, u64, ResourceOptions)) -> Result<Heap, String> {
-        device.new_heap(&HeapDescriptor::new(recipe.0, recipe.1, recipe.2)).map_err(|error| format!("heap: {error:?}"))
+        Heap::new(device, &HeapDescriptor::new(recipe.0, recipe.1, recipe.2)).map_err(|error| format!("heap: {error:?}"))
     }
     fn state(&self, state: PurgeableState) -> Result<PurgeableState, String> {
         self.set_purgeable_state(state).map_err(|error| format!("heap purgeable state: {error:?}"))
@@ -526,49 +489,12 @@ impl<T> std::ops::Deref for Live<'_, T> {
     }
 }
 
-/// A resource made in a light form that serves slot bindings alone, and how to make it whole: a two-plane YCbCr texture over a
-/// surface's planes with no converted image (bridge patch 0035). The first call that needs more than a slot binding makes the whole
-/// object, which every call uses from then on; an encoder or a batch that bound the light one keeps it until it is done.
-pub struct Forms<T: Kind> {
-    /// The object in use and whether it is the whole one.
-    now: Mutex<(T, bool)>,
-    whole: Box<dyn Fn() -> Result<T, String> + Send + Sync>,
-    tie: Option<Tie>,
-}
-
-/// The light objects a call made whole, for the frontend's YC row.
-static MADE_WHOLE: AtomicU64 = AtomicU64::new(0);
-
-/// How many light objects a call other than a slot binding made whole.
-pub fn made_whole() -> u64 {
-    MADE_WHOLE.load(Relaxed)
-}
-
-impl<T: Kind> Forms<T> {
-    /// The whole object, made at the first call that asks for it.
-    fn whole(&self) -> Result<T, String> {
-        let mut now = lock(&self.now);
-        if !now.1 {
-            *now = ((self.whole)()?, true);
-            MADE_WHOLE.fetch_add(1, Relaxed);
-        }
-        Ok(now.0.clone())
-    }
-
-    /// The object in use: the light one until a call made it whole.
-    fn any(&self) -> T {
-        lock(&self.now).0.clone()
-    }
-}
-
 /// A buffer, texture or heap behind a frontend handle.
 pub enum Resource<T: Kind> {
     /// Never discarded: its object, and its tie on the resource it was made of where that one may be.
     Fixed(T, Option<Tie>),
     /// May be discarded while Volatile or Empty and idle.
     Kept(Arc<Cell<T>>),
-    /// Never discarded: light until a call needs it whole.
-    Forms(Forms<T>),
 }
 
 impl<T: Kind> Resource<T> {
@@ -582,9 +508,7 @@ impl<T: Kind> Resource<T> {
         Resource::Fixed(object, tie)
     }
 
-    /// `object`, made of `recipe` by the device of `purge`, which may be discarded and made again of it; fixed where the device
-    /// does not discard, and where the runtime keeps no purgeable state for the object (one with no allocation of its own: under
-    /// 16 KiB, or memoryless), which can then never be Volatile and whose uses pay for no cell.
+    /// An owned placement that may be discarded and recreated from its recipe.
     pub fn kept(purge: &Arc<Purge>, object: T, recipe: T::Recipe) -> Resource<T> {
         if !purge.on || !keeps_state(&object) {
             return Resource::Fixed(object, None);
@@ -606,43 +530,33 @@ impl<T: Kind> Resource<T> {
         }))
     }
 
-    /// `light`, which serves slot bindings alone, made of the resource `tie` is on, and `whole`, which makes the object every
-    /// other call uses.
-    pub fn forms(light: T, tie: Option<Tie>, whole: impl Fn() -> Result<T, String> + Send + Sync + 'static) -> Resource<T> {
-        Resource::Forms(Forms { now: Mutex::new((light, false)), whole: Box::new(whole), tie })
-    }
-
     /// The object for a call that uses the resource, placed again where it was discarded, and made whole where it was light.
     pub fn live(&self) -> Result<Live<'_, T>, String> {
         match self {
             Resource::Fixed(object, _) => Ok(Live::Fixed(object)),
             Resource::Kept(cell) => cell.live().map(Live::Placed),
-            Resource::Forms(forms) => forms.whole().map(Live::Placed),
+
         }
     }
 
-    /// The object for a slot binding, or a question every form answers alike: as [`live`](Self::live), but a light object stays
-    /// light.
+    /// The placement used for a slot binding.
     pub fn slot(&self) -> Result<Live<'_, T>, String> {
-        match self {
-            Resource::Forms(forms) => Ok(Live::Placed(forms.any())),
-            other => other.live(),
-        }
-    }
+        self.live()
+}
 
     /// The object where the resource has one, for a question that places nothing: `None` while it is discarded.
     pub fn peek(&self) -> Option<Live<'_, T>> {
         match self {
             Resource::Fixed(object, _) => Some(Live::Fixed(object)),
             Resource::Kept(cell) => cell.peek().map(Live::Placed),
-            Resource::Forms(forms) => Some(Live::Placed(forms.any())),
+
         }
     }
 
     /// What a kept resource was made of.
     pub fn recipe(&self) -> Option<&T::Recipe> {
         match self {
-            Resource::Fixed(..) | Resource::Forms(_) => None,
+            Resource::Fixed(..) => None,
             Resource::Kept(cell) => Some(&cell.recipe),
         }
     }
@@ -652,7 +566,7 @@ impl<T: Kind> Resource<T> {
         match self {
             Resource::Fixed(object, _) => object.bytes(),
             Resource::Kept(cell) => cell.bytes,
-            Resource::Forms(forms) => forms.any().bytes(),
+
         }
     }
 
@@ -662,7 +576,7 @@ impl<T: Kind> Resource<T> {
         match self {
             Resource::Fixed(object, _) => Ok(object.state(requested)?.raw()),
             Resource::Kept(cell) => cell.set_state(requested),
-            Resource::Forms(forms) => Ok(forms.any().state(requested)?.raw()),
+
         }
     }
 
@@ -670,7 +584,7 @@ impl<T: Kind> Resource<T> {
     /// resource's object is read: what a fixed resource is itself tied to, since that is whose memory the new one shares.
     pub fn tie(&self) -> Option<Tie> {
         match self {
-            Resource::Fixed(_, tie) | Resource::Forms(Forms { tie, .. }) => tie.as_ref().map(|tie| Tie::on(Arc::clone(&tie.0))),
+            Resource::Fixed(_, tie) => tie.as_ref().map(|tie| Tie::on(Arc::clone(&tie.0))),
             Resource::Kept(cell) => {
                 let cell: Arc<dyn Tied> = cell.clone();
                 Some(Tie::on(cell))
@@ -683,7 +597,7 @@ impl<T: Kind> Resource<T> {
     /// without having set it NonVolatile, and the command's use will place it again, emptied.
     pub fn hold(&self) -> bool {
         match self {
-            Resource::Fixed(..) | Resource::Forms(_) => false,
+            Resource::Fixed(..) => false,
             Resource::Kept(cell) => {
                 cell.holds.fetch_add(1, SeqCst);
                 cell.out.load(SeqCst)

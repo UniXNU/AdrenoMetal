@@ -76,6 +76,34 @@ bool nmb_device_pass_counts(const NmbDevice *, uint64_t out[10]);
 // Bytes of pooled blocks live and placed in them, empty kept, dedicated, host imports; bytes allocated so far; pooled and dedicated
 // blocks live; GPU pool blocks made and released.
 bool nmb_device_memory_counts(const NmbDevice *, uint64_t out[10]);
+// Runtime v2: overlapping counters, sampled independently; available only with SHENG_DIAG=1.
+typedef struct NmbRuntimeMemory {
+ uint64_t version;
+ uint64_t sample_ns;
+ uint64_t shared_allocation_bytes;
+ uint64_t private_allocation_bytes;
+ uint64_t shared_placed_bytes;
+ uint64_t private_placed_bytes;
+ uint64_t shared_idle_bytes;
+ uint64_t private_idle_bytes;
+ uint64_t shared_reserve_bytes;
+ uint64_t private_reserve_bytes;
+ uint64_t shared_idle_age_ns;
+ uint64_t private_idle_age_ns;
+ uint64_t import_bytes;
+ uint64_t export_bytes;
+ uint64_t surface_import_bytes;
+ uint64_t imports;
+ uint64_t command_buffers;
+ uint64_t releases_waiting;
+ uint64_t allocations_freed;
+ uint64_t texture_block_bytes;
+ uint64_t texture_block_held_bytes;
+ uint64_t shared_buffer_bytes;
+ uint64_t private_buffer_bytes;
+} NmbRuntimeMemory;
+bool nmb_device_runtime_memory(const NmbDevice *, NmbRuntimeMemory *out);
+
 // Live blocks of the runtime's own device memory: seven size classes each (at most 16, 32, 40, 48, 56, 64 MiB,
 // larger) of pooled blocks with a placement [0], pooled blocks kept empty [7], spare image blocks [14], dedicated blocks of an image
 // [21] and of a buffer [28]; bytes of the spare blocks [35] and of the dedicated blocks of images [36] and buffers [37]; lazily
@@ -173,10 +201,13 @@ bool nmb_device_heap_buffer_size_and_align(const NmbDevice *, uint64_t length, u
 NmbTexture *nmb_texture_new(NmbDevice *, const struct NmbTextureDescriptor *);
 /* A linear texture over a buffer's bytes; iosurface marks the buffer as standing for a surface without planes (Metal's IOSurface rules). */
 NmbTexture *nmb_texture_new_on_buffer(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row, bool iosurface);
-// A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size and plane 1's offset and rows.
-NmbTexture *nmb_texture_new_on_surface(NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset, uint64_t bytes_per_row,
-                                       uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height, uint64_t chroma_offset,
-                                       uint64_t chroma_bytes_per_row);
+typedef uint32_t (*NmbSurfaceSeedFn)(const void *context);
+// A texture over a surface with planes; a two-plane surface gives its OSType, the asked plane, its size, plane 1's offset and rows,
+// its YCbCr matrix (0 = BT.601/default, 1 = BT.709, 2 = BT.2020), and an optional IOSurface seed reader.
+NmbTexture *nmb_texture_new_on_surface(NmbDevice *, NmbBuffer *, const struct NmbTextureDescriptor *, uint64_t offset,
+                                       uint64_t bytes_per_row, uint32_t pixel_format, uint64_t plane, uint64_t width, uint64_t height,
+                                       uint64_t chroma_offset, uint64_t chroma_bytes_per_row, uint32_t ycbcr_matrix,
+                                       NmbSurfaceSeedFn surface_seed, const void *surface_context);
 /* Two-plane YCbCr surface textures: made over their planes alone, made with their converted image, images made later at a slot
    binding, textures over their planes another call made whole, converted images alive and their bytes; then textures whose planes
    are read in place and those that keep their image alone by reason (device, layout, swizzle, offset, elements, reach, view). */
@@ -226,6 +257,8 @@ struct NmbConstant {uint64_t type, index; const char *name; const void *bytes; u
 NmbFunction *nmb_function_new_specialized(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 // The library's function with every function constant it declares set to zero (shader priming), or null.
 NmbFunction *nmb_function_new_zero_constants(NmbLibrary *, const char *name);
+// Specialize required constants only. Set the selected scalar integer to one, or keep all zero with UINT32_MAX.
+NmbFunction *nmb_function_new_required_constants(NmbLibrary *, const char *name, uint32_t one_index);
 /* nmb_function_new_specialized, with every declared constant the caller left out set to zero (false for a bool). */
 NmbFunction *nmb_function_new_specialized_zero_rest(NmbLibrary *, const char *name, const struct NmbConstant *constants, uint32_t count);
 void nmb_function_release(NmbFunction *);
@@ -320,6 +353,9 @@ bool nmb_command_buffer_on_completed(NmbCommandBuffer *, void (*handler)(void *c
  * The caller keeps context alive until completion (or a refused commit). */
 bool nmb_command_buffer_on_scheduled(NmbCommandBuffer *, void (*handler)(void *context), void *context);
 bool nmb_command_buffer_commit(NmbCommandBuffer *);
+bool nmb_command_buffer_enqueue(NmbCommandBuffer *);
+// Native display fence snapshots must follow the final driver submission, not queue staging.
+bool nmb_command_buffer_native_presentation(const NmbCommandBuffer *);
 /* Wait for scheduling and scheduled handlers only; false on a refused wait. */
 bool nmb_command_buffer_wait_scheduled(NmbCommandBuffer *);
 /* 0 completed in time, 1 timed out (timeout_ms 0 waits without a bound). */
@@ -349,6 +385,12 @@ bool nmb_encoder_update_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 bool nmb_encoder_wait_fence(NmbEncoder *, NmbFence *, uint64_t stages);
 
 NmbEncoder *nmb_compute_encoder_new(NmbCommandBuffer *);
+NmbEncoder *nmb_compute_encoder_with_dispatch(NmbCommandBuffer *, uint64_t dispatch_type);
+bool nmb_encoder_use_resource(NmbEncoder *, const NmbBuffer *, const NmbTexture *, uint64_t usage, uint64_t stages);
+bool nmb_encoder_use_heap(NmbEncoder *, const NmbCommandBuffer *, const NmbHeap *, uint64_t stages);
+bool nmb_heap_hold(const NmbHeap *);
+void nmb_heap_unhold(const NmbHeap *);
+bool nmb_encoder_memory_barrier(NmbEncoder *, uint64_t after_stages, uint64_t before_stages);
 NmbEncoder *nmb_blit_encoder_new(NmbCommandBuffer *);
 struct NmbPassAttachment {
     NmbTexture *texture;
@@ -437,6 +479,18 @@ bool nmb_blit_texture_to_buffer(NmbEncoder *, NmbTexture *source, uint64_t slice
 bool nmb_blit_generate_mipmaps(NmbEncoder *, NmbTexture *);
 uint64_t nmb_command_buffer_diagnostic_id(const NmbCommandBuffer *buffer);
 void nmb_gpu_diagnostic_hook(void (*hook)(uint32_t,uint64_t,uint64_t,uint64_t));
+/* Runtime-v2 DEBUG metrics, 32 words: version; submissions, submit infos, submit ns/max ns,
+   queue-lock ns; passes, barriers, copied/zeroed bytes; pipelines, pipeline ns;
+   translations, loaded translations, cache bytes written, writes dropped;
+   imported-buffer copies/bytes; allocations freed, consumer allocations/ns;
+   allocation bytes by texture, texture block, ring, staging region, staging buffer,
+   shared take, private take; first-use waits/ns; held releases/bytes.
+   Version-1 statistics queries return false under runtime v2; their layouts are not equivalent. */
+bool nmb_device_runtime_metrics(const NmbDevice *, uint64_t *out);
+
+// Retain consumer placement and index leases until command retirement.
+bool nmb_command_buffer_keep(const NmbCommandBuffer *, const void *, uint32_t kind);
+
 #ifdef __cplusplus
 }
 #endif
