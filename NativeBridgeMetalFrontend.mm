@@ -4664,11 +4664,14 @@ static void fillBaseLimits(id device);
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
 }
-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
-}
+// SPI: the row alignment a texture over an IOSurface needs (unanswered it was 0, a divisor for its callers). Core Image
+// (CIMetalTextureCreateFromPaddedIOSurface) and Metal's stride check refuse a surface whose rows are not a multiple of it, and
+// IOSurfaceCreate and CGBitmapContext align 8-bit four-channel rows to 16 or 32 bytes (SF Symbol rasterization in IconFoundation:
+// 72x52 at 288 bytes, 36x26 and 38x38 at 160): answering the linear alignment (64) dropped those glyphs. A texture over a buffer
+// whose rows the device's linear image does not take is the runtime's copy (check_over), so 16 is safe; the runtime answer is the
+// same (capabilities::IOSURFACE_ROW_ALIGNMENT). Linear textures over buffers keep the device's linear alignment.
+- (NSUInteger)iosurfaceTextureAlignmentBytes {return 16;}
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {return 16;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
