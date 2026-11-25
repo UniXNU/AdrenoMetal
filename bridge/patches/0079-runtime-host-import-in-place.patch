@@ -313,10 +313,10 @@ index ed90be95..afa57325 100644
                  drop((texture, imported, import));
                  wait_until(&device, "the release", || released.load(Ordering::SeqCst));
 diff --git a/crates/metal2vulkan-runtime/src/tests/texture.rs b/crates/metal2vulkan-runtime/src/tests/texture.rs
-index 3da5b978..f0bf7fc6 100644
+index 3da5b978..88a9a943 100644
 --- a/crates/metal2vulkan-runtime/src/tests/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/tests/texture.rs
-@@ -294,6 +294,182 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
+@@ -294,6 +294,245 @@ fn a_views_swizzle_reads_its_parents_swizzled_channels() {
      );
  }
  
@@ -326,7 +326,7 @@ index 3da5b978..f0bf7fc6 100644
 +    use crate::texture::{
 +        homing_host_dependency, in_place_attachment_reads, in_place_create_error,
 +        in_place_pitch_fits, in_place_subresource_aspect, keeps_home_on_copy, linear_image_usage,
-+        select_host_laid, Laid,
++        select_host_laid, select_host_plan, Laid,
 +    };
 +
 +    // Modifier extension available and passes extent+features -> explicit DRM_FORMAT_MOD_LINEAR.
@@ -494,13 +494,76 @@ index 3da5b978..f0bf7fc6 100644
 +    assert!(keeps_home_on_copy(vk::ImageLayout::PREINITIALIZED, false, false));
 +    assert!(keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, true));
 +    assert!(!keeps_home_on_copy(vk::ImageLayout::UNDEFINED, false, false));
++
++    // Unextended DRM_FORMAT_MOD_LINEAR wins over extended plain LINEAR so custom pitches bind.
++    assert_eq!(
++        select_host_plan(
++            2,
++            Some((false, false, false)),
++            Some((true, true, true)),
++            (true, true, true),
++            Some((true, true, false)),
++        ),
++        (
++            Ok(Laid::HostMemory {
++                memory_type: 2,
++                explicit_modifier: true,
++                feedback: true,
++            }),
++            true,
++        )
++    );
++    assert_eq!(
++        select_host_plan(
++            2,
++            Some((false, false, false)),
++            Some((false, false, false)),
++            (true, true, false),
++            Some((true, true, true)),
++        ),
++        (
++            Ok(Laid::HostMemory {
++                memory_type: 2,
++                explicit_modifier: false,
++                feedback: false,
++            }),
++            false,
++        )
++    );
++    assert_eq!(
++        select_host_plan(
++            2,
++            Some((false, false, false)),
++            Some((true, false, false)),
++            (false, false, false),
++            Some((true, true, true)),
++        ),
++        (
++            Ok(Laid::HostMemory {
++                memory_type: 2,
++                explicit_modifier: false,
++                feedback: true,
++            }),
++            true,
++        )
++    );
++    assert_eq!(
++        select_host_plan(
++            2,
++            Some((false, false, false)),
++            Some((true, false, false)),
++            (false, false, false),
++            Some((false, false, false)),
++        ),
++        (Err(OverCause::LinearFeatures), false)
++    );
 +}
 +
  #[cfg(any(m2v_gpu, m2v_cpu_icd))]
  mod on_device {
      use super::refused;
 diff --git a/crates/metal2vulkan-runtime/src/texture.rs b/crates/metal2vulkan-runtime/src/texture.rs
-index c1060f9c..8d0d6475 100644
+index c1060f9c..f0f2cf02 100644
 --- a/crates/metal2vulkan-runtime/src/texture.rs
 +++ b/crates/metal2vulkan-runtime/src/texture.rs
 @@ -793,13 +793,14 @@ impl Image {
@@ -711,7 +774,7 @@ index c1060f9c..8d0d6475 100644
      }
  
      /// Whether a draw may read an attachment of its own pass through a texture of the plan, where
-@@ -2198,77 +2230,346 @@ fn check_over(
+@@ -2198,77 +2230,389 @@ fn check_over(
      let (block, copy) = buffer.held();
      // An image bound in imported memory is made for the import's handle
      // (VUID-vkBindImageMemory-memory-02989), so in the undefined layout
@@ -813,6 +876,18 @@ index c1060f9c..8d0d6475 100644
 +                    feedback,
 +                }));
 +            }
++            let plain = plan.extended.then(|| plan.unextended());
++            let plain_mod = plain
++                .as_ref()
++                .and_then(|plain| core.exports.modifiers.then(|| probe(plain, handle, true)));
++            if let Some((true, true, feedback)) = plain_mod {
++                *plan = plain.unwrap();
++                return Ok(Ok(Laid::HostMemory {
++                    memory_type,
++                    explicit_modifier: true,
++                    feedback,
++                }));
++            }
 +            let linear = probe(plan, handle, false);
 +            if let (true, true, feedback) = linear {
 +                return Ok(Ok(Laid::HostMemory {
@@ -821,28 +896,16 @@ index c1060f9c..8d0d6475 100644
 +                    feedback,
 +                }));
 +            }
-+            if plan.extended {
-+                let plain = plan.unextended();
-+                let plain_mod = core.exports.modifiers.then(|| probe(&plain, handle, true));
-+                if let Some((true, true, feedback)) = plain_mod {
-+                    *plan = plain;
-+                    return Ok(Ok(Laid::HostMemory {
-+                        memory_type,
-+                        explicit_modifier: true,
-+                        feedback,
-+                    }));
-+                }
-+                let plain_lin = probe(&plain, handle, false);
-+                if let (true, true, feedback) = plain_lin {
-+                    *plan = plain;
-+                    return Ok(Ok(Laid::HostMemory {
-+                        memory_type,
-+                        explicit_modifier: false,
-+                        feedback,
-+                    }));
-+                }
++            let plain_lin = plain.as_ref().map(|plain| probe(plain, handle, false));
++            if let Some((true, true, feedback)) = plain_lin {
++                *plan = plain.unwrap();
++                return Ok(Ok(Laid::HostMemory {
++                    memory_type,
++                    explicit_modifier: false,
++                    feedback,
++                }));
 +            }
-+            return Ok(select_host_laid(memory_type, modifier, linear));
++            return Ok(select_host_plan(memory_type, modifier, plain_mod, linear, plain_lin).0);
 +        }
          (None, Some(own)) => return Ok(Err(memory_cause(own))),
      };
@@ -993,28 +1056,71 @@ index c1060f9c..8d0d6475 100644
 +/// probe (`modifier`: `Some((extent_ok, features_ok, feedback))` when
 +/// `VK_EXT_image_drm_format_modifier` is enabled) and the plain `LINEAR` probe
 +/// (`linear`: `(extent_ok, features_ok, feedback)`).
++/// Selects the in-place layout and whether to drop extended storage view usage for a host-memory
++/// import, probing explicit `DRM_FORMAT_MOD_LINEAR` (extended, then unextended) ahead of plain
++/// `LINEAR` (extended, then unextended) so driver-accepted row pitches bind directly before
++/// falling back to strict plain linear pitch limits.
++pub(crate) fn select_host_plan(
++    memory_type: u32,
++    modifier: Option<(bool, bool, bool)>,
++    plain_modifier: Option<(bool, bool, bool)>,
++    linear: (bool, bool, bool),
++    plain_linear: Option<(bool, bool, bool)>,
++) -> (Result<Laid, OverCause>, bool) {
++    if let Some((true, true, feedback)) = modifier {
++        (
++            Ok(Laid::HostMemory {
++                memory_type,
++                explicit_modifier: true,
++                feedback,
++            }),
++            false,
++        )
++    } else if let Some((true, true, feedback)) = plain_modifier {
++        (
++            Ok(Laid::HostMemory {
++                memory_type,
++                explicit_modifier: true,
++                feedback,
++            }),
++            true,
++        )
++    } else if let (true, true, feedback) = linear {
++        (
++            Ok(Laid::HostMemory {
++                memory_type,
++                explicit_modifier: false,
++                feedback,
++            }),
++            false,
++        )
++    } else if let Some((true, true, feedback)) = plain_linear {
++        (
++            Ok(Laid::HostMemory {
++                memory_type,
++                explicit_modifier: false,
++                feedback,
++            }),
++            true,
++        )
++    } else if modifier.is_some_and(|(extent, _, _)| extent)
++        || plain_modifier.is_some_and(|(extent, _, _)| extent)
++        || linear.0
++        || plain_linear.is_some_and(|(extent, _, _)| extent)
++    {
++        (Err(OverCause::LinearFeatures), false)
++    } else {
++        (Err(OverCause::HostMemory), false)
++    }
++}
++
++#[cfg(test)]
 +pub(crate) fn select_host_laid(
 +    memory_type: u32,
 +    modifier: Option<(bool, bool, bool)>,
 +    linear: (bool, bool, bool),
 +) -> Result<Laid, OverCause> {
-+    if let Some((true, true, feedback)) = modifier {
-+        Ok(Laid::HostMemory {
-+            memory_type,
-+            explicit_modifier: true,
-+            feedback,
-+        })
-+    } else if let (true, true, feedback) = linear {
-+        Ok(Laid::HostMemory {
-+            memory_type,
-+            explicit_modifier: false,
-+            feedback,
-+        })
-+    } else if modifier.is_some_and(|(extent, _, _)| extent) || linear.0 {
-+        Err(OverCause::LinearFeatures)
-+    } else {
-+        Err(OverCause::HostMemory)
-+    }
++    select_host_plan(memory_type, modifier, None, linear, None).0
 +}
 +
 +/// Whether `bytes_per_row` fits an explicit DRM modifier plane layout without 32-bit truncation.
@@ -1099,7 +1205,7 @@ index c1060f9c..8d0d6475 100644
  /// Why a texture over a buffer in `own`'s memory, which no in-place image takes
  /// ([`check_over`]), is the counted copy: the import's or export's kind.
  fn memory_cause(own: Own) -> OverCause {
-@@ -2289,23 +2590,52 @@ fn memory_cause(own: Own) -> OverCause {
+@@ -2289,23 +2633,52 @@ fn memory_cause(own: Own) -> OverCause {
  }
  
  /// The memory a texture over a buffer in place lies in ([`check_over`]).
@@ -1160,7 +1266,7 @@ index c1060f9c..8d0d6475 100644
          }
      }
  }
-@@ -2362,18 +2692,30 @@ fn linear_extent(
+@@ -2362,18 +2735,30 @@ fn linear_extent(
      core: &Core,
      shape: &Shape,
      plan: &Plan,
@@ -1193,7 +1299,7 @@ index c1060f9c..8d0d6475 100644
      let Some(handle) = handle else {
          return core
              .image_format_properties(&linear)
-@@ -2439,14 +2781,15 @@ fn linear_layout(
+@@ -2439,14 +2824,15 @@ fn linear_layout(
      shape: &Shape,
      plan: &Plan,
  ) -> Option<(u64, u64, u64)> {
@@ -1211,7 +1317,7 @@ index c1060f9c..8d0d6475 100644
          .initial_layout(vk::ImageLayout::PREINITIALIZED);
      let device = &core.device;
      // SAFETY: the device is live, and makes a linear image of the format, usage and extent.
-@@ -3193,6 +3536,8 @@ enum Bind {
+@@ -3193,6 +3579,8 @@ enum Bind {
          base: u64,
          memory_type: u32,
          handle: Option<vk::ExternalMemoryHandleTypeFlags>,
@@ -1220,7 +1326,7 @@ index c1060f9c..8d0d6475 100644
          block_len: u64,
          at: u64,
          bytes_per_row: u64,
-@@ -3289,12 +3634,45 @@ impl Made {
+@@ -3289,12 +3677,45 @@ impl Made {
          let mut list = plan.format_list();
          let info = image_info(d, shape, plan, &mut list);
          let mut external = vk::ExternalMemoryImageCreateInfo::default();
@@ -1270,7 +1376,7 @@ index c1060f9c..8d0d6475 100644
                      // Made for the import's handle (`VUID-vkBindImageMemory-memory-02989`), so
                      // undefined (`VUID-VkImageCreateInfo-pNext-01443`).
                      Some(handle) => {
-@@ -3303,14 +3681,24 @@ impl Made {
+@@ -3303,14 +3724,24 @@ impl Made {
                              .push_next(&mut external)
                      }
                      None => info.initial_layout(vk::ImageLayout::PREINITIALIZED),
@@ -1297,7 +1403,7 @@ index c1060f9c..8d0d6475 100644
          let created = crate::host_time() - started;
          self.image = Some(image);
          let mut dedicated = vk::MemoryDedicatedRequirements::default();
-@@ -3340,19 +3728,22 @@ impl Made {
+@@ -3340,19 +3771,22 @@ impl Made {
              base,
              memory_type,
              handle: _,
@@ -1324,7 +1430,7 @@ index c1060f9c..8d0d6475 100644
              let memory_fits = dedicated.requires_dedicated_allocation == vk::FALSE
                  && bits & (1 << memory_type) != 0
                  && at
-@@ -6252,7 +6643,7 @@ impl Device {
+@@ -6252,7 +6686,7 @@ impl Device {
          let texel = over_texel(d, &plan)?;
          Ok(crate::surface::PlanePlan {
              format: plan.format,
@@ -1333,7 +1439,7 @@ index c1060f9c..8d0d6475 100644
              looped: plan.reads_attachments(self.core()) && self.core().feedback_loop,
              view_formats: plan.view_formats.clone(),
              texel,
-@@ -6285,7 +6676,7 @@ impl Device {
+@@ -6285,7 +6719,7 @@ impl Device {
              }
              // The plane's image is made by the surface's rule ([`Device::plane_plan`]).
              let plan = plan.unextended();

@@ -48,15 +48,17 @@ pub fn compute(
     crate::archive::Registry::for_device(device)?.prepare_compute(device, descriptor);
     let mut held = Vec::new();
     let mut refused = None;
-    let state = device.new_compute_pipeline_state(descriptor, |samplers| {
-        sampler_ids(device, samplers, &mut held, &mut refused)
-    });
-    state
-        .map(|raw| ComputePipelineState {
-            raw,
-            ownership: crate::ownership::Ownership::new(held.iter().map(|r| r.owner()).collect()),
+    let raw = device
+        .new_compute_pipeline_state(descriptor, |samplers| {
+            sampler_ids(device, samplers, &mut held, &mut refused)
         })
-        .map_err(|e| refused.unwrap_or_else(|| format!("compute pipeline: {e:?}")))
+        .map_err(|e| refused.unwrap_or_else(|| format!("compute pipeline: {e:?}")))?;
+    raw.finish_pipeline()
+        .map_err(|e| format!("compute pipeline finish: {e:?}"))?;
+    Ok(ComputePipelineState {
+        raw,
+        ownership: crate::ownership::Ownership::new(held.iter().map(|r| r.owner()).collect()),
+    })
 }
 pub fn render(
     device: &rt::Device,
@@ -65,15 +67,17 @@ pub fn render(
     crate::archive::Registry::for_device(device)?.prepare_render(device, descriptor);
     let mut held = Vec::new();
     let mut refused = None;
-    let state = device.new_render_pipeline_state(descriptor, |samplers| {
-        sampler_ids(device, samplers, &mut held, &mut refused)
-    });
-    state
-        .map(|raw| RenderPipelineState {
-            raw,
-            ownership: crate::ownership::Ownership::new(held.iter().map(|r| r.owner()).collect()),
+    let raw = device
+        .new_render_pipeline_state(descriptor, |samplers| {
+            sampler_ids(device, samplers, &mut held, &mut refused)
         })
-        .map_err(|e| refused.unwrap_or_else(|| format!("render pipeline: {e:?}")))
+        .map_err(|e| refused.unwrap_or_else(|| format!("render pipeline: {e:?}")))?;
+    raw.finish_pipeline()
+        .map_err(|e| format!("render pipeline finish: {e:?}"))?;
+    Ok(RenderPipelineState {
+        raw,
+        ownership: crate::ownership::Ownership::new(held.iter().map(|r| r.owner()).collect()),
+    })
 }
 
 #[derive(Clone)]
