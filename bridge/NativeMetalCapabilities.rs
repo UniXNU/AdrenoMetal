@@ -85,11 +85,11 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
                 PixelFormat::try_from(narrow(arg)?).map_err(|_| "invalid pixel format")?,
             )
             .map_err(|e| format!("linear alignment: {e:?}"))?,
+        "iosurfaceTextureAlignmentBytes"
+        | "iosurfaceReadOnlyTextureAlignmentBytes" => 16,
         "deviceLinearReadOnlyTextureAlignmentBytes"
         | "deviceLinearTextureAlignmentBytes"
-        | "linearTextureAlignmentBytes"
-        | "iosurfaceTextureAlignmentBytes"
-        | "iosurfaceReadOnlyTextureAlignmentBytes" => [
+        | "linearTextureAlignmentBytes" => [
             PixelFormat::BGRA8Unorm,
             PixelFormat::RGBA8Unorm,
             PixelFormat::RGBA16Float,

@@ -4664,11 +4664,12 @@ static void fillBaseLimits(id device);
 - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
 }
-// SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
-// texture alignment of the widest common format is the same rule this GPU applies to any linear image.
-- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
- return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
-}
+// SPI: row alignment required for textures created over an IOSurface. Host-mapped IOSurfaces whose row pitch is not a multiple of
+// Turnip's 64-byte linear image pitch automatically fall back to runtime-v2's synchronized optimal copy (Form::Copied), which only
+// requires texel alignment; answering 16 (matching Apple Silicon) prevents Core Image's CIMetalTextureCreateFromPaddedIOSurface from
+// rejecting 32-byte-aligned intermediate IOSurfaces (such as 24pt@2x SF Symbol masks in iconservicesagent / System Settings).
+- (NSUInteger)iosurfaceTextureAlignmentBytes {return 16;}
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {return 16;}
 - (uint64_t)registryID {return gRegistryID;}
 - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
 - (BOOL)hasUnifiedMemory {return YES;}
