@@ -60,7 +60,25 @@ pub const PRIVATE_FLAGS: &[&str] = &[
     "supportsTileShaders",
 ];
 
+/// The row alignment a texture over an IOSurface plane needs. Core Image (`CIMetalTextureCreateFromPaddedIOSurface`) and
+/// Metal's stride check refuse a surface whose rows are not a multiple of it, and `IOSurfaceCreate` and `CGBitmapContext`
+/// align 8-bit four-channel rows to 16 or 32 bytes (SF Symbol rasterization: 72x52 at 288 bytes, 36x26 and 38x38 at 160).
+/// The runtime's texture over a buffer takes any row pitch that is a whole number of texels: in place where the device's
+/// linear image takes it, else its copy (`check_over`). Linear textures over buffers keep the device's linear alignment.
+pub const IOSURFACE_ROW_ALIGNMENT: u64 = 16;
+
+/// The answers that need no device.
+pub fn fixed_answer(selector: &str) -> Option<u64> {
+    match selector {
+        "iosurfaceTextureAlignmentBytes" | "iosurfaceReadOnlyTextureAlignmentBytes" => Some(IOSURFACE_ROW_ALIGNMENT),
+        _ => None,
+    }
+}
+
 pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> {
+    if let Some(value) = fixed_answer(selector) {
+        return Ok(value);
+    }
     let translator = device.translator();
     let p = translator.metal_properties();
     let profile = translator.profile();
@@ -87,9 +105,7 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
             .map_err(|e| format!("linear alignment: {e:?}"))?,
         "deviceLinearReadOnlyTextureAlignmentBytes"
         | "deviceLinearTextureAlignmentBytes"
-        | "linearTextureAlignmentBytes"
-        | "iosurfaceTextureAlignmentBytes"
-        | "iosurfaceReadOnlyTextureAlignmentBytes" => [
+        | "linearTextureAlignmentBytes" => [
             PixelFormat::BGRA8Unorm,
             PixelFormat::RGBA8Unorm,
             PixelFormat::RGBA16Float,
@@ -196,6 +212,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn iosurface_row_alignment_is_16_and_linear_alignment_stays_the_runtimes() {
+        assert_eq!(fixed_answer("iosurfaceTextureAlignmentBytes"), Some(16));
+        assert_eq!(fixed_answer("iosurfaceReadOnlyTextureAlignmentBytes"), Some(16));
+        assert_eq!(IOSURFACE_ROW_ALIGNMENT, 16);
+        for linear in [
+            "linearTextureAlignmentBytes",
+            "deviceLinearTextureAlignmentBytes",
+            "deviceLinearReadOnlyTextureAlignmentBytes",
+            "minimumLinearTextureAlignmentForPixelFormat:",
+        ] {
+            assert_eq!(fixed_answer(linear), None, "{linear}");
+        }
+    }
+
+    #[test]
     fn every_registered_selector_has_a_match_arm_in_answer() {
         let source = include_str!("NativeMetalCapabilities.rs");
         let answer_body = source
@@ -214,7 +245,7 @@ mod tests {
             .chain(crate::objects::PUBLIC_ANSWERS.iter().map(|(s, _)| *s))
         {
             let needle = format!("\"{selector}\"");
-            if !answer_body.contains(&needle) {
+            if fixed_answer(selector).is_none() && !answer_body.contains(&needle) {
                 missing.push(selector);
             }
         }
