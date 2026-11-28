@@ -1095,10 +1095,10 @@ static void waitForResource(id resource);
 @property(nonatomic,strong) id<MTLTexture> parent;
 @property(nonatomic,strong) id<MTLHeap> parentHeap;
 @property(nonatomic) NSUInteger heapOffset;
-@property(nonatomic) BOOL counted;   // its surface counted in use (countUse)
-- (void)countUse;
 @end
-// The render server counts the surfaces it textures in use while the textures live (countUse).
+// The render server counts the surfaces it textures in use while a command buffer referencing them is in flight.
+// Holding IOSurfaceIncrementUseCount for the lifetime of NBTexture would pin IOSurfaces cached in QuartzCore's
+// CAImageQueue texture rings (e.g. Camera/Video) and permanently exhaust producer pixel buffer pools once filled.
 static const bool gCountsSurfaceUse=nativeIsRenderServer();
 // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
 // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
@@ -1399,11 +1399,10 @@ static bool textureDescriptor(MTLTextureDescriptor *d,NmbTextureDescriptor *out)
 - (void)dealloc {
  DetailSpan timing(5,(uintptr_t)_handle);
  if(_purgeCounted)countPurgeable(_purgeCounted,0,nmb_texture_allocated_size(_handle));
- nmb_texture_release(_handle);if(_surface){if(_counted)IOSurfaceDecrementUseCount(_surface);CFRelease(_surface);}
+ nmb_texture_release(_handle);if(_surface)CFRelease(_surface);
  // What it was made of (a viewed texture, a buffer, a heap) may be discarded now: the age timer runs again if that waits for it.
  if(_parent || _parentHeap || _buffer)armPurgeAge();
 }
-- (void)countUse {if(_surface && !_counted && gCountsSurfaceUse){IOSurfaceIncrementUseCount(_surface);_counted=YES;}}
 - (MTLTextureType)textureType {return (MTLTextureType)_descriptor.type;}
 - (MTLPixelFormat)pixelFormat {return (MTLPixelFormat)(_pvrtc?_pvrtc:_descriptor.format);}
 - (NSUInteger)width {return _descriptor.width;}
@@ -1434,7 +1433,7 @@ NB_RESOURCE_SPI
  if(!handle){NBLOG(@"native-metal: texture view refused: %@",lastError());return nil;}
  NBTexture *view=[NBTexture new];view.handle=handle;NmbTextureDescriptor descriptor;nmb_texture_describe(handle,&descriptor);view.descriptor=descriptor;
  view.parent=(id<MTLTexture>)self;view.buffer=_buffer;view.offset=_offset;view.rowBytes=_rowBytes;
- if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);view.surfacePlane=_surfacePlane;[view countUse];}
+ if(_surface){view.surface=(IOSurfaceRef)CFRetain(_surface);view.surfacePlane=_surfacePlane;}
  return (id<MTLTexture>)view;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)format {
@@ -2164,6 +2163,8 @@ static void dumpSurfacesOnce(NSSet *textures,NSSet *owners) {
  uint32_t createCpu,createTid,commitCpu,commitTid;
  BOOL earlyEligible;   // made by the render server's thread: its completed handlers may run at submission (see fireEarly)
  std::vector<WatchedSource> watched;
+ std::mutex surfaceUseLock;
+ std::vector<IOSurfaceRef> countedSurfaces;
 }
 @property(nonatomic) NmbCommandBuffer *handle;
 @property(nonatomic,strong) NBQueue *queue;
@@ -3447,12 +3448,31 @@ static char kUserDictionaryKey;
  if(_resourceOwners.count!=before) {
   if([(NBObject *)resource purgeHold:YES])noteLateUse();
   if(![(NBObject *)resource keepForCommand:_handle])[self refuse:lastError()];
+  if(gCountsSurfaceUse && [resource isKindOfClass:[NBTexture class]]) {
+   IOSurfaceRef surface=[(NBTexture *)resource surface];
+   if(surface) {
+    std::lock_guard<std::mutex> guard(surfaceUseLock);
+    if(std::find(countedSurfaces.begin(),countedSurfaces.end(),surface)==countedSurfaces.end()) {
+     countedSurfaces.push_back((IOSurfaceRef)CFRetain(surface));
+     IOSurfaceIncrementUseCount(surface);
+    }
+   }
+  }
  }
 }
 // The resources go: the command buffer completed, was refused, or was released without a commit.
 - (void)disown {
  for(NBObject *resource in _resourceOwners)[resource purgeHold:NO];
  [_resourceOwners removeAllObjects];
+ std::vector<IOSurfaceRef> releaseSurfaces;
+ {
+  std::lock_guard<std::mutex> guard(surfaceUseLock);
+  releaseSurfaces.swap(countedSurfaces);
+ }
+ for(IOSurfaceRef surface:releaseSurfaces) {
+  IOSurfaceDecrementUseCount(surface);
+  CFRelease(surface);
+ }
 }
 - (void)watchTexture:(NBTexture *)texture {
  const uint8_t *bytes=texture.surface?(const uint8_t *)IOSurfaceGetBaseAddress(texture.surface):(const uint8_t *)texture.buffer.wrapped;
@@ -4862,7 +4882,7 @@ static void fillBaseLimits(id device);
  NBTexture *texture=planes>=2?textureOnSurface(buffer,d,surface,plane,start-(uintptr_t)base,row):textureOnBuffer(buffer,d,start-(uintptr_t)base,row,true);
  if(!texture){refuseSurface(5,surface,d,plane,start-(uintptr_t)base,row);return nil;}
  if(gLogTextures)logTexture("iosurface",d,surface,plane,base,start-(uintptr_t)base,row,texture!=nil);
- gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;[texture countUse];return (id<MTLTexture>)texture;
+ gSurfaceTextures++;texture.surface=(IOSurfaceRef)CFRetain(surface);texture.surfacePlane=plane;return (id<MTLTexture>)texture;
 }
 - (id<MTLLibrary>)newLibraryWithData:(dispatch_data_t)data error:(NSError **)error {
  const void *bytes=nullptr;size_t size=0;dispatch_data_t mapped=dispatch_data_create_map(data,&bytes,&size);
