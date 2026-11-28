@@ -75,6 +75,36 @@ pub fn fixed_answer(selector: &str) -> Option<u64> {
     }
 }
 
+/// Minimum Metal linear texture alignment in bytes.
+pub const METAL_MIN_LINEAR_ALIGNMENT: u64 = 16;
+/// Maximum linear texture row alignment advertised on iOS.
+///
+/// Turnip linear images on Adreno 830 align rows to 64 texels (256 B for BGRA8Unorm,
+/// 512 B for RGBA16Float). iOS 26 QuartzCore validates linear texture alignment against
+/// Apple iOS GPU bounds (<= 64 B) and skips compositing 64 B-aligned surfaces whose row
+/// pitch is not a multiple of the advertised alignment (e.g. 1216x2688 BGRA8Unorm
+/// bytesPerRow = 4864, where 4864 % 512 = 256 != 0). Runtime v2's `Buffer::new_texture`
+/// (`check_over`) still checks the real hardware linear pitch internally, binding
+/// hardware-aligned pitches in place and staging copies for tighter pitches.
+pub const IOS_MAX_LINEAR_ALIGNMENT: u64 = 64;
+
+/// Clamp a runtime-reported linear texture alignment for Metal capability queries.
+pub fn clamp_linear_alignment(raw: u64, is_ios: bool) -> u64 {
+    if is_ios {
+        raw.clamp(METAL_MIN_LINEAR_ALIGNMENT, IOS_MAX_LINEAR_ALIGNMENT)
+    } else {
+        raw
+    }
+}
+
+/// Effective linear texture alignment advertised to Metal clients for `format`.
+pub fn linear_texture_alignment(device: &Device, format: PixelFormat) -> Result<u64, String> {
+    let raw = device
+        .minimum_linear_texture_alignment(format)
+        .map_err(|e| format!("linear alignment: {e:?}"))?;
+    Ok(clamp_linear_alignment(raw, cfg!(target_os = "ios")))
+}
+
 pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> {
     if let Some(value) = fixed_answer(selector) {
         return Ok(value);
@@ -98,11 +128,10 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
             .min(l.max_fragment_output_attachments)
             .min(8) as u64,
         "minConstantBufferAlignmentBytes" => 4,
-        "minimumLinearTextureAlignmentForPixelFormat:" => device
-            .minimum_linear_texture_alignment(
-                PixelFormat::try_from(narrow(arg)?).map_err(|_| "invalid pixel format")?,
-            )
-            .map_err(|e| format!("linear alignment: {e:?}"))?,
+        "minimumLinearTextureAlignmentForPixelFormat:" => {
+            let pf = PixelFormat::try_from(narrow(arg)?).map_err(|_| "invalid pixel format")?;
+            linear_texture_alignment(device, pf)?
+        }
         "deviceLinearReadOnlyTextureAlignmentBytes"
         | "deviceLinearTextureAlignmentBytes"
         | "linearTextureAlignmentBytes" => [
@@ -111,11 +140,8 @@ pub fn answer(device: &Device, selector: &str, arg: u64) -> Result<u64, String> 
             PixelFormat::RGBA16Float,
         ]
         .into_iter()
-        .try_fold(16, |a, pf| {
-            device
-                .minimum_linear_texture_alignment(pf)
-                .map(|b| a.max(b))
-                .map_err(|e| format!("linear alignment: {e:?}"))
+        .try_fold(METAL_MIN_LINEAR_ALIGNMENT, |a, pf| {
+            linear_texture_alignment(device, pf).map(|b| a.max(b))
         })?,
         "maxVertexBuffers"
         | "maxFragmentBuffers"
@@ -253,5 +279,27 @@ mod tests {
             missing.is_empty(),
             "registered selectors missing from capabilities::answer: {missing:?}"
         );
+    }
+
+    #[test]
+    fn ios_linear_alignment_clamps_wide_driver_pitches_while_preserving_non_ios() {
+        // Non-iOS (macOS) preserves the runtime/driver pitch alignment unchanged.
+        assert_eq!(clamp_linear_alignment(512, false), 512);
+        assert_eq!(clamp_linear_alignment(256, false), 256);
+        assert_eq!(clamp_linear_alignment(64, false), 64);
+        assert_eq!(clamp_linear_alignment(16, false), 16);
+
+        // iOS clamps into [16, 64] so 64 B-aligned surfaces (e.g. 1216x2688 BGRA8Unorm
+        // bytesPerRow = 4864, where 4864 % 512 == 256 != 0) pass QuartzCore alignment checks.
+        assert_eq!(clamp_linear_alignment(512, true), 64);
+        assert_eq!(clamp_linear_alignment(256, true), 64);
+        assert_eq!(clamp_linear_alignment(64, true), 64);
+        assert_eq!(clamp_linear_alignment(32, true), 32);
+        assert_eq!(clamp_linear_alignment(16, true), 16);
+        assert_eq!(clamp_linear_alignment(4, true), 16);
+
+        let display_bpr: u64 = 1216 * 4; // 4864
+        assert_ne!(display_bpr % 512, 0);
+        assert_eq!(display_bpr % clamp_linear_alignment(512, true), 0);
     }
 }
