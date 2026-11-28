@@ -684,6 +684,19 @@ static void onLargeStack(void (^body)(void)) {
 // its Metal cache directory but not Library/Caches: with the replies only there it kept none, and each of its launches compiled
 // every request again.
 static std::string gCacheRoot;   // the pipeline cache directory the device opened with (native_bridge_metal_open)
+#if !TARGET_OS_OSX
+extern "C" bool native_bridge_metal_cache_matches(id<MTLDevice> device, const char *root) {
+ return device && device==gDeviceObject && root && gCacheRoot==root;
+}
+extern "C" bool nmb_device_publish_pipeline_cache(const NmbDevice *);
+extern "C" bool nmb_device_merge_pipeline_cache(const NmbDevice *);
+extern "C" bool native_bridge_publish_pipeline_cache(void) {
+ return gDevice && nmb_device_publish_pipeline_cache(gDevice);
+}
+extern "C" bool native_bridge_merge_pipeline_cache(void) {
+ return gDevice && nmb_device_merge_pipeline_cache(gDevice);
+}
+#endif
 // The system shader cache as this process uses it (native_bridge_metal_system_cache): 0 not named, 1 read as a layer, 2 filled by
 // this process, 3 refused; its directory or the refusal's reason; and the compiler replies the layer answered.
 static int gSystemCacheState;
@@ -1622,6 +1635,9 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 - (id<MTLFunction>)nb_newFunctionWithName:(NSString *)name constantValues:(MTLFunctionConstantValues *)values zeroRest:(BOOL)zeroRest
                                     error:(NSError **)error;
 @end
+@interface NBArgumentEncoder : NBObject
+@property(nonatomic) NmbArgumentEncoder *handle;
+@end
 @interface NBFunction : NBObject
 @property(nonatomic) NmbFunction *handle;
 @property(nonatomic,copy) NSString *sourceName;
@@ -1636,9 +1652,10 @@ static void noteUnalignedTexture(MTLTextureDescriptor *d,NSUInteger offset,NSUIn
 @property(nonatomic,copy) NSString *name;
 @property(nonatomic) MTLDataType type;
 @property(nonatomic) NSUInteger index;
-@property(nonatomic,getter=isRequired) BOOL required;
+@property(nonatomic) BOOL required;
 @end
 @implementation NBFunctionConstant
+- (BOOL)isRequired {return self.required;}
 @end
 @interface NBFunctionAttribute : NSObject
 @property(nonatomic,copy) NSString *name;
@@ -1666,6 +1683,13 @@ static void libraryAirBytes(NBLibrary *library,const void *bytes,size_t length) 
  }
 }
 @implementation NBFunction
+- (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)index {
+ NmbArgumentEncoder *handle=nmb_function_new_argument_encoder(_handle,index);
+ if(!handle){NBLOG(@"native-metal: argument encoder refused: %@",lastError());return nil;}
+ NBArgumentEncoder *encoder=[NBArgumentEncoder new];
+ encoder.handle=handle;
+ return (id<MTLArgumentEncoder>)encoder;
+}
 - (NSArray *)stageInputAttributes {
  if(!_handle)return nil;
  int32_t count=nmb_function_attribute_count(_handle);if(count<=0)return nil;
@@ -1854,14 +1878,19 @@ static NSError *functionLookupError(NBLibrary *library, NSString *name, NSString
 - (NSArray<NSString *> *)functionNames {
  NSMutableArray *names=[NSMutableArray array];
  for(uint32_t i=0,n=nmb_library_function_count(_handle);i<n;i++) {
-  char name[256];nmb_library_function_name(_handle,i,name,sizeof name);[names addObject:[NSString stringWithUTF8String:name]];
+  const size_t length=nmb_library_function_name(_handle,i,nullptr,0);
+  if(!length)continue;
+  std::vector<char> bytes(length+1);
+  nmb_library_function_name(_handle,i,bytes.data(),bytes.size());
+  if(NSString *name=[NSString stringWithUTF8String:bytes.data()])[names addObject:name];
  }
  return names;
 }
 - (NSArray<NSString *> *)nb_primeFunctionNames {
  NSMutableArray<NSString *> *names=[NSMutableArray array];
  if(!forEachLibraryEntry(self,[&](const std::string &entry,int type) {
-  if((type==0 || type==2) && !entry.empty())[names addObject:@(entry.c_str())];
+  if((type==0 || type==2) && !entry.empty())
+   if(NSString *name=@(entry.c_str()))[names addObject:name];
   return true;
  }))return self.functionNames;
  return names;
@@ -2024,6 +2053,36 @@ static NBFunction *ciKernelFunction(NBLibrary *library,NSString *name) {
   NBSampler *sampler=[NBSampler new];sampler.handle=handle;sampler.descriptor=d;_clamped[key]=sampler;
   return sampler;
  }
+}
+@end
+@implementation NBArgumentEncoder
+- (void)dealloc {nmb_argument_encoder_release(_handle);}
+- (NSUInteger)encodedLength {return nmb_argument_encoder_encoded_length(_handle);}
+- (NSUInteger)alignment {return nmb_argument_encoder_alignment(_handle);}
+- (void)setArgumentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign argument buffer");return;}
+ if(!nmb_argument_encoder_set_argument_buffer(_handle,[(NBBuffer *)buffer handle],offset))
+  NBLOG(@"native-metal: setArgumentBuffer: %@",lastError());
+}
+- (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
+ if(buffer && ![(id)buffer isKindOfClass:[NBBuffer class]]){NBLOG(@"native-metal: foreign buffer argument");return;}
+ if(!nmb_argument_encoder_set_buffer(_handle,[(NBBuffer *)buffer handle],offset,index))
+  NBLOG(@"native-metal: encode buffer argument: %@",lastError());
+}
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
+ if(texture && ![(id)texture isKindOfClass:[NBTexture class]]){NBLOG(@"native-metal: foreign texture argument");return;}
+ if(!nmb_argument_encoder_set_texture(_handle,[(NBTexture *)texture handle],index))
+  NBLOG(@"native-metal: encode texture argument: %@",lastError());
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
+ if(sampler && ![(id)sampler isKindOfClass:[NBSampler class]]){NBLOG(@"native-metal: foreign sampler argument");return;}
+ if(!nmb_argument_encoder_set_sampler(_handle,[(NBSampler *)sampler handle],index))
+  NBLOG(@"native-metal: encode sampler argument: %@",lastError());
+}
+- (void *)constantDataAtIndex:(NSUInteger)index {
+ void *data=nmb_argument_encoder_constant_data(_handle,index);
+ if(!data)NBLOG(@"native-metal: constantDataAtIndex: %@",lastError());
+ return data;
 }
 @end
 @interface NBDepthStencil : NBObject
@@ -5422,6 +5481,8 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
  if(gDeviceObject)return gDeviceObject;
  gMissing=missing;gInFlight=[NSMutableSet set];
  if(cache && *cache){configureShaderDiskCache(cache);gCacheRoot=cache;}
+#if TARGET_OS_OSX
+ // The iPadOS render service sandbox forbids replacing its stderr descriptor.
  const bool renderStderr=diagOn() && nativeIsRenderServer();
  if(diagOn() && !gCacheRoot.empty() && (renderStderr || (getenv("NATIVE_METAL_DUMP_CB") && !strcmp(getprogname(),"iconservicesagent")))) {
   const std::string path=gCacheRoot+"/runtime-stderr.log";
@@ -5431,6 +5492,7 @@ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint
    if(fd!=STDERR_FILENO){dup2(fd,STDERR_FILENO);close(fd);}
   }
  }
+#endif
  gDevice=nmb_device_open(loader,cache);
  if(loader)gLoaderPath=loader;
  if(diagOn() && loader) {

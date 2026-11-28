@@ -4,7 +4,7 @@
 //! checked conversions; a value it does not know fails the call (never a substitute). Failures leave their reason in a per-thread
 //! string, and no call unwinds into C.
 
-use metal2vulkan::bind::SamplerDescriptor;
+use metal2vulkan::bind::{ArgumentBufferLayout, ArgumentType, SamplerDescriptor, ARGUMENT_HANDLE_BYTES};
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::library::{FunctionConstantValue, FunctionConstantValues};
 use metal2vulkan::metal::{
@@ -675,6 +675,21 @@ pub extern "C" fn nmb_last_warning(out: *mut c_char, size: usize) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_device_release(device: *mut NmbDevice) {
     release(device)
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_publish_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || Ok(get(device)?.0.publish_pipeline_cache()))
+}
+
+#[cfg(target_os = "ios")]
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_device_merge_pipeline_cache(device: *const NmbDevice) -> bool {
+    guard(false, || {
+        let device = get(device)?;
+        Ok(device.1.merge_system_pipeline_cache(&device.0))
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1481,15 +1496,15 @@ pub unsafe extern "C" fn nmb_texture_get_bytes(texture: *const NmbTexture, bytes
 
 // ---- libraries and functions ----
 
-pub struct NmbLibrary(Library, Vec<String>);
-pub struct NmbFunction(Function);
+pub struct NmbLibrary(Library, Vec<String>, Device);
+pub struct NmbFunction(Function, Device);
 
 /// # Safety
 /// `bytes` holds `length` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nmb_library_new(device: *mut NmbDevice, bytes: *const c_void, length: usize, air: bool) -> *mut NmbLibrary {
     guard(std::ptr::null_mut(), || {
-        get(device)?;
+        let device = get(device)?.0.clone();
         if bytes.is_null() || length == 0 {
             return Err("no library bytes".into());
         }
@@ -1501,7 +1516,7 @@ pub unsafe extern "C" fn nmb_library_new(device: *mut NmbDevice, bytes: *const c
             Library::from_metallib(crate::air_slice(bytes).ok_or("metallib without an AIR64 slice")?).map_err(e("metallib"))?
         };
         let names = library.function_names();
-        Ok(boxed(NmbLibrary(library, names)))
+        Ok(boxed(NmbLibrary(library, names, device)))
     })
 }
 
@@ -1533,7 +1548,9 @@ pub unsafe extern "C" fn nmb_function_new(library: *mut NmbLibrary, name: *const
         }
         // SAFETY: the caller's contract.
         let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
-        Ok(boxed(NmbFunction(get(library)?.0.new_function_with_name(name).map_err(e("function"))?)))
+        let library = get(library)?;
+        let function = library.0.new_function_with_name(name).map_err(e("function"))?;
+        Ok(boxed(NmbFunction(function, library.2.clone())))
     })
 }
 
@@ -1607,8 +1624,9 @@ unsafe fn specialized(library: *mut NmbLibrary, name: *const c_char, constants: 
                 values.by_index.insert(constant.index(), FunctionConstantValue::new(ty, vec![0; bytes]));
             }
         }
-        let function = get(library)?.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;
-        Ok(boxed(NmbFunction(function)))
+        let library = get(library)?;
+        let function = library.0.new_function_with_name_constant_values(name, &values).map_err(e("specialized function"))?;
+        Ok(boxed(NmbFunction(function, library.2.clone())))
     })
 }
 
@@ -1661,7 +1679,7 @@ unsafe fn specialize_prime_function(library: *mut NmbLibrary, name: *const c_cha
         }
         // SAFETY: the caller's contract.
         let name = unsafe { CStr::from_ptr(name) }.to_str().map_err(e("function name"))?;
-        let library = &get(library)?.0;
+        let NmbLibrary(library, _, device) = get(library)?;
         let generic = library.new_function_with_name(name).map_err(e("function"))?;
         let mut values = FunctionConstantValues::defaults();
         let mut selected = one_index == u32::MAX;
@@ -1689,13 +1707,190 @@ unsafe fn specialize_prime_function(library: *mut NmbLibrary, name: *const c_cha
             return Err("priming constant index was not found".into());
         }
         let function = library.new_function_with_name_constant_values(name, &values).map_err(e("zero-specialized function"))?;
-        Ok(boxed(NmbFunction(function)))
+        Ok(boxed(NmbFunction(function, device.clone())))
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn nmb_function_release(function: *mut NmbFunction) {
     release(function)
+}
+
+fn same_device(a: &Device, b: &Device) -> bool {
+    std::ptr::eq(a.raw().device, b.raw().device)
+}
+
+pub struct NmbArgumentEncoder {
+    device: Device,
+    layout: ArgumentBufferLayout,
+    target: Option<(Buffer, u64)>,
+}
+
+impl NmbArgumentEncoder {
+    fn set_target(&mut self, buffer: Option<&Buffer>, offset: u64) -> Result<(), String> {
+        let Some(buffer) = buffer else {
+            self.target = None;
+            return Ok(());
+        };
+        if buffer.writable_contents().is_none() {
+            return Err("argument buffer has no CPU mapping".into());
+        }
+        if offset.checked_add(self.layout.encoded_length).is_none_or(|end| end > buffer.length()) {
+            return Err("argument layout exceeds the buffer".into());
+        }
+        self.target = Some((buffer.clone(), offset));
+        Ok(())
+    }
+
+    fn mapped_argument(&self, index: u32, ty: ArgumentType) -> Result<(&Buffer, u64, NonNull<u8>), String> {
+        let (buffer, base) = self.target.as_ref().ok_or("argument buffer is unset")?;
+        let (offset, size) = match self.layout.argument(index) {
+            Some(place) if place.ty == ty => (place.offset, place.size),
+            Some(place) => return Err(format!("argument {index} has type {:?}, expected {ty:?}", place.ty)),
+            // Plain Metal writes a missing handle index at the argument buffer's first word.
+            None if ty != ArgumentType::Constant => (0, ARGUMENT_HANDLE_BYTES),
+            None => return Err(format!("argument {index} is absent")),
+        };
+        if ty != ArgumentType::Constant && size != ARGUMENT_HANDLE_BYTES {
+            return Err(format!("argument {index} is not a Metal handle"));
+        }
+        let offset = base.checked_add(offset).ok_or("argument offset overflow")?;
+        if offset.checked_add(size).is_none_or(|end| end > base + self.layout.encoded_length) {
+            return Err(format!("argument {index} exceeds the buffer"));
+        }
+        let mapping = buffer.writable_contents().ok_or("argument buffer has no writable CPU mapping")?;
+        let offset_in_address_space = usize::try_from(offset).map_err(e("argument offset"))?;
+        // SAFETY: the CPU-mapped buffer retains this span until target replacement.
+        let pointer = unsafe { NonNull::new_unchecked(mapping.as_ptr().add(offset_in_address_space)) };
+        Ok((buffer, offset, pointer))
+    }
+
+    fn write(&self, index: u32, ty: ArgumentType, word: u64) -> Result<(), String> {
+        let (buffer, offset, pointer) = self.mapped_argument(index, ty)?;
+        let bytes = word.to_le_bytes();
+        // SAFETY: mapped_argument verified this word lies inside the CPU-mapped buffer.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer.as_ptr(), bytes.len()) };
+        buffer.did_modify_range(offset, ARGUMENT_HANDLE_BYTES).map_err(e("argument buffer range"))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_function_new_argument_encoder(function: *const NmbFunction, index: u64) -> *mut NmbArgumentEncoder {
+    guard(std::ptr::null_mut(), || {
+        let index = u32::try_from(index).map_err(e("argument buffer index"))?;
+        let function = get(function)?;
+        let descriptor = function.0.function_descriptor();
+        let layout = descriptor.function.argument_buffer_layout(index, &descriptor.constants, &metal2vulkan::Budget::standard())
+            .map_err(e("argument encoder"))?;
+        Ok(boxed(NmbArgumentEncoder { device: function.1.clone(), layout, target: None }))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_release(encoder: *mut NmbArgumentEncoder) {
+    release(encoder);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_encoded_length(encoder: *const NmbArgumentEncoder) -> u64 {
+    guard(0, || Ok(get(encoder)?.layout.encoded_length))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_alignment(encoder: *const NmbArgumentEncoder) -> u64 {
+    guard(0, || Ok(get(encoder)?.layout.alignment))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_argument_buffer(encoder: *mut NmbArgumentEncoder, buffer: *const NmbBuffer, offset: u64) -> bool {
+    guard(false, || {
+        let buffer = optional(buffer)?;
+        let encoder = get_mut(encoder)?;
+        let placed = buffer.map(|b| {
+            // Constant data pointers must remain valid like the buffer's contents pointer.
+            if b.1 {
+                b.0.pin();
+            }
+            let buffer = b.0.live()?;
+            if !same_device(buffer.device(), &encoder.device) {
+                return Err("argument buffer belongs to another Metal device".into());
+            }
+            Ok::<_, String>(buffer)
+        }).transpose()?;
+        encoder.set_target(placed.as_deref(), offset)?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_buffer(encoder: *mut NmbArgumentEncoder, buffer: *const NmbBuffer, offset: u64, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let encoder = get(encoder)?;
+        let buffer = optional(buffer)?.map(|b| {
+            b.0.pin();
+            let buffer = b.0.live()?;
+            if !same_device(buffer.device(), &encoder.device) {
+                return Err("buffer argument belongs to another Metal device".into());
+            }
+            Ok::<_, String>(buffer)
+        }).transpose()?;
+        let address = match buffer.as_deref() {
+            Some(buffer) if offset <= buffer.length() =>
+                buffer.gpu_address().checked_add(offset).ok_or("buffer argument address overflow")?,
+            Some(_) => return Err("invalid device or offset for buffer argument".into()),
+            None => 0,
+        };
+        encoder.write(index, ArgumentType::Buffer, address)?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_texture(encoder: *mut NmbArgumentEncoder, texture: *const NmbTexture, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let encoder = get(encoder)?;
+        let texture = optional(texture)?.map(|t| {
+            t.0.pin();
+            let texture = t.0.live()?;
+            if !same_device(texture.device(), &encoder.device) {
+                return Err("texture argument belongs to another Metal device".into());
+            }
+            Ok::<_, String>(texture)
+        }).transpose()?;
+        let id = match texture.as_deref() {
+            Some(texture) => texture.gpu_resource_id().to_bits(),
+            None => 0,
+        };
+        encoder.write(index, ArgumentType::Texture, id)?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_set_sampler(encoder: *mut NmbArgumentEncoder, sampler: *const NmbSampler, index: u64) -> bool {
+    guard(false, || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let sampler = optional(sampler)?;
+        let encoder = get(encoder)?;
+        let id = match sampler {
+            Some(sampler) if same_device(&sampler.2, &encoder.device) => sampler.0.gpu_resource_id().to_bits(),
+            Some(_) => return Err("sampler argument belongs to another Metal device".into()),
+            None => 0,
+        };
+        encoder.write(index, ArgumentType::Sampler, id)?;
+        Ok(true)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nmb_argument_encoder_constant_data(encoder: *const NmbArgumentEncoder, index: u64) -> *mut c_void {
+    guard(std::ptr::null_mut(), || {
+        let index = u32::try_from(index).map_err(e("argument index"))?;
+        let (_, _, pointer) = get(encoder)?.mapped_argument(index, ArgumentType::Constant)?;
+        Ok(pointer.as_ptr().cast())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -1741,7 +1936,7 @@ pub extern "C" fn nmb_function_patch_control_point_count(function: *const NmbFun
 
 pub struct NmbComputePipeline(ComputePipelineState);
 pub struct NmbRenderPipeline(RenderPipelineState);
-pub struct NmbSampler(SamplerState, Arc<Ownership>);
+pub struct NmbSampler(SamplerState, Arc<Ownership>, Device);
 pub struct NmbDepthStencil(DepthStencilState);
 
 #[unsafe(no_mangle)]
@@ -2429,7 +2624,8 @@ pub extern "C" fn nmb_sampler_new(device: *mut NmbDevice, descriptor: *const Nmb
         out.lod_max_clamp = d.lod_max;
         let device = &get(device)?.0;
         let index = crate::ownership::reserve(device, metal2vulkan_runtime::IndexClass::Sampler)?;
-        Ok(boxed(NmbSampler(device.new_sampler_state(&out, index.index()).map_err(e("sampler"))?, Ownership::new(vec![index.owner()]))))
+        let sampler = device.new_sampler_state(&out, index.index()).map_err(e("sampler"))?;
+        Ok(boxed(NmbSampler(sampler, Ownership::new(vec![index.owner()]), device.clone())))
     })
 }
 

@@ -176,6 +176,18 @@ impl Registry {
             remaining-=1; if remaining==0 { break; }
         }
     }
+    #[cfg(target_os = "ios")]
+    pub fn merge_system_pipeline_cache(&self, device: &rt::Device) -> bool {
+        let Some(system) = &self.system else { return false; };
+        let Some(name) = device.pipeline_cache_blob_name() else { return false; };
+        let path = PathBuf::from(runtime_namespace()).join(name);
+        let Some(bytes) = system.read(&path, MAX_BYTES as u64) else { return false; };
+        let merged = device.merge_external_pipeline_cache(&bytes);
+        if merged {
+            system.accepted(bytes.len() as u64);
+        }
+        merged
+    }
     fn seed(&self, name: &str) -> Option<Vec<u8>> {
         let bytes = self.read(name)?;
         let _ = crate::cache_store::import(&self.cache_root, name, &bytes);
