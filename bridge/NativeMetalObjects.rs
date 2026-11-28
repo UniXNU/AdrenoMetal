@@ -800,9 +800,10 @@ pub unsafe extern "C" fn nmb_device_answer(device: *const NmbDevice, selector: *
 pub extern "C" fn nmb_device_linear_bytes_per_row(device: *const NmbDevice, format: u64, width: u64) -> u64 {
     guard(0, || {
         let d = &get(device)?.0;
-        let alignment = d
-            .minimum_linear_texture_alignment(raw::<PixelFormat>(format, "pixel format")?)
-            .map_err(e("linear texture"))?;
+        let alignment = crate::capabilities::linear_texture_alignment(
+            d,
+            raw::<PixelFormat>(format, "pixel format")?,
+        )?;
         let info = d.pixel_format_info(format);
         // Flags bit 0x400: a format of blocks, which the alignment query has refused already.
         if info.flags & 0x400 != 0 || info.words[0] == 0 {
